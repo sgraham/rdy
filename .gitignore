@@ -5,3 +5,4 @@ ide/share
 tmp/
 *.pdb
 *.exe
+tmp.raw

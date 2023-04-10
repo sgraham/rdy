@@ -5,8 +5,11 @@
 #include "libdyibicc.h"
 #include "raylib.h"
 
+static DyibiccContext* cc_ctx;
+static bool last_compile_successful;
+
 extern bool nvim_connection_setup(const char* files[], const char* nvim_config_fullpath);
-extern bool nvim_connection_poll(void);
+extern bool nvim_connection_poll(void (*file_update)(char* name, char* contents));
 
 static int output_function(int level, const char* fmt, va_list ap) {
   (void)level;
@@ -16,7 +19,7 @@ static int output_function(int level, const char* fmt, va_list ap) {
 static void Log(const char* fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  output_function(0, fmt, ap);
+  output_function(1, fmt, ap);
 }
 
 static void* provide_function(const char* name) {
@@ -556,6 +559,10 @@ static char* fullpath(const char* relpath) {
   return _strdup(buf);
 }
 
+static void file_update_notification(char* filename, char* contents) {
+  last_compile_successful = dyibicc_update(cc_ctx, filename, contents);
+}
+
 int main(void) {
   InitWindow(1920, 1080, "Rdy");
 
@@ -578,7 +585,7 @@ int main(void) {
                                        .entry_point_name = "RdyEntryPoint",
                                        .get_function_address = provide_function,
                                        .output_function = output_function};
-  DyibiccContext* cc_ctx = dyibicc_set_environment(&cc_env_data);
+  cc_ctx = dyibicc_set_environment(&cc_env_data);
 
   for (char**p = include_paths; *p; ++p)
     free(*p);
@@ -587,23 +594,29 @@ int main(void) {
 
   bool first = true;
 
+  last_compile_successful = dyibicc_update(cc_ctx, NULL, NULL);
+
   while (!WindowShouldClose()) {
-    if (!nvim_connection_poll()) {
+    if (!nvim_connection_poll(file_update_notification)) {
       break;
     }
 
-    bool code_update_ok = dyibicc_update(cc_ctx);
-
     BeginDrawing();
 
-    if (code_update_ok && cc_ctx->entry_point) {
+    if (last_compile_successful && cc_ctx->entry_point) {
       void (*p)(int) = (void (*)(int))cc_ctx->entry_point;
       p(first ? 0 : 1);
       first = false;
+    } else {
+      ClearBackground((Color){0x80, 0x80, 0x80, 0xff});
+      DrawText("error: ...", 10, 10, 40, RED);
     }
 
     EndDrawing();
   }
+
+  dyibicc_free(cc_ctx);
+  cc_ctx = NULL;
 
   CloseWindow();
 

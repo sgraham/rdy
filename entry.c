@@ -10,11 +10,7 @@ static void init(void) {
 static void update(void) {
   ClearBackground((Color){0x64, 0x95, 0xed, 0xff});
 
-  DrawText("Welcome to Rdy!", 290, 200, 40, WHITE);
-  Vector2 scale = GetWindowScaleDPI();
-  char buf[256];
-  sprintf(buf, "DPI Scale: %f %f", scale.x, scale.y);
-  DrawText(buf, 190, 290, 40, WHITE);
+  DrawText("Welcome to Rdy!", 100, 100, 40, WHITE);
 }
 
 // 0 = init

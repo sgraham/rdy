@@ -7,6 +7,7 @@
 
 static mpack_tree_t nvim_tree;
 static uint32_t message_id;
+static char file_receive_buffer[2<<20];
 
 // Buffer sizes for mpack reading.
 #define NVIM_MAX_SIZE (64*1024*1024)
@@ -144,24 +145,36 @@ again:
   return true;
 }
 
-static void got_message(mpack_node_t root) {
-  printf("-------------\n");
-  mpack_node_print_to_stdout(root);
+static void got_message(mpack_node_t root, void (*callback)(char*, char*)) {
+  //printf("-------------\n");
+  //mpack_node_print_to_stdout(root);
   // Ignore everything except our custom event generated from init.lua.
   if (mpack_node_array_length(root) == 3 && mpack_node_u32(mpack_node_array_at(root, 0)) == 2) {
     // I think "2" means event, but I can't find that documented anywhere.
     mpack_node_t evname = mpack_node_array_at(root, 1);
     if (strncmp(mpack_node_str(evname), "EventFileUpdate", mpack_node_strlen(evname)) == 0) {
-      mpack_node_t filename_node = mpack_node_array_at(root, 1);
-      mpack_node_t filecontents_node = mpack_node_array_at(root, 2);
-      (void)filecontents_node;
-      printf("update for %.*s\n", (int)mpack_node_strlen(filename_node),
-             mpack_node_str(filename_node));
+      mpack_node_t event_data = mpack_node_array_at(root, 2);
+      mpack_node_t filename_node = mpack_node_array_at(event_data, 1);
+      char* name_copy = mpack_node_cstr_alloc(filename_node, 1024);
+      mpack_node_t filecontents_node = mpack_node_array_at(event_data, 2);
+      char* p = file_receive_buffer;
+      size_t num_lines = mpack_node_array_length(filecontents_node);
+      //printf("num_lines: %zu\n", num_lines);
+      for (size_t i = 0; i < num_lines; ++i) {
+        mpack_node_t line = mpack_node_array_at(filecontents_node, i);
+        size_t len = mpack_node_strlen(line);
+        memcpy(p, mpack_node_str(line), len);
+        p[len] = '\n';
+        p += len + 1;
+      }
+      *p = 0;
+      callback(name_copy, file_receive_buffer);
+      MPACK_FREE(name_copy);
     }
   }
 }
 
-bool nvim_connection_poll(void) {
+bool nvim_connection_poll(void (*file_update)(char* name, char* contents)) {
   bool ok = mpack_tree_try_parse(&nvim_tree);
   mpack_error_t err = mpack_tree_error(&nvim_tree);
   if (err != mpack_ok) {
@@ -169,7 +182,7 @@ bool nvim_connection_poll(void) {
     return false;
   }
   if (ok) {
-    got_message(mpack_tree_root(&nvim_tree));
+    got_message(mpack_tree_root(&nvim_tree), file_update);
   }
   return true;
 }

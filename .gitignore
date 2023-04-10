@@ -1,0 +1,7 @@
+__filelist.lua
+ide/nvim/plugin/
+ide/share
+.vs/
+tmp/
+*.pdb
+*.exe

@@ -11,15 +11,24 @@ static bool last_compile_successful;
 extern bool nvim_connection_setup(const char* files[], const char* nvim_config_fullpath);
 extern bool nvim_connection_poll(void (*file_update)(char* name, char* contents));
 
+extern void console_init(void);
+extern void console_update(void);
+extern void console_set_override_visible(bool visible);
+extern void console_clear(void);
+extern int console_vprintf(int level, const char* fmt, va_list ap);
+extern int console_errf(const char* fmt, ...);
+extern int console_logf(const char* fmt, ...);
+extern void console_shutdown(void);
+
 static int output_function(int level, const char* fmt, va_list ap) {
-  (void)level;
-  return vfprintf(stdout, fmt, ap);
+  return console_vprintf(level, fmt, ap);
+  //return vfprintf(stdout, fmt, ap);
 }
 
 static void Log(const char* fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  output_function(1, fmt, ap);
+  console_vprintf(1, fmt, ap);
 }
 
 static void* provide_function(const char* name) {
@@ -560,11 +569,17 @@ static char* fullpath(const char* relpath) {
 }
 
 static void file_update_notification(char* filename, char* contents) {
+  if (!last_compile_successful) {
+    console_clear();
+  }
   last_compile_successful = dyibicc_update(cc_ctx, filename, contents);
 }
 
 int main(void) {
   InitWindow(1920, 1080, "Rdy");
+  SetTargetFPS(60);
+
+  console_init();
 
   const char* include_paths[] = {
       fullpath(".\\raylib\\src"),
@@ -608,9 +623,11 @@ int main(void) {
       p(first ? 0 : 1);
       first = false;
     } else {
-      ClearBackground((Color){0x80, 0x80, 0x80, 0xff});
-      DrawText("error: ...", 10, 10, 40, RED);
+      ClearBackground(VIOLET);
     }
+
+    console_set_override_visible(!last_compile_successful);
+    console_update();
 
     EndDrawing();
   }

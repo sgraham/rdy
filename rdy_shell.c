@@ -17,33 +17,40 @@ extern bool nvim_connection_send_quit_and_shutdown(void* connection_handle);
 extern void console_preinit(void);
 extern void console_init(void);
 extern void console_update(void);
-extern void console_set_override_visible(bool visible);
-extern void console_clear(void);
-extern int console_vprintf(const char* fmt, va_list ap);
-extern int console_out(const char* text);
+
+extern void console_main_set_visible(bool visible);
+extern void console_error_set_visible(bool visible);
+
+extern int console_main_vprintf(const char* fmt, va_list ap);
+extern int console_main_out(const char* text);
+extern void console_main_clear(void);
+
+extern int console_error_out(const char* text);
+extern int console_error_vprintf(const char* fmt, va_list ap);
+extern void console_error_clear(void);
+
 extern void console_shutdown(void);
 
 static int output_function(const char* fmt, va_list ap) {
-  return console_vprintf(fmt, ap);
-  // return vfprintf(stdout, fmt, ap);
+  return console_error_vprintf(fmt, ap);
 }
 
 static void Log(const char* fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  console_vprintf(fmt, ap);
+  console_main_vprintf(fmt, ap);
 }
 
 void custom_raylib_log(int log_type, const char *fmt, va_list ap) {
   if (log_type < LOG_WARNING) {
-    console_out("\033[0m"); // Reset
+    console_main_out("\033[0m"); // Reset
   } else if (log_type == LOG_WARNING) {
-    console_out("\033[1;35m"); // Violet
+    console_main_out("\033[1;35m"); // Violet
   } else if (log_type >= LOG_ERROR) {
-    console_out("\033[1;31m"); // Red
+    console_main_out("\033[1;31m"); // Red
   }
-  console_vprintf(fmt, ap);
-  console_out("\033[0m\n");
+  console_main_vprintf(fmt, ap);
+  console_main_out("\033[0m\n");
 }
 
 static void* provide_function(const char* name) {
@@ -586,9 +593,7 @@ static char* fullpath(const char* relpath) {
 }
 
 static void file_update_notification(char* filename, char* contents) {
-  if (!last_compile_successful) {
-    console_clear();
-  }
+  console_error_clear();
   last_compile_successful = dyibicc_update(cc_ctx, filename, contents);
 }
 
@@ -640,14 +645,17 @@ int main(void) {
     BeginDrawing();
 
     if (last_compile_successful && cc_ctx->entry_point) {
+      console_error_set_visible(false);
       void (*p)(int) = (void (*)(int))cc_ctx->entry_point;
       p(first ? 0 : 1);
       first = false;
     } else {
-      ClearBackground(PINK);
+      console_error_set_visible(true);
+      ClearBackground(DARKGRAY);
+      //DrawRectangleGradientEx((Rectangle){0, 0, GetScreenWidth(), GetScreenHeight()},
+          //RED, WHITE, GREEN, BLUE);
     }
 
-    console_set_override_visible(!last_compile_successful);
     console_update();
 
     EndDrawing();

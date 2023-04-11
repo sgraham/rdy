@@ -6,16 +6,6 @@
 #include "raylib.h"
 #include "raymath.h"
 
-static bool is_visible = false;
-static bool override_visible = false;
-
-static Rectangle location;
-
-typedef struct CChar {
-  char c;
-  char colour;
-} CChar;
-
 static Color colours_by_index[] = {
     {12, 12, 12, 255},     // Black
     {197, 15, 31, 255},    // Red
@@ -36,16 +26,26 @@ static Color colours_by_index[] = {
     {242, 242, 242, 255},  // Bright White
 };
 
-#define CONSOLE_WIDTH 120
-#define CONSOLE_HEIGHT 35
+typedef struct CChar {
+  char c;
+  char colour;
+} CChar;
 
-static CChar* characters;
-static CChar* last_insertion_location;
+typedef struct Console {
+  Rectangle location;
+  CChar* characters;
+  int buffer_width;
+  int buffer_height;
+  CChar* last_insertion_location;
+  char current_colour;
+  bool is_visible;
+} Console;
 
-static int scroll_offset;
-static char current_colour;
+static Console main;
+static Console error;
 
 static Font debug_font;
+static float font_scale_factor;
 
 #define CONSOLE_FONT_SIZE 30
 #define BORDER 10.f
@@ -53,82 +53,129 @@ static Font debug_font;
 #define LAST_GLYPH '~'
 
 void console_preinit(void) {
-  characters = calloc(CONSOLE_WIDTH * CONSOLE_HEIGHT, sizeof(CChar));
+  main.buffer_width = 120;
+  main.buffer_height = 35;
+  main.characters = calloc(main.buffer_width * main.buffer_height, sizeof(CChar));
+
+  error.buffer_width = 100;
+  error.buffer_height = 8;
+  error.characters = calloc(error.buffer_width * error.buffer_height, sizeof(CChar));
 }
 
 void console_init(void) {
   debug_font = LoadFontEx("hack-font\\Hack-Regular.ttf", CONSOLE_FONT_SIZE, NULL, 0);
-  location.x = location.y = BORDER;
-  location.width = (float)GetScreenWidth() - BORDER * 2;
-  location.height = (float)GetScreenHeight() - BORDER * 2;
-  current_colour = 7;
+  font_scale_factor = (float)CONSOLE_FONT_SIZE / debug_font.baseSize;
+
+  main.location.x = main.location.y = BORDER;
+  main.location.width = (float)GetScreenWidth() - BORDER * 2;
+  main.location.height = (float)GetScreenHeight() - BORDER * 2;
+  main.current_colour = 7;
+
+  error.location.x = BORDER * 2;
+  error.location.y = (float)GetScreenHeight();
+  error.location.width = GetScreenWidth() - BORDER * 4;
+  error.location.height = CONSOLE_FONT_SIZE * font_scale_factor * error.buffer_height + BORDER * 2;
 }
 
-void console_clear(void) {
-  // TODO probably need a separate stream for compile errors vs. regular logs
-  memset(characters, 0, CONSOLE_HEIGHT * CONSOLE_WIDTH * sizeof(CChar));
-  last_insertion_location = NULL;
+void console_main_clear(void) {
+  memset(main.characters, 0, main.buffer_width * main.buffer_height * sizeof(CChar));
+  main.last_insertion_location = NULL;
 }
 
-void console_update(void) {
-  if (IsKeyPressed(KEY_GRAVE))
-    is_visible = !is_visible;
+void console_main_set_visible(bool visible) {
+  main.is_visible = visible;
+}
 
-  if (is_visible || override_visible) {
-    float target_height = BORDER;
-    location.y =
-        Clamp(Lerp(location.y, target_height, 0.5f), (float)-GetScreenHeight(), target_height);
-  } else {
-    location.y = Lerp(location.y, (float)-GetScreenHeight(), 0.5f);
-  }
+void console_error_clear(void) {
+  memset(error.characters, 0, error.buffer_width * error.buffer_height * sizeof(CChar));
+  error.last_insertion_location = NULL;
+}
 
-  DrawRectangleRounded(location, .02f, 6, Fade(BLACK, 0.9f));
+void console_error_set_visible(bool visible) {
+  error.is_visible = visible;
+}
 
-  float scale_factor = (float)CONSOLE_FONT_SIZE / debug_font.baseSize;
-
-  Vector2 pos = {BORDER, BORDER + location.y};
-  for (int y = 0; y < CONSOLE_HEIGHT; ++y) {
-    pos.x = BORDER;
-    for (int x = 0; x < CONSOLE_WIDTH; ++x) {
-      CChar* ch = &characters[y * CONSOLE_WIDTH + x];
+static void render_console_text(Console* con, float startx, float starty) {
+  Vector2 pos = {startx, starty};
+  for (int y = 0; y < con->buffer_height; ++y) {
+    pos.x = startx;
+    for (int x = 0; x < con->buffer_width; ++x) {
+      CChar* ch = &con->characters[y * con->buffer_width + x];
       if (ch->c < FIRST_GLYPH || ch->c > LAST_GLYPH) {
         continue;
       }
       DrawTextCodepoint(debug_font, ch->c, pos, CONSOLE_FONT_SIZE, colours_by_index[ch->colour]);
       int index = GetGlyphIndex(debug_font, ch->c);
       if (debug_font.glyphs[index].advanceX == 0) {
-        pos.x += ((float)debug_font.recs[index].width * scale_factor);
+        pos.x += ((float)debug_font.recs[index].width * font_scale_factor);
       } else {
-        pos.x += ((float)debug_font.glyphs[index].advanceX * scale_factor);
+        pos.x += ((float)debug_font.glyphs[index].advanceX * font_scale_factor);
       }
     }
-    pos.y += debug_font.baseSize * scale_factor;
+    pos.y += debug_font.baseSize * font_scale_factor;
   }
 }
 
-void console_out(const char* text) {
+void console_update(void) {
+  if (IsKeyPressed(KEY_GRAVE))
+    main.is_visible = !main.is_visible;
+
+  float error_hidden_y_location = (float)GetScreenHeight();
+  if (error.is_visible) {
+    float target_y = (float)GetScreenHeight() - error.location.height - BORDER * 2;
+    error.location.y = Lerp(error.location.y, target_y, 0.5f);
+  } else {
+    error.location.y = Lerp(error.location.y, error_hidden_y_location, 0.5f);
+  }
+
+  float main_hidden_y_location = (float)-GetScreenHeight();
+  if (main.is_visible) {
+    float target_y = BORDER;
+    if (error.is_visible) {
+      target_y -= error.location.height + BORDER * 3;
+    }
+    main.location.y = Lerp(main.location.y, target_y, 0.5f);
+  } else {
+    main.location.y = Lerp(main.location.y, main_hidden_y_location, 0.5f);
+  }
+
+
+  if (!FloatEquals(main.location.y, main_hidden_y_location)) {
+    DrawRectangleRounded(main.location, .02f, 6, Fade(BLACK, 0.9f));
+
+    render_console_text(&main, main.location.x + BORDER, main.location.y + BORDER);
+  }
+
+  if (!FloatEquals(error.location.y, error_hidden_y_location)) {
+    DrawRectangleRounded(error.location, .1f, 6, Fade(BLACK, 0.9f));
+    DrawRectangleRoundedLines(error.location, .1f, 6, 5, RED);
+    render_console_text(&error, error.location.x + BORDER, error.location.y + BORDER);
+  }
+}
+
+static void console_out(Console* con, const char* text) {
   const char* p = text;
-  CChar* start_of_last_line = &characters[CONSOLE_WIDTH * (CONSOLE_HEIGHT - 1)];
-  CChar* past_end_of_last_line = &characters[CONSOLE_WIDTH * CONSOLE_HEIGHT];
-  CChar* q = last_insertion_location ? last_insertion_location : start_of_last_line;
+  CChar* start_of_last_line = &con->characters[con->buffer_width * (con->buffer_height - 1)];
+  CChar* past_end_of_last_line = &con->characters[con->buffer_width * con->buffer_height];
+  CChar* q = con->last_insertion_location ? con->last_insertion_location : start_of_last_line;
   while (*p) {
     if (*p == '\033') {
       ++p;
       if (p[0] == '[' && p[1] == '0' && p[2] == 'm') {
         p += 3;
-        current_colour = 7;
+        con->current_colour = 7;
       } else if (p[0] == '[' && p[1] == '1' && p[2] == ';' && p[3] == '3' && p[4] != 0 &&
                  p[5] == 'm') {
-        current_colour = 8 + (p[4] - '0');
+        con->current_colour = 8 + (p[4] - '0');
         p += 6;
       }
       continue;
     }
     if (q >= past_end_of_last_line || *p == '\n') {
-      memmove(&characters[0], &characters[CONSOLE_WIDTH],
-              sizeof(CChar) * CONSOLE_WIDTH * (CONSOLE_HEIGHT - 1));
+      memmove(&con->characters[0], &con->characters[con->buffer_width],
+              sizeof(CChar) * con->buffer_width * (con->buffer_height - 1));
       q = start_of_last_line;
-      memset(q, 0, sizeof(CChar) * CONSOLE_WIDTH);
+      memset(q, 0, sizeof(CChar) * con->buffer_width);
       if (*p == '\n')
         ++p;
       continue;
@@ -137,31 +184,47 @@ void console_out(const char* text) {
       continue;
     }
     q->c = *p;
-    q->colour = current_colour;
+    q->colour = con->current_colour;
     ++p;
     ++q;
   }
 
-  last_insertion_location = q;
+  con->last_insertion_location = q;
 }
 
-int console_vprintf(const char* fmt, va_list ap) {
+void console_main_out(const char* text) {
+  console_out(&main, text);
+}
+
+void console_error_out(const char* text) {
+  console_out(&error, text);
+}
+
+int console_main_vprintf(const char* fmt, va_list ap) {
   char stack_buf[256];
   int num_chars = vsnprintf(stack_buf, sizeof(stack_buf), fmt, ap);
   if (num_chars >= sizeof(stack_buf)) {
     return 0;
   }
 
-  console_out(stack_buf);
+  console_main_out(stack_buf);
 
   return num_chars;
 }
 
-void console_set_override_visible(bool visible) {
-  override_visible = visible;
+int console_error_vprintf(const char* fmt, va_list ap) {
+  char stack_buf[256];
+  int num_chars = vsnprintf(stack_buf, sizeof(stack_buf), fmt, ap);
+  if (num_chars >= sizeof(stack_buf)) {
+    return 0;
+  }
+
+  console_error_out(stack_buf);
+
+  return num_chars;
 }
 
 void console_shutdown(void) {
-  free(characters);
+  free(main.characters);
   UnloadFont(debug_font);
 }

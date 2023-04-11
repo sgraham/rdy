@@ -3,7 +3,8 @@ pushd ..\dyibicc
 call make.bat
 popd
 
-set CFLAGS=/nologo /c /Ox /GL /Zi /MT /D_CRT_SECURE_NO_DEPRECATE /DPLATFORM_DESKTOP /DMPACK_EXTENSIONS=1 /DMPACK_DEBUG=1
+set CFLAGS=/nologo /fsanitize=address /c /Ox /GL /Zi /MT /D_CRT_SECURE_NO_DEPRECATE /DPLATFORM_DESKTOP /DMPACK_EXTENSIONS=1
+:: /DMPACK_DEBUG=1
 
 cl %CFLAGS% /W4 /WX ^
   /Iraylib\src ^
@@ -67,7 +68,7 @@ link /nologo ^
   ..\dyibicc\type.obj ^
   ..\dyibicc\unicode.obj ^
   ..\dyibicc\util.obj ^
-  winmm.lib user32.lib gdi32.lib shell32.lib onecore.lib /LTCG /out:rdy.exe ^
+  winmm.lib user32.lib gdi32.lib shell32.lib onecore.lib /LTCG /DEBUG /out:rdy.exe ^
   || exit /b 1
 
 del *.obj 2>nul

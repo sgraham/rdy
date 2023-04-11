@@ -14,24 +14,36 @@ extern bool nvim_connection_setup(const char* files[],
 extern bool nvim_connection_poll(void (*file_update)(char* name, char* contents));
 extern bool nvim_connection_send_quit_and_shutdown(void* connection_handle);
 
+extern void console_preinit(void);
 extern void console_init(void);
 extern void console_update(void);
 extern void console_set_override_visible(bool visible);
 extern void console_clear(void);
-extern int console_vprintf(int level, const char* fmt, va_list ap);
-extern int console_errf(const char* fmt, ...);
-extern int console_logf(const char* fmt, ...);
+extern int console_vprintf(const char* fmt, va_list ap);
+extern int console_out(const char* text);
 extern void console_shutdown(void);
 
-static int output_function(int level, const char* fmt, va_list ap) {
-  return console_vprintf(level, fmt, ap);
+static int output_function(const char* fmt, va_list ap) {
+  return console_vprintf(fmt, ap);
   // return vfprintf(stdout, fmt, ap);
 }
 
 static void Log(const char* fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
-  console_vprintf(1, fmt, ap);
+  console_vprintf(fmt, ap);
+}
+
+void custom_raylib_log(int log_type, const char *fmt, va_list ap) {
+  if (log_type < LOG_WARNING) {
+    console_out("\033[0m"); // Reset
+  } else if (log_type == LOG_WARNING) {
+    console_out("\033[1;35m"); // Violet
+  } else if (log_type >= LOG_ERROR) {
+    console_out("\033[1;31m"); // Red
+  }
+  console_vprintf(fmt, ap);
+  console_out("\033[0m\n");
 }
 
 static void* provide_function(const char* name) {
@@ -581,6 +593,9 @@ static void file_update_notification(char* filename, char* contents) {
 }
 
 int main(void) {
+  console_preinit();
+  SetTraceLogCallback(custom_raylib_log);
+
   InitWindow(1920, 1080, "Rdy");
   SetTargetFPS(60);
 
@@ -629,7 +644,7 @@ int main(void) {
       p(first ? 0 : 1);
       first = false;
     } else {
-      ClearBackground(VIOLET);
+      ClearBackground(PINK);
     }
 
     console_set_override_visible(!last_compile_successful);

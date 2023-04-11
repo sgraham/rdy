@@ -21,12 +21,15 @@ extern void console_update(void);
 extern void console_main_set_visible(bool visible);
 extern void console_error_set_visible(bool visible);
 
-extern int console_main_vprintf(const char* fmt, va_list ap);
 extern int console_main_out(const char* text);
+extern void console_error_printf(const char* fmt, ...);
+extern int console_main_vprintf(const char* fmt, va_list ap);
 extern void console_main_clear(void);
 
 extern int console_error_out(const char* text);
+extern void console_error_printf(const char* fmt, ...);
 extern int console_error_vprintf(const char* fmt, va_list ap);
+
 extern void console_error_clear(void);
 
 extern void console_shutdown(void);
@@ -621,9 +624,10 @@ int main(void) {
   nvim_connection_setup(files, nvim_config_fullpath, &connection_handle);
   free(nvim_config_fullpath);
 
+#define ENTRY_POINT_NAME "RdyEntryPoint"
   DyibiccEnviromentData cc_env_data = {.include_paths = include_paths,
                                        .files = files,
-                                       .entry_point_name = "RdyEntryPoint",
+                                       .entry_point_name = ENTRY_POINT_NAME,
                                        .get_function_address = provide_function,
                                        .output_function = output_function};
   cc_ctx = dyibicc_set_environment(&cc_env_data);
@@ -652,8 +656,10 @@ int main(void) {
     } else {
       console_error_set_visible(true);
       ClearBackground(DARKGRAY);
-      //DrawRectangleGradientEx((Rectangle){0, 0, GetScreenWidth(), GetScreenHeight()},
-          //RED, WHITE, GREEN, BLUE);
+      if (last_compile_successful) {
+        console_error_clear();
+        console_error_printf("\033[1;31mentry point not found: \033[0m%s\n", ENTRY_POINT_NAME);
+      }
     }
 
     console_update();

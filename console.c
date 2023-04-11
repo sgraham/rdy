@@ -120,12 +120,13 @@ void console_update(void) {
   if (IsKeyPressed(KEY_GRAVE))
     main.is_visible = !main.is_visible;
 
-  float error_hidden_y_location = (float)GetScreenHeight();
+#define EASE_SPEED 0.3f
+  float error_hidden_y_location = (float)GetScreenHeight() + BORDER;
   if (error.is_visible) {
     float target_y = (float)GetScreenHeight() - error.location.height - BORDER * 2;
-    error.location.y = Lerp(error.location.y, target_y, 0.5f);
+    error.location.y = Lerp(error.location.y, target_y, EASE_SPEED);
   } else {
-    error.location.y = Lerp(error.location.y, error_hidden_y_location, 0.5f);
+    error.location.y = Lerp(error.location.y, error_hidden_y_location, EASE_SPEED);
   }
 
   float main_hidden_y_location = (float)-GetScreenHeight();
@@ -134,9 +135,9 @@ void console_update(void) {
     if (error.is_visible) {
       target_y -= error.location.height + BORDER * 3;
     }
-    main.location.y = Lerp(main.location.y, target_y, 0.5f);
+    main.location.y = Lerp(main.location.y, target_y, EASE_SPEED);
   } else {
-    main.location.y = Lerp(main.location.y, main_hidden_y_location, 0.5f);
+    main.location.y = Lerp(main.location.y, main_hidden_y_location, EASE_SPEED);
   }
 
 
@@ -222,6 +223,13 @@ int console_error_vprintf(const char* fmt, va_list ap) {
   console_error_out(stack_buf);
 
   return num_chars;
+}
+
+void console_error_printf(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  console_error_vprintf(fmt, ap);
+  va_end(ap);
 }
 
 void console_shutdown(void) {

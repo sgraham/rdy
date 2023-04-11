@@ -8,8 +8,11 @@
 static DyibiccContext* cc_ctx;
 static bool last_compile_successful;
 
-extern bool nvim_connection_setup(const char* files[], const char* nvim_config_fullpath);
+extern bool nvim_connection_setup(const char* files[],
+                                  const char* nvim_config_fullpath,
+                                  void** connection_handle);
 extern bool nvim_connection_poll(void (*file_update)(char* name, char* contents));
+extern bool nvim_connection_send_quit_and_shutdown(void* connection_handle);
 
 extern void console_init(void);
 extern void console_update(void);
@@ -22,7 +25,7 @@ extern void console_shutdown(void);
 
 static int output_function(int level, const char* fmt, va_list ap) {
   return console_vprintf(level, fmt, ap);
-  //return vfprintf(stdout, fmt, ap);
+  // return vfprintf(stdout, fmt, ap);
 }
 
 static void Log(const char* fmt, ...) {
@@ -32,7 +35,9 @@ static void Log(const char* fmt, ...) {
 }
 
 static void* provide_function(const char* name) {
-#define X(n) if (strcmp(#n, name) == 0) return (void*)n;
+#define X(n)                 \
+  if (strcmp(#n, name) == 0) \
+    return (void*)n;
   X(Log);
 
   X(InitWindow);
@@ -592,7 +597,8 @@ int main(void) {
   };
 
   char* nvim_config_fullpath = fullpath("ide");
-  nvim_connection_setup(files, nvim_config_fullpath);
+  void* connection_handle;
+  nvim_connection_setup(files, nvim_config_fullpath, &connection_handle);
   free(nvim_config_fullpath);
 
   DyibiccEnviromentData cc_env_data = {.include_paths = include_paths,
@@ -602,9 +608,9 @@ int main(void) {
                                        .output_function = output_function};
   cc_ctx = dyibicc_set_environment(&cc_env_data);
 
-  for (char**p = include_paths; *p; ++p)
+  for (char** p = include_paths; *p; ++p)
     free(*p);
-  for (char**p = files; *p; ++p)
+  for (char** p = files; *p; ++p)
     free(*p);
 
   bool first = true;
@@ -634,6 +640,8 @@ int main(void) {
 
   dyibicc_free(cc_ctx);
   cc_ctx = NULL;
+
+  nvim_connection_send_quit_and_shutdown(connection_handle);
 
   CloseWindow();
 

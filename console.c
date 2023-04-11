@@ -49,12 +49,13 @@ void console_update(void) {
 
   if (is_visible || override_visible) {
     float target_height = BORDER;
-    location.y = Clamp(Lerp(location.y, target_height, 0.5f), (float)-GetScreenHeight(), target_height);
+    location.y =
+        Clamp(Lerp(location.y, target_height, 0.5f), (float)-GetScreenHeight(), target_height);
   } else {
     location.y = Lerp(location.y, (float)-GetScreenHeight(), 0.5f);
   }
 
-  DrawRectangleRec(location, Fade(BLACK, 0.85f));
+  DrawRectangleRounded(location, .02f, 6, Fade(BLACK, 0.85f));
 
   float scale_factor = (float)CONSOLE_FONT_SIZE / debug_font.baseSize;
 

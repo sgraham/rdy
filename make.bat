@@ -3,7 +3,8 @@ pushd ..\dyibicc
 call make.bat
 popd
 
-set CFLAGS=/nologo /fsanitize=address /c /Ox /GL /Zi /MT /D_CRT_SECURE_NO_DEPRECATE /DPLATFORM_DESKTOP /DMPACK_EXTENSIONS=1
+set CFLAGS=/nologo /c /Ox /GL /Zi /MT /D_CRT_SECURE_NO_DEPRECATE /DPLATFORM_DESKTOP /DMPACK_EXTENSIONS=1
+:: /fsanitize=address
 :: /DMPACK_DEBUG=1
 
 cl %CFLAGS% /W4 /WX ^

@@ -226,7 +226,7 @@ bool nvim_connection_send_quit_and_shutdown(HANDLE pipe) {
   // As the failure case is just that you have to close nvim manually, we'll
   // tolerate the Sleep for now.
   FlushFileBuffers(pipe);
-  Sleep(50);
+  Sleep(100);
   CloseHandle(pipe);
 
   return true;

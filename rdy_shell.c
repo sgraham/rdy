@@ -629,7 +629,8 @@ int main(void) {
                                        .files = files,
                                        .entry_point_name = ENTRY_POINT_NAME,
                                        .get_function_address = provide_function,
-                                       .output_function = output_function};
+                                       .output_function = output_function,
+                                       .use_ansi_codes = true};
   cc_ctx = dyibicc_set_environment(&cc_env_data);
 
   for (char** p = include_paths; *p; ++p)

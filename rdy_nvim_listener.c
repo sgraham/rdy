@@ -182,16 +182,19 @@ static void got_message(mpack_node_t root, void (*callback)(char*, char*)) {
 }
 
 bool nvim_connection_poll(void (*file_update)(char* name, char* contents)) {
-  bool ok = mpack_tree_try_parse(&nvim_tree);
-  mpack_error_t err = mpack_tree_error(&nvim_tree);
-  if (err != mpack_ok) {
-    fprintf(stderr, "got error %d\n", err);
-    return false;
+  for (;;) {
+    bool ok = mpack_tree_try_parse(&nvim_tree);
+    mpack_error_t err = mpack_tree_error(&nvim_tree);
+    if (err != mpack_ok) {
+      fprintf(stderr, "got error %d\n", err);
+      return false;
+    }
+    if (ok) {
+      got_message(mpack_tree_root(&nvim_tree), file_update);
+    } else {
+      return true;
+    }
   }
-  if (ok) {
-    got_message(mpack_tree_root(&nvim_tree), file_update);
-  }
-  return true;
 }
 
 bool nvim_connection_send_quit_and_shutdown(HANDLE pipe) {

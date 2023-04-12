@@ -22,7 +22,7 @@ extern void console_main_set_visible(bool visible);
 extern void console_error_set_visible(bool visible);
 
 extern int console_main_out(const char* text);
-extern void console_error_printf(const char* fmt, ...);
+extern void console_main_printf(const char* fmt, ...);
 extern int console_main_vprintf(const char* fmt, va_list ap);
 extern void console_main_clear(void);
 
@@ -595,9 +595,75 @@ static char* fullpath(const char* relpath) {
   return _strdup(buf);
 }
 
+typedef struct PendingUpdate {
+  char* filename;
+  char* contents;
+} PendingUpdate;
+static PendingUpdate* pending_updates;
+static int num_pending_files;
+
+static void allocate_pending_updates(const char* files[]) {
+  num_pending_files = 0;
+  for (char**p = files; *p; ++p) {
+    ++num_pending_files;
+  }
+
+  pending_updates = calloc(num_pending_files, sizeof(PendingUpdate));
+  int i = 0;
+  for (char**p = files; *p; ++p) {
+    PendingUpdate* pu = &pending_updates[i++];
+    pu->filename = _strdup(*p);
+  }
+}
+
+static void free_pending_updates(void) {
+  for (int i = 0; i < num_pending_files; ++i) {
+    PendingUpdate* pu = &pending_updates[i];
+    free(pu->filename);
+    if (pu->contents) {
+      free(pu->contents);
+      pu->contents = NULL;
+    }
+  }
+}
+
 static void file_update_notification(char* filename, char* contents) {
-  console_error_clear();
-  last_compile_successful = dyibicc_update(cc_ctx, filename, contents);
+  for (int i = 0; i < num_pending_files; ++i) {
+    PendingUpdate* pu = &pending_updates[i];
+    if (strcmp(pu->filename, filename) == 0) {
+      if (pu->contents) {
+        free(pu->contents);
+      }
+      pu->contents = _strdup(contents);
+      return;
+    }
+  }
+  console_main_printf("'%s' got update but wasn't in project?", filename);
+}
+
+static void commit_last_change_for_each_file(void) {
+  bool first_this_frame = true;
+  // If multiple updates arrived during one RPC poll, we only bother compiling
+  // the last one. This helps avoid getting "behind" during rapid changes in the
+  // editor, like a long autocomplete or rapid undo/redo.
+  for (int i = 0; i < num_pending_files; ++i) {
+    PendingUpdate* pu = &pending_updates[i];
+    if (pu->contents) {
+      if (first_this_frame) {
+        console_error_clear();
+        last_compile_successful = true;
+        first_this_frame = false;
+      }
+
+      if (!dyibicc_update(cc_ctx, pu->filename, pu->contents)) {
+        last_compile_successful = false;
+        // Don't break here, otherwise an update with multiple files would lose
+        // the later update if an earlier one had a compile error.
+      }
+      free(pu->contents);
+      pu->contents = NULL;
+    }
+  }
 }
 
 int main(void) {
@@ -618,6 +684,8 @@ int main(void) {
       fullpath(".\\entry.c"),
       NULL,
   };
+
+  allocate_pending_updates(files);
 
   char* nvim_config_fullpath = fullpath("ide");
   void* connection_handle;
@@ -647,6 +715,8 @@ int main(void) {
       break;
     }
 
+    commit_last_change_for_each_file();
+
     BeginDrawing();
 
     if (last_compile_successful && cc_ctx->entry_point) {
@@ -672,6 +742,7 @@ int main(void) {
   cc_ctx = NULL;
 
   nvim_connection_send_quit_and_shutdown(connection_handle);
+  free_pending_updates();
 
   CloseWindow();
 

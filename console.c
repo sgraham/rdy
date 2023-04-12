@@ -213,6 +213,13 @@ int console_main_vprintf(const char* fmt, va_list ap) {
   return num_chars;
 }
 
+void console_main_printf(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  console_main_vprintf(fmt, ap);
+  va_end(ap);
+}
+
 int console_error_vprintf(const char* fmt, va_list ap) {
   char stack_buf[256];
   int num_chars = vsnprintf(stack_buf, sizeof(stack_buf), fmt, ap);

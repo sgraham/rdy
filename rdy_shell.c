@@ -692,10 +692,8 @@ int main(void) {
   nvim_connection_setup(files, nvim_config_fullpath, &connection_handle);
   free(nvim_config_fullpath);
 
-#define ENTRY_POINT_NAME "RdyEntryPoint"
   DyibiccEnviromentData cc_env_data = {.include_paths = include_paths,
                                        .files = files,
-                                       .entry_point_name = ENTRY_POINT_NAME,
                                        .get_function_address = provide_function,
                                        .output_function = output_function,
                                        .use_ansi_codes = true};
@@ -719,9 +717,14 @@ int main(void) {
 
     BeginDrawing();
 
-    if (last_compile_successful && cc_ctx->entry_point) {
+#define ENTRY_POINT_NAME "RdyEntryPoint"
+    void* entry = NULL;
+    if (last_compile_successful)
+      entry = dyibicc_find_export(cc_ctx, ENTRY_POINT_NAME);
+
+    if (last_compile_successful && entry) {
       console_error_set_visible(false);
-      void (*p)(int) = (void (*)(int))cc_ctx->entry_point;
+      void (*p)(int) = (void (*)(int))entry;
       p(first ? 0 : 1);
       first = false;
     } else {

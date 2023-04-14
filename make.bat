@@ -59,7 +59,6 @@ link /nologo ^
   utils.obj ^
   ..\dyibicc\alloc.obj ^
   ..\dyibicc\codegen.win32.obj ^
-  ..\dyibicc\dyo.obj ^
   ..\dyibicc\hashmap.obj ^
   ..\dyibicc\link.obj ^
   ..\dyibicc\main.obj ^

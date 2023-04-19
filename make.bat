@@ -1,7 +1,4 @@
 @echo off
-pushd ..\dyibicc
-call make.bat
-popd
 
 set CFLAGS=/nologo /c /Ox /GL /Zi /MT /D_CRT_SECURE_NO_DEPRECATE /DPLATFORM_DESKTOP /DMPACK_EXTENSIONS=1
 :: /fsanitize=address
@@ -10,20 +7,14 @@ set CFLAGS=/nologo /c /Ox /GL /Zi /MT /D_CRT_SECURE_NO_DEPRECATE /DPLATFORM_DESK
 cl %CFLAGS% /W4 /WX ^
   /Iraylib\src ^
   /I..\dyibicc ^
-  /Impack\src\mpack ^
-  rdy_shell.c ^
-  rdy_nvim_listener.c ^
-  console.c ^
+  /Impack ^
+  /Ilibdyibicc ^
+  src\rdy_shell.c ^
+  src\rdy_nvim_listener.c ^
+  src\console.c ^
+  mpack\mpack.c ^
+  libdyibicc\libdyibicc.c ^
   || exit /b 1
-
-cl %CFLAGS% /W4 /WX ^
-    mpack\src\mpack\mpack-common.c ^
-    mpack\src\mpack\mpack-expect.c ^
-    mpack\src\mpack\mpack-node.c ^
-    mpack\src\mpack\mpack-platform.c ^
-    mpack\src\mpack\mpack-reader.c ^
-    mpack\src\mpack\mpack-writer.c^
-    || exit /b 1
 
 cl %CFLAGS% /W1 ^
   /Iraylib\src ^
@@ -43,12 +34,7 @@ link /nologo ^
   rdy_shell.obj ^
   rdy_nvim_listener.obj ^
   console.obj ^
-  mpack-common.obj ^
-  mpack-expect.obj ^
-  mpack-node.obj ^
-  mpack-platform.obj ^
-  mpack-reader.obj ^
-  mpack-writer.obj ^
+  mpack.obj ^
   raudio.obj ^
   rcore.obj ^
   rglfw.obj ^
@@ -57,20 +43,12 @@ link /nologo ^
   rtext.obj ^
   rtextures.obj ^
   utils.obj ^
-  ..\dyibicc\alloc.obj ^
-  ..\dyibicc\codegen.win32.obj ^
-  ..\dyibicc\hashmap.obj ^
-  ..\dyibicc\link.obj ^
-  ..\dyibicc\main.obj ^
-  ..\dyibicc\parse.obj ^
-  ..\dyibicc\preprocess.obj ^
-  ..\dyibicc\tokenize.obj ^
-  ..\dyibicc\type.obj ^
-  ..\dyibicc\unicode.obj ^
-  ..\dyibicc\util.obj ^
+  libdyibicc.obj ^
   winmm.lib user32.lib gdi32.lib shell32.lib onecore.lib /LTCG /DEBUG /out:rdy.exe ^
   || exit /b 1
 
 del *.obj 2>nul
 del vc140.pdb 2>nul
 del *.ilk 2>nul
+del *.exp 2>nul
+del *.lib 2>nul

@@ -5,6 +5,7 @@ vim.opt.shiftwidth = 2
 vim.opt.softtabstop = 2
 vim.opt.tw = 80
 vim.opt.cc = '80'
+vim.opt.wrap = false
 vim.opt.clipboard:append('unnamedplus')
 
 vim.cmd([[
@@ -15,9 +16,10 @@ imap <S-Insert> <C-R><C-O>*
 cmap <S-Insert> <C-R><C-O>*
 vmap <S-Insert> "-d"*P
 map <S-Insert> "*P
+map <silent> <F8> :call ToggleTraceWatch()<CR>
 
-let g:clang_format_path = "nvim/clang-format.exe"
-au BufRead,BufNewFile,BufEnter *.c,*.h noremap <silent> <F1> :py3f nvim/clang-format.py<CR>
+let g:clang_format_path = "ide/clang-format.exe"
+au BufRead,BufNewFile,BufEnter *.c,*.h noremap <silent> <F1> :py3f ide/clang-format.py<CR>
 ]])
 
 vim.api.nvim_create_autocmd({"BufEnter", "WinEnter"}, {

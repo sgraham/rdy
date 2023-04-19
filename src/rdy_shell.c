@@ -677,11 +677,11 @@ int main(void) {
 
   const char* include_paths[] = {
       fullpath(".\\raylib\\src"),
-      fullpath("."),
+      fullpath(".\\project"),
       NULL,
   };
   const char* files[] = {
-      fullpath(".\\entry.c"),
+      fullpath(".\\project\\entry.c"),
       NULL,
   };
 
@@ -708,6 +708,7 @@ int main(void) {
 
   last_compile_successful = dyibicc_update(cc_ctx, NULL, NULL);
 
+  SetExitKey(0);
   while (!WindowShouldClose()) {
     if (!nvim_connection_poll(file_update_notification)) {
       break;

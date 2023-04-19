@@ -2,8 +2,7 @@
 #include <time.h>
 #include <windows.h>
 
-#include "mpack-node.h"
-#include "mpack-writer.h"
+#include "mpack.h"
 
 static mpack_tree_t nvim_tree;
 static uint32_t message_id;
@@ -83,18 +82,23 @@ static bool launch_nvim(const char* pipename,
     strcat(command_line, *p);
     strcat(command_line, " ");
   }
-  char envblock[1024] = {0};
-  strcpy(envblock, "XDG_CONFIG_HOME=");
-  strcat(envblock, nvim_config_fullpath);
-  char* next = &envblock[strlen(envblock) + 1];
-  strcpy(next, "XDG_DATA_HOME=");
-  strcat(next, nvim_config_fullpath);
-  strcat(next, "\\share\0");
+  strcat(command_line, "raylib\\src\\raylib.h"); // TODO: fullpath, but not files.
+
+  // We add these to our own environment and then inherit that. We're not going
+  // to survive long after neovim goes away anyway, and don't care about these
+  // variables generally.
+  SetEnvironmentVariable("XDG_CONFIG_HOME", nvim_config_fullpath);
+  char home_var[1024] = {0};
+  strcpy(home_var, nvim_config_fullpath);
+  strcat(home_var, "\\share");
+  SetEnvironmentVariable("XDG_DATA_HOME", home_var);
+
   STARTUPINFO si = {0};
   si.cb = sizeof(STARTUPINFO);
   PROCESS_INFORMATION pi = {0};
   // TODO pi handles leaked
-  return CreateProcess(nvim_exe_name, command_line, NULL, NULL, TRUE, 0, envblock, NULL, &si, &pi);
+  return CreateProcess(nvim_exe_name, command_line, NULL, NULL, TRUE, 0, /*inherit*/ NULL, NULL,
+                       &si, &pi);
 }
 
 bool nvim_connection_setup(const char* files[],

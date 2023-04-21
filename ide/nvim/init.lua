@@ -3,10 +3,13 @@ require("plugins").setup()
 vim.opt.tabstop = 2
 vim.opt.shiftwidth = 2
 vim.opt.softtabstop = 2
+vim.opt.expandtab = true
 vim.opt.tw = 80
 vim.opt.cc = '80'
 vim.opt.wrap = false
 vim.opt.clipboard:append('unnamedplus')
+vim.opt.listchars='tab:>-,trail:.,extends:>'
+vim.opt.list = true
 
 vim.cmd([[
 map H ^
@@ -19,6 +22,8 @@ map <S-Insert> "*P
 map <silent> <F8> :call ToggleTraceWatch()<CR>
 execute "map ,ev :e! " . stdpath('config') . "/init.lua<CR>"
 execute "map ,sv :so " . stdpath('config') . "/init.lua<CR>"
+
+map ,i0 dO#if 0<CR>#endif<ESC>kp
 
 map <silent> <C-F5> :if expand("%:p:h") != ""<CR>:!start explorer.exe %:p:h,/e<CR>:endif<CR><CR>
 

@@ -7,6 +7,8 @@
 static mpack_tree_t nvim_tree;
 static uint32_t message_id;
 static char file_receive_buffer[2 << 20];
+static uint32_t namespace_creation_message_id;
+static uint32_t qq_namespace_id;
 
 // Buffer sizes for mpack reading.
 #define NVIM_MAX_SIZE (64 * 1024 * 1024)
@@ -58,6 +60,32 @@ static bool send_subscribe(HANDLE pipe) {
   mpack_build_array(&writer);
   // This is triggered by an autocmd and then sent here by rpcnotify.
   mpack_write_cstr(&writer, "EventFileUpdate");
+  mpack_complete_array(&writer);
+  mpack_complete_array(&writer);
+
+  if (mpack_writer_destroy(&writer) != mpack_ok) {
+    fprintf(stderr, "An error occurred encoding the data!\n");
+    return false;
+  }
+
+  send_message_and_free(pipe, data, size);
+
+  return true;
+}
+
+static bool send_create_namespace(HANDLE pipe) {
+  char* data;
+  size_t size;
+  mpack_writer_t writer;
+  mpack_writer_init_growable(&writer, &data, &size);
+
+  mpack_build_array(&writer);
+  mpack_write_u32(&writer, 0);  // "Request"
+  mpack_write_u32(&writer, ++message_id);
+  namespace_creation_message_id = message_id;
+  mpack_write_cstr(&writer, "nvim_create_namespace");
+  mpack_build_array(&writer);
+  mpack_write_cstr(&writer, "QQtext");
   mpack_complete_array(&writer);
   mpack_complete_array(&writer);
 
@@ -151,6 +179,9 @@ bool nvim_connection_setup(const char* files[],
   if (!send_subscribe(pipe))
     return false;
 
+  if (!send_create_namespace(pipe))
+    return false;
+
   mpack_tree_init_stream(&nvim_tree, &do_nonblocking_read, pipe, NVIM_MAX_SIZE, NVIM_MAX_NODES);
   *connection_handle = pipe;
   return true;
@@ -159,7 +190,13 @@ bool nvim_connection_setup(const char* files[],
 static void got_message(mpack_node_t root, void (*callback)(char*, char*)) {
   // printf("-------------\n");
   // mpack_node_print_to_stdout(root);
-  //  Ignore everything except our custom event generated from init.lua.
+  if (mpack_node_array_length(root) == 4 &&
+      mpack_node_u32(mpack_node_array_at(root, 0)) == 1 /*Response*/ &&
+      mpack_node_u32(mpack_node_array_at(root, 1)) == namespace_creation_message_id) {
+    qq_namespace_id = mpack_node_u32(mpack_node_array_at(root, 3));
+    return;
+  }
+    //  Ignore everything else except our custom event generated from init.lua.
   if (mpack_node_array_length(root) == 3 && mpack_node_u32(mpack_node_array_at(root, 0)) == 2) {
     // I think "2" means event, but I can't find that documented anywhere.
     mpack_node_t evname = mpack_node_array_at(root, 1);
@@ -199,6 +236,76 @@ bool nvim_connection_poll(void (*file_update)(char* name, char* contents)) {
       return true;
     }
   }
+}
+
+bool nvim_connection_send_clear_all_extmarks(HANDLE pipe) {
+  char* data;
+  size_t size;
+  mpack_writer_t writer;
+  mpack_writer_init_growable(&writer, &data, &size);
+
+  mpack_build_array(&writer);
+  mpack_write_u32(&writer, 0);  // "Request"
+  mpack_write_u32(&writer, ++message_id);
+  mpack_write_cstr(&writer, "nvim_buf_clear_namespace");
+  mpack_build_array(&writer);
+  mpack_write_u32(&writer, 0);  // TODO: buffer == cur
+  mpack_write_u32(&writer, qq_namespace_id);
+  mpack_write_i32(&writer, 0); // start
+  mpack_write_i32(&writer, -1); // end
+  mpack_complete_array(&writer);
+  mpack_complete_array(&writer);
+
+  if (mpack_writer_destroy(&writer) != mpack_ok) {
+    fprintf(stderr, "An error occurred encoding the data!\n");
+    return false;
+  }
+
+  send_message_and_free(pipe, data, size);
+
+  return true;
+}
+
+bool nvim_connection_send_extmark_update(HANDLE pipe, char* file, int line, char* contents) {
+  (void)file;
+  char* data;
+  size_t size;
+  mpack_writer_t writer;
+  mpack_writer_init_growable(&writer, &data, &size);
+
+  mpack_build_array(&writer);
+  mpack_write_u32(&writer, 0);  // "Request"
+  mpack_write_u32(&writer, ++message_id);
+  mpack_write_cstr(&writer, "nvim_buf_set_extmark");
+  mpack_build_array(&writer);
+  mpack_write_u32(&writer, 0);  // TODO: buffer == cur
+  mpack_write_u32(&writer, qq_namespace_id);
+  mpack_write_i32(&writer, line); // line
+  mpack_write_i32(&writer, 0); // col, unused
+  mpack_build_map(&writer); // opts
+  mpack_write_cstr(&writer, "id");
+  mpack_write_u32(&writer, line);
+  mpack_write_cstr(&writer, "virt_text");
+  mpack_build_array(&writer);
+  mpack_build_array(&writer);
+  mpack_write_cstr(&writer, contents);
+  mpack_write_cstr(&writer, "IncSearch");
+  mpack_complete_array(&writer);
+  mpack_complete_array(&writer);
+  mpack_write_cstr(&writer, "virt_text_pos");
+  mpack_write_cstr(&writer, "eol");
+  mpack_complete_map(&writer); // opts
+  mpack_complete_array(&writer);
+  mpack_complete_array(&writer);
+
+  if (mpack_writer_destroy(&writer) != mpack_ok) {
+    fprintf(stderr, "An error occurred encoding the data!\n");
+    return false;
+  }
+
+  send_message_and_free(pipe, data, size);
+
+  return true;
 }
 
 bool nvim_connection_send_quit_and_shutdown(HANDLE pipe) {

@@ -1,70 +1,34 @@
-#ifndef __dyibicc__
-#define 🔎(...)
-#endif
+#define QQ(expr) qq_eval(__FILE__, __LINE__, _ReflectTypeOf(expr), expr)
+void qq_eval(const char* file, int line, int num_args, ...);
+
 #include <math.h>
 #include <stdio.h>
 #include "raylib.h"
 
-void Log(const char* fmt, ...);
+#define GRID 16
 
 static void init(void) {
   SetWindowPosition(10, 50);
 }
 
-#define NUM_BALLS 1000
-
-typedef struct SnowBall {
-  double x;
-  double y;
-  double yspeed;
-} SnowBall;
-
-SnowBall snowballs[NUM_BALLS];
-
-double counter;
-
-static void bounce_a_thing(void) {
-  int x = 400 * cos(counter);
-  int y = 400 * sin(counter * 2);
-  counter += 0.05;
-  DrawCircle(x + 1000, y + 500, 50.f, RED);
-  // DrawText(TextFormat("%f", counter), 100, 200, 40, WHITE);
-}
-
-static void init_snowball(SnowBall* b) {
-  b->x = GetRandomValue(0, GetRenderWidth() - 1);
-  b->y = 0;
-  b->yspeed = GetRandomValue(1, 100) / 10.0;
-}
-
-static void init_snowballs(void) {
-  for (int i = 0; i < NUM_BALLS; ++i) {
-    init_snowball(&snowballs[i]);
-  }
-}
-
-static void draw_snowballs(void) {
-  for (int i = 0; i < NUM_BALLS; ++i) {
-    SnowBall* b = &snowballs[i];
-    b->y += b->yspeed;
-    DrawCircle(b->x, b->y, 5.f, WHITE);
-    if (b->y > GetScreenWidth()) {
-      init_snowball(b);
-    }
-  }
-  DrawText(TextFormat("%d %d", GetRenderWidth(), GetRenderHeight()), 100, 300,
-           40, WHITE);
-}
+void Log(const char* fmt, ...);
 
 static void update(void) {
   ClearBackground((Color){0x64, 0x95, 0xed, 0xff});
 
-  //init_snowballs();
-  draw_snowballs();
+  Camera2D cam = { (Vector2){0,0}, (Vector2){0,0}, 0.f, 1.f };
+  //BeginMode2D(cam);
 
-  bounce_a_thing();
+#if 0
+  for (int x = 0; x < GetRenderWidth(); x += GRID) {
+    DrawLine(x, 0, x, GetRenderHeight(), GRAY);
+  }
+  for (int y = 0; y < GetRenderHeight(); y += GRID) {
+    DrawLine(0, y, GetRenderWidth(), y, GRAY);
+  }
+#endif
 
-  DrawText("Welcome to Rdy!", 100, 100, 40, ORANGE);
+  EndMode2D();
 }
 
 // 0 = init

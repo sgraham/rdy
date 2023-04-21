@@ -1,18 +1,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <reflect.h>
 
 #include "libdyibicc.h"
 #include "raylib.h"
 
 static DyibiccContext* cc_ctx;
 static bool last_compile_successful;
+static void* connection_handle;
 
 extern bool nvim_connection_setup(const char* files[],
                                   const char* nvim_config_fullpath,
                                   void** connection_handle);
 extern bool nvim_connection_poll(void (*file_update)(char* name, char* contents));
 extern bool nvim_connection_send_quit_and_shutdown(void* connection_handle);
+extern bool nvim_connection_send_extmark_update(void* pipe, char* file, int line, char* contents);
+extern bool nvim_connection_send_clear_all_extmarks(void* pipe);
 
 extern void console_preinit(void);
 extern void console_init(void);
@@ -44,6 +48,23 @@ static void Log(const char* fmt, ...) {
   console_main_vprintf(fmt, ap);
 }
 
+static void qq_eval(char* file, int line, _ReflectType* type, ...) {
+  char buf[256];
+
+  va_list ap;
+  va_start(ap, type);
+  if (type->kind == _REFLECT_KIND_INT) {
+    sprintf(buf, "= %d (%s)", va_arg(ap, int), type->name);
+  } else if (type->kind == _REFLECT_KIND_DOUBLE) {
+    sprintf(buf, "= %f (%s)", va_arg(ap, double), type->name);
+  } else {
+    sprintf(buf, "...todo");
+  }
+  va_end(ap);
+
+  nvim_connection_send_extmark_update(connection_handle, file, line - 1, buf);
+}
+
 void custom_raylib_log(int log_type, const char *fmt, va_list ap) {
   if (log_type < LOG_WARNING) {
     console_main_out("\033[0m"); // Reset
@@ -61,6 +82,7 @@ static void* provide_function(const char* name) {
   if (strcmp(#n, name) == 0) \
     return (void*)n;
   X(Log);
+  X(qq_eval);
 
   X(InitWindow);
   X(WindowShouldClose);
@@ -655,6 +677,7 @@ static void commit_last_change_for_each_file(void) {
         first_this_frame = false;
       }
 
+      nvim_connection_send_clear_all_extmarks(connection_handle);
       if (!dyibicc_update(cc_ctx, pu->filename, pu->contents)) {
         last_compile_successful = false;
         // Don't break here, otherwise an update with multiple files would lose
@@ -688,12 +711,12 @@ int main(void) {
   allocate_pending_updates(files);
 
   char* nvim_config_fullpath = fullpath("ide");
-  void* connection_handle;
   nvim_connection_setup(files, nvim_config_fullpath, &connection_handle);
   free(nvim_config_fullpath);
 
   DyibiccEnviromentData cc_env_data = {.include_paths = include_paths,
                                        .files = files,
+                                       .dyibicc_include_dir = "libdyibicc\\include",
                                        .get_function_address = provide_function,
                                        .output_function = output_function,
                                        .use_ansi_codes = true};

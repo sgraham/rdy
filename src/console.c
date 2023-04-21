@@ -36,6 +36,7 @@ typedef struct Console {
   CChar* characters;
   int buffer_width;
   int buffer_height;
+  int visible_height;
   CChar* last_insertion_location;
   char current_colour;
   bool is_visible;
@@ -43,6 +44,8 @@ typedef struct Console {
 
 static Console main;
 static Console error;
+
+static int main_scroll;
 
 static Font debug_font;
 static float font_scale_factor;
@@ -54,11 +57,13 @@ static float font_scale_factor;
 
 void console_preinit(void) {
   main.buffer_width = 120;
-  main.buffer_height = 35;
+  main.buffer_height = 500;
+  main.visible_height = 35;
   main.characters = calloc(main.buffer_width * main.buffer_height, sizeof(CChar));
 
   error.buffer_width = 100;
   error.buffer_height = 8;
+  error.visible_height = 8;
   error.characters = calloc(error.buffer_width * error.buffer_height, sizeof(CChar));
 }
 
@@ -74,12 +79,13 @@ void console_init(void) {
   error.location.x = BORDER * 2;
   error.location.y = (float)GetScreenHeight();
   error.location.width = GetScreenWidth() - BORDER * 4;
-  error.location.height = CONSOLE_FONT_SIZE * font_scale_factor * error.buffer_height + BORDER * 2;
+  error.location.height = CONSOLE_FONT_SIZE * font_scale_factor * error.visible_height + BORDER * 2;
 }
 
 void console_main_clear(void) {
   memset(main.characters, 0, main.buffer_width * main.buffer_height * sizeof(CChar));
   main.last_insertion_location = NULL;
+  main_scroll = 0;
 }
 
 void console_main_set_visible(bool visible) {
@@ -95,9 +101,10 @@ void console_error_set_visible(bool visible) {
   error.is_visible = visible;
 }
 
-static void render_console_text(Console* con, float startx, float starty) {
+static void render_console_text(Console* con, float startx, float starty, int scroll) {
   Vector2 pos = {startx, starty};
-  for (int y = 0; y < con->buffer_height; ++y) {
+  for (int y = con->buffer_height - con->visible_height + scroll; y < con->buffer_height + scroll;
+       ++y) {
     pos.x = startx;
     for (int x = 0; x < con->buffer_width; ++x) {
       CChar* ch = &con->characters[y * con->buffer_width + x];
@@ -119,6 +126,21 @@ static void render_console_text(Console* con, float startx, float starty) {
 void console_update(void) {
   if (IsKeyPressed(KEY_GRAVE))
     main.is_visible = !main.is_visible;
+
+  if (main.is_visible) {
+    if (IsKeyDown(KEY_PAGE_UP))
+      main_scroll--;
+    else if (IsKeyDown(KEY_PAGE_DOWN))
+      main_scroll++;
+
+    main_scroll -= (int)GetMouseWheelMove();
+
+    int min_scroll = -(main.buffer_height - main.visible_height);
+    if (main_scroll < min_scroll)
+      main_scroll = min_scroll;
+    if (main_scroll > 0)
+      main_scroll = 0;
+  }
 
 #define EASE_SPEED 0.3f
   float error_hidden_y_location = (float)GetScreenHeight() + BORDER;
@@ -144,13 +166,13 @@ void console_update(void) {
   if (!FloatEquals(main.location.y, main_hidden_y_location)) {
     DrawRectangleRounded(main.location, .02f, 6, Fade(BLACK, 0.9f));
 
-    render_console_text(&main, main.location.x + BORDER, main.location.y + BORDER);
+    render_console_text(&main, main.location.x + BORDER, main.location.y + BORDER, main_scroll);
   }
 
   if (!FloatEquals(error.location.y, error_hidden_y_location)) {
     DrawRectangleRounded(error.location, .1f, 6, Fade(BLACK, 0.9f));
     DrawRectangleRoundedLines(error.location, .1f, 6, 5, RED);
-    render_console_text(&error, error.location.x + BORDER, error.location.y + BORDER);
+    render_console_text(&error, error.location.x + BORDER, error.location.y + BORDER, 0);
   }
 }
 

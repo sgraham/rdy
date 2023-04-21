@@ -43,6 +43,8 @@ function M.setup()
       end,
     }
 
+    use { "ctrlpvim/ctrlp.vim" }
+
     use {
       "rcarriga/nvim-dap-ui",
       requires = {"mfussenegger/nvim-dap"}

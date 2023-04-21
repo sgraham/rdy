@@ -17,9 +17,18 @@ cmap <S-Insert> <C-R><C-O>*
 vmap <S-Insert> "-d"*P
 map <S-Insert> "*P
 map <silent> <F8> :call ToggleTraceWatch()<CR>
+execute "map ,ev :e! " . stdpath('config') . "/init.lua<CR>"
+execute "map ,sv :so " . stdpath('config') . "/init.lua<CR>"
+
+map <silent> <C-F5> :if expand("%:p:h") != ""<CR>:!start explorer.exe %:p:h,/e<CR>:endif<CR><CR>
+
+map <silent> <F12> :CtrlPMRU<cr>
+imap <silent> <F12> <ESC>:CtrlPMRU<cr>
 
 let g:clang_format_path = "ide/clang-format.exe"
 au BufRead,BufNewFile,BufEnter *.c,*.h noremap <silent> <F1> :py3f ide/clang-format.py<CR>
+
+set gcr=a:blockCursor-blinkwait600-blinkoff700-blinkon600
 ]])
 
 vim.api.nvim_create_autocmd({"BufEnter", "WinEnter"}, {
@@ -42,3 +51,24 @@ vim.api.nvim_create_autocmd({"BufEnter", "WinEnter"}, {
   end,
   once = false
 })
+
+--[[local api = vim.api
+
+local bnr = vim.fn.bufnr('%')
+local ns_id = api.nvim_create_namespace('demo')
+
+local line_num = 5
+local col_num = 5
+
+local opts = {
+  end_line = 10,
+  id = 1,
+  virt_text = {{"/*QQ demo */", "Comment"}},
+  virt_text_pos = 'eol',
+  -- virt_text_win_col = 20,
+}
+
+local mark_id = api.nvim_buf_set_extmark(bnr, ns_id, line_num, 0, opts)
+print(mark_id)
+api.nvim_buf_del_extmark(bnr, ns_id, mark_id)
+]]

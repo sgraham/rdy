@@ -1,6 +1,6 @@
 //
 // Amalgamated (single file) build of https://github.com/sgraham/dyibicc.
-// Revision: 47ae33d77e512f42fb6c811e98033a13abf4d81a
+// Revision: 98c3387dcc54c28f1df9a1432694bcd6fffb9a07
 //
 // This file should not be edited or modified, patches should be to the
 // non-amalgamated files in src/. The user-facing API is in libdyibicc.h
@@ -11,7 +11,7 @@
 #undef L
 #undef VOID
 //
-// START OF src/dyibicc.h
+// START OF ../../src/dyibicc.h
 //
 #define _POSIX_C_SOURCE 200809L
 #define _DEFAULT_SOURCE
@@ -122,6 +122,7 @@ static void alloc_free(void* p, AllocLifetime lifetime);  // AL_Manual only.
 static void* aligned_allocate(size_t size, size_t alignment);
 static void aligned_free(void* p);
 static void* allocate_writable_memory(size_t size);
+static bool make_memory_readwrite(void* m, size_t size);
 static bool make_memory_executable(void* m, size_t size);
 static void free_executable_memory(void* p, size_t size);
 
@@ -173,7 +174,7 @@ static void strarray_push(StringArray* arr, char* s, AllocLifetime lifetime);
 static void strintarray_push(StringIntArray* arr, StringInt item, AllocLifetime lifetime);
 static char* format(AllocLifetime lifetime, char* fmt, ...)
     __attribute__((format(printf, 2, 3)));
-static char* read_file(char* path, AllocLifetime lifetime);
+static char* read_file_wrap_user(char* path, AllocLifetime lifetime);
 static NORETURN void error(char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static NORETURN void error_at(char* loc, char* fmt, ...) __attribute__((format(printf, 2, 3)));
 static NORETURN void error_tok(Token* tok, char* fmt, ...)
@@ -643,6 +644,7 @@ typedef struct FileLinkData {
 static void free_link_fixups(FileLinkData* fld);
 
 typedef struct UserContext {
+  DyibiccLoadFileContents load_file_contents;
   DyibiccFunctionLookupFn get_function_address;
   DyibiccOutputFn output_function;
   bool use_ansi_codes;
@@ -718,13 +720,13 @@ typedef struct LinkerState {
 } LinkerState;
 
 //
-// END OF src/dyibicc.h
+// END OF ../../src/dyibicc.h
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF include/all/reflect.h
+// START OF ../../include/all/reflect.h
 //
 
 #include <stddef.h>
@@ -819,13 +821,13 @@ struct _ReflectType {
 extern _ReflectType* _ReflectTypeOf(...);
 #endif
 //
-// END OF include/all/reflect.h
+// END OF ../../include/all/reflect.h
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF src/khash.h
+// START OF ../../src/khash.h
 //
 /* The MIT License
 
@@ -1503,7 +1505,7 @@ typedef const char* kh_cstr_t;
 
 #endif /* __AC_KHASH_H */
 //
-// END OF src/khash.h
+// END OF ../../src/khash.h
 //
 #undef C
 #undef L
@@ -1515,7 +1517,7 @@ typedef const char* kh_cstr_t;
 #pragma warning(disable: 4244)
 #endif
 //
-// START OF src/dynasm/dasm_proto.h
+// START OF ../../src/dynasm/dasm_proto.h
 //
 /*
 ** DynASM encoding engine prototypes.
@@ -1601,7 +1603,7 @@ static int dasm_checkstep(Dst_DECL, int secmatch);
 
 #endif /* _DASM_PROTO_H */
 //
-// END OF src/dynasm/dasm_proto.h
+// END OF ../../src/dynasm/dasm_proto.h
 //
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -1616,7 +1618,7 @@ static int dasm_checkstep(Dst_DECL, int secmatch);
 #pragma warning(disable: 4244)
 #endif
 //
-// START OF src/dynasm/dasm_x86.h
+// START OF ../../src/dynasm/dasm_x86.h
 //
 /*
 ** DynASM x86 encoding engine.
@@ -2147,7 +2149,7 @@ int dasm_checkstep(Dst_DECL, int secmatch)
 #endif
 
 //
-// END OF src/dynasm/dasm_x86.h
+// END OF ../../src/dynasm/dasm_x86.h
 //
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -2156,7 +2158,7 @@ int dasm_checkstep(Dst_DECL, int secmatch)
 #undef L
 #undef VOID
 //
-// START OF src/type.c
+// START OF ../../src/type.c
 //
 
 static Type* ty_void = &(Type){TY_VOID, 1, 1};
@@ -2487,13 +2489,13 @@ static void add_type(Node* node) {
   }
 }
 //
-// END OF src/type.c
+// END OF ../../src/type.c
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF src/alloc.c
+// START OF ../../src/alloc.c
 //
 
 #if X64WIN
@@ -2637,6 +2639,24 @@ static void* allocate_writable_memory(size_t size) {
 
 // Sets a RX permission on the given memory, which must be page-aligned. Returns
 // 0 on success. On failure, prints out the error and returns -1.
+static bool make_memory_readwrite(void* m, size_t size) {
+#if X64WIN
+  DWORD old_protect;
+  if (!VirtualProtect(m, size, PAGE_READWRITE, &old_protect)) {
+    error("VirtualProtect %p %zu failed: 0x%x\n", m, size, GetLastError());
+  }
+  return true;
+#else
+  if (mprotect(m, size, PROT_READ | PROT_WRITE) == -1) {
+    perror("mprotect");
+    return false;
+  }
+  return true;
+#endif
+}
+
+// Sets a RX permission on the given memory, which must be page-aligned. Returns
+// 0 on success. On failure, prints out the error and returns -1.
 static bool make_memory_executable(void* m, size_t size) {
 #if X64WIN
   DWORD old_protect;
@@ -2666,251 +2686,13 @@ static void free_executable_memory(void* p, size_t size) {
 #endif
 }
 //
-// END OF src/alloc.c
+// END OF ../../src/alloc.c
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF src/util.c
-//
-
-#ifdef _WIN64
-#include <windows.h>
-#else
-#include <errno.h>
-#include <sys/stat.h>
-#endif
-
-static char* bumpstrndup(const char* s, size_t n, AllocLifetime lifetime) {
-  size_t l = strnlen(s, n);
-  char* d = bumpcalloc(1, l + 1, lifetime);
-  if (!d)
-    return NULL;
-  memcpy(d, s, l);
-  d[l] = 0;
-  return d;
-}
-
-static char* bumpstrdup(const char* s, AllocLifetime lifetime) {
-  size_t l = strlen(s);
-  char* d = bumpcalloc(1, l + 1, lifetime);
-  if (!d)
-    return NULL;
-  memcpy(d, s, l);
-  d[l] = 0;
-  return d;
-}
-
-static char* dirname(char* s) {
-  size_t i;
-  if (!s || !*s)
-    return ".";
-  i = strlen(s) - 1;
-  for (; s[i] == '/' || s[i] == '\\'; i--)
-    if (!i)
-      return "/";
-  for (; s[i] != '/' || s[i] == '\\'; i--)
-    if (!i)
-      return ".";
-  for (; s[i] == '/' || s[i] == '\\'; i--)
-    if (!i)
-      return "/";
-  s[i + 1] = 0;
-  return s;
-}
-
-// Round up `n` to the nearest multiple of `align`. For instance,
-// align_to(5, 8) returns 8 and align_to(11, 8) returns 16.
-static uint64_t align_to_u(uint64_t n, uint64_t align) {
-  return (n + align - 1) / align * align;
-}
-
-static int64_t align_to_s(int64_t n, int64_t align) {
-  return (n + align - 1) / align * align;
-}
-
-static unsigned int get_page_size(void) {
-#if X64WIN
-  SYSTEM_INFO system_info;
-  GetSystemInfo(&system_info);
-  return system_info.dwPageSize;
-#else
-  return sysconf(_SC_PAGESIZE);
-#endif
-}
-
-static void strarray_push(StringArray* arr, char* s, AllocLifetime lifetime) {
-  if (!arr->data) {
-    arr->data = bumpcalloc(8, sizeof(char*), lifetime);
-    arr->capacity = 8;
-  }
-
-  if (arr->capacity == arr->len) {
-    arr->data = bumplamerealloc(arr->data, sizeof(char*) * arr->capacity,
-                                sizeof(char*) * arr->capacity * 2, lifetime);
-    arr->capacity *= 2;
-    for (int i = arr->len; i < arr->capacity; i++)
-      arr->data[i] = NULL;
-  }
-
-  arr->data[arr->len++] = s;
-}
-
-static void strintarray_push(StringIntArray* arr, StringInt item, AllocLifetime lifetime) {
-  if (!arr->data) {
-    arr->data = bumpcalloc(8, sizeof(StringInt), lifetime);
-    arr->capacity = 8;
-  }
-
-  if (arr->capacity == arr->len) {
-    arr->data = bumplamerealloc(arr->data, sizeof(StringInt) * arr->capacity,
-                                sizeof(StringInt) * arr->capacity * 2, lifetime);
-    arr->capacity *= 2;
-    for (int i = arr->len; i < arr->capacity; i++)
-      arr->data[i] = (StringInt){NULL, -1};
-  }
-
-  arr->data[arr->len++] = item;
-}
-
-// Returns the contents of a given file. Doesn't support '-' for reading from
-// stdin.
-static char* read_file(char* path, AllocLifetime lifetime) {
-  FILE* fp = fopen(path, "rb");
-  if (!fp) {
-    return NULL;
-  }
-
-  fseek(fp, 0, SEEK_END);
-  long long size = ftell(fp);
-  rewind(fp);
-  char* buf = bumpcalloc(1, size + 1, lifetime);  // TODO: doesn't really need a calloc
-  long long n = fread(buf, 1, size, fp);
-  fclose(fp);
-  buf[n] = 0;
-  return buf;
-}
-
-// Takes a printf-style format string and returns a formatted string.
-static char* format(AllocLifetime lifetime, char* fmt, ...) {
-  char buf[4096];
-
-  va_list ap;
-  va_start(ap, fmt);
-  vsprintf(buf, fmt, ap);
-  va_end(ap);
-  return bumpstrdup(buf, lifetime);
-}
-
-static int outaf(const char* fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  int ret = user_context->output_function(fmt, ap);
-  va_end(ap);
-  return ret;
-}
-
-#define ANSI_WHITE "\033[1;37m"
-#define ANSI_GREEN "\033[1;32m"
-#define ANSI_RED "\033[1;31m"
-#define ANSI_RESET "\033[0m"
-
-// Reports an error message in the following format.
-//
-// foo.c:10: x = y + 1;
-//               ^ <error message here>
-static void verror_at(char* filename, char* input, int line_no, char* loc, char* fmt, va_list ap) {
-  // Find a line containing `loc`.
-  char* line = loc;
-  while (input < line && line[-1] != '\n')
-    line--;
-
-  char* end = loc;
-  while (*end && *end != '\n')
-    end++;
-
-  // Print out the line.
-  if (user_context->use_ansi_codes)
-    outaf(ANSI_WHITE);
-
-  int indent = outaf("%s:%d: ", filename, line_no);
-
-  if (user_context->use_ansi_codes)
-    outaf(ANSI_RESET);
-
-  outaf("%.*s\n", (int)(end - line), line);
-
-  // Show the error message.
-  int pos = display_width(line, (int)(loc - line)) + indent;
-
-  outaf("%*s", pos, "");  // print pos spaces.
-
-  if (user_context->use_ansi_codes)
-    outaf("%s^ %serror: %s", ANSI_GREEN, ANSI_RED, ANSI_WHITE);
-  else
-    outaf("^ error: ");
-
-  user_context->output_function(fmt, ap);
-
-  outaf("\n");
-  if (user_context->use_ansi_codes)
-    outaf("%s", ANSI_RESET);
-}
-
-static void error_at(char* loc, char* fmt, ...) {
-  File* cf = compiler_state.tokenize__current_file;
-
-  int line_no = 1;
-  for (char* p = cf->contents; p < loc; p++)
-    if (*p == '\n')
-      line_no++;
-
-  va_list ap;
-  va_start(ap, fmt);
-  verror_at(cf->name, cf->contents, line_no, loc, fmt, ap);
-  longjmp(toplevel_update_jmpbuf, 1);
-}
-
-static void error_tok(Token* tok, char* fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  verror_at(tok->file->name, tok->file->contents, tok->line_no, tok->loc, fmt, ap);
-  longjmp(toplevel_update_jmpbuf, 1);
-}
-
-static void warn_tok(Token* tok, char* fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  verror_at(tok->file->name, tok->file->contents, tok->line_no, tok->loc, fmt, ap);
-  va_end(ap);
-}
-
-// Reports an error and exit update.
-static void error(char* fmt, ...) {
-  va_list ap;
-  va_start(ap, fmt);
-  if (!user_context || !user_context->output_function) {
-    vfprintf(stderr, fmt, ap);
-  } else {
-    user_context->output_function(fmt, ap);
-    outaf("\n");
-  }
-  longjmp(toplevel_update_jmpbuf, 1);
-}
-
-static void error_internal(char* file, int line, char* msg) {
-  outaf("%sinternal error at %s:%d: %s%s\n%s", ANSI_RED, file, line, ANSI_WHITE, msg, ANSI_RESET);
-  longjmp(toplevel_update_jmpbuf, 1);
-}
-//
-// END OF src/util.c
-//
-#undef C
-#undef L
-#undef VOID
-//
-// START OF src/hashmap.c
+// START OF ../../src/hashmap.c
 //
 // This is an implementation of the open-addressing hash table.
 
@@ -3004,8 +2786,13 @@ static HashEntry* get_or_insert_entry(HashMap* map, char* key, int keylen) {
   for (int i = 0; i < map->capacity; i++) {
     HashEntry* ent = &map->buckets[(hash + i) % map->capacity];
 
-    if (match(ent, key, keylen))
+    if (match(ent, key, keylen)) {
+      if (map->alloc_lifetime == AL_Manual) {
+        free(ent->key);
+      }
+      ent->key = key;
       return ent;
+    }
 
     if (ent->key == TOMBSTONE) {
       ent->key = key;
@@ -3047,8 +2834,12 @@ static void hashmap_delete(HashMap* map, char* key) {
 
 static void hashmap_delete2(HashMap* map, char* key, int keylen) {
   HashEntry* ent = get_entry(map, key, keylen);
-  if (ent)
+  if (ent) {
+    if (map->alloc_lifetime == AL_Manual) {
+      free(ent->key);
+    }
     ent->key = TOMBSTONE;
+  }
 }
 
 // keys strdup'd with AL_Manual, and values that are the data segment
@@ -3085,13 +2876,13 @@ static void hashmap_clear_manual_key_owned_value_unowned(HashMap* map) {
   map->capacity = 0;
 }
 //
-// END OF src/hashmap.c
+// END OF ../../src/hashmap.c
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF src/link.c
+// START OF ../../src/link.c
 //
 
 #if X64WIN
@@ -3135,72 +2926,7 @@ static void* get_standard_runtime_function(char* name) {
     L(runtime_function_map).alloc_lifetime = AL_Link;
 #define X(func) hashmap_put(&L(runtime_function_map), #func, (void*)&func)
 #define Y(name, func) hashmap_put(&L(runtime_function_map), name, (void*)&func)
-    X(__acrt_iob_func);
-    X(__chkstk);
-    X(__pctype_func);
-    X(__stdio_common_vfprintf);
-    X(__stdio_common_vfprintf_p);
-    X(__stdio_common_vfprintf_s);
-    X(__stdio_common_vfscanf);
-    X(__stdio_common_vfwprintf);
-    X(__stdio_common_vfwprintf_p);
-    X(__stdio_common_vfwprintf_s);
-    X(__stdio_common_vfwscanf);
-    X(__stdio_common_vsnprintf_s);
-    X(__stdio_common_vsnwprintf_s);
-    X(__stdio_common_vsprintf);
-    X(__stdio_common_vsprintf_p);
-    X(__stdio_common_vsprintf_s);
-    X(__stdio_common_vsscanf);
-    X(__stdio_common_vswprintf);
-    X(__stdio_common_vswprintf_p);
-    X(__stdio_common_vswprintf_s);
-    X(__stdio_common_vswscanf);
-    X(_access);
-    X(_chmod);
-    X(_chmod);
-    X(_ctime64);
-    X(_ctime64_s);
-    X(_difftime64);
-    X(_errno);
-    X(_fileno);
-    X(_fileno);
-    X(_fileno);
-    X(_findclose);
-    X(_findfirst64i32);
-    X(_findnext64i32);
-    X(_findnext64i32);
-    X(_findnext64i32);
-    X(_fstat64i32);
-    X(_gmtime64);
-    X(_gmtime64_s);
-    X(_invalid_parameter_noinfo);
-    X(_isatty);
-    X(_isctype_l);
-    X(_localtime64);
-    X(_localtime64_s);
-    X(_mkdir);
-    X(_mkdir);
-    X(_mkgmtime64);
-    X(_mktime64);
-    X(_pclose);
-    X(_popen);
-    X(_setmode);
-    X(_setmode);
-    X(_snprintf);
-    X(_stat64i32);
-    X(_stat64i32);
-    X(_strdup);
-    X(_time64);
-    X(_timespec64_get);
-    X(_unlink);
-    X(_wassert);
-    X(_wcsicmp);
-    X(_wctime64);
-    X(_wctime64_s);
-    X(_wunlink);
     X(AreFileApisANSI);
-    X(atoi);
     X(CharUpperW);
     X(CloseHandle);
     X(CreateFileA);
@@ -3212,33 +2938,20 @@ static void* get_standard_runtime_function(char* name) {
     X(DeleteCriticalSection);
     X(DeleteFileA);
     X(DeleteFileW);
-    X(exit);
-    X(fclose);
-    X(fflush);
-    X(fgetc);
-    X(fgets);
+    X(EnterCriticalSection);
     X(FindClose);
     X(FindFirstFileW);
     X(FlushFileBuffers);
     X(FlushViewOfFile);
-    X(fopen);
     X(FormatMessageA);
     X(FormatMessageW);
-    X(fprintf);
-    X(fputc);
-    X(fputs);
-    X(fread);
-    X(free);
     X(FreeLibrary);
-    X(fseek);
-    X(ftell);
-    X(fwrite);
     X(GetConsoleScreenBufferInfo);
     X(GetCurrentProcess);
     X(GetCurrentProcessId);
+    X(GetCurrentThreadId);
     X(GetDiskFreeSpaceA);
     X(GetDiskFreeSpaceW);
-    X(getenv);
     X(GetEnvironmentVariableA);
     X(GetFileAttributesA);
     X(GetFileAttributesExW);
@@ -3264,36 +2977,21 @@ static void* get_standard_runtime_function(char* name) {
     X(HeapReAlloc);
     X(HeapSize);
     X(HeapValidate);
-    X(isalnum);
-    X(isalpha);
-    X(isdigit);
-    X(isprint);
-    X(isspace);
+    X(InitializeCriticalSection);
+    X(LeaveCriticalSection);
     X(LoadLibraryA);
     X(LoadLibraryW);
     X(LocalFree);
     X(LockFile);
     X(LockFileEx);
-    X(lstrcmpiW);
-    X(lstrcmpW);
-    X(lstrlenW);
-    X(malloc);
     X(MapViewOfFile);
     X(MapViewOfFileNuma2);
-    X(memcmp);
-    X(memcpy);
-    X(memmove);
-    X(memset);
     X(MessageBoxA);
     X(MultiByteToWideChar);
     X(OutputDebugStringA);
     X(OutputDebugStringW);
-    X(printf);
-    X(putc);
     X(QueryPerformanceCounter);
     X(ReadFile);
-    X(realloc);
-    X(rewind);
     X(SetConsoleCtrlHandler);
     X(SetConsoleTextAttribute);
     X(SetCurrentDirectoryW);
@@ -3301,9 +2999,144 @@ static void* get_standard_runtime_function(char* name) {
     X(SetFilePointer);
     X(SetFileTime);
     X(SetProcessDPIAware);
-    X(setvbuf);
     X(Sleep);
+    X(SystemTimeToFileTime);
+    X(SystemTimeToFileTime);
+    X(TryEnterCriticalSection);
+    X(UnlockFile);
+    X(UnlockFileEx);
+    X(UnmapViewOfFile);
+    X(WaitForSingleObject);
+    X(WaitForSingleObjectEx);
+    X(WideCharToMultiByte);
+    X(WriteFile);
+    X(__acrt_iob_func);
+    X(__chkstk);
+    X(__pctype_func);
+    X(__stdio_common_vfprintf);
+    X(__stdio_common_vfprintf_p);
+    X(__stdio_common_vfprintf_s);
+    X(__stdio_common_vfscanf);
+    X(__stdio_common_vfwprintf);
+    X(__stdio_common_vfwprintf_p);
+    X(__stdio_common_vfwprintf_s);
+    X(__stdio_common_vfwscanf);
+    X(__stdio_common_vsnprintf_s);
+    X(__stdio_common_vsnwprintf_s);
+    X(__stdio_common_vsprintf);
+    X(__stdio_common_vsprintf_p);
+    X(__stdio_common_vsprintf_s);
+    X(__stdio_common_vsscanf);
+    X(__stdio_common_vswprintf);
+    X(__stdio_common_vswprintf_p);
+    X(__stdio_common_vswprintf_s);
+    X(__stdio_common_vswscanf);
+    X(_access);
+    X(_beginthreadex);
+    X(_byteswap_ulong);
+    X(_byteswap_ushort);
+    X(_chgsign);
+    X(_chmod);
+    X(_chmod);
+    X(_copysign);
+    X(_ctime64);
+    X(_ctime64_s);
+    X(_difftime64);
+    X(_endthreadex);
+    X(_errno);
+    X(_fileno);
+    X(_fileno);
+    X(_fileno);
+    X(_findclose);
+    X(_findfirst64i32);
+    X(_findnext64i32);
+    X(_findnext64i32);
+    X(_findnext64i32);
+    X(_fstat64i32);
+    X(_gmtime64);
+    X(_gmtime64_s);
+    X(_hypot);
+    X(_hypotf);
+    X(_invalid_parameter_noinfo);
+    X(_isatty);
+    X(_isctype_l);
+    X(_localtime64);
+    X(_localtime64_s);
+    X(_mkdir);
+    X(_mkdir);
+    X(_mkgmtime64);
+    X(_mktime64);
+    X(_msize);
+    X(_pclose);
+    X(_popen);
+    X(_setmode);
+    X(_setmode);
+    X(_snprintf);
+    X(_stat64i32);
+    X(_stat64i32);
+    X(_strdup);
+    X(_time64);
+    X(_timespec64_get);
+    X(_unlink);
+    X(_wcsicmp);
+    X(_wctime64);
+    X(_wctime64_s);
+    X(_wunlink);
+    X(acos);
+    X(asin);
+    X(atan);
+    X(atan2);
+    X(atoi);
+    X(ceil);
+    X(cos);
+    X(cosh);
+    X(exit);
+    X(exp);
+    X(fabs);
+    X(fclose);
+    X(fflush);
+    X(fgetc);
+    X(fgets);
+    X(floor);
+    X(fmod);
+    X(fopen);
+    X(fprintf);
+    X(fputc);
+    X(fputs);
+    X(fread);
+    X(free);
+    X(frexp);
+    X(fseek);
+    X(ftell);
+    X(fwrite);
+    X(getenv);
+    X(isalnum);
+    X(isalpha);
+    X(isdigit);
+    X(isprint);
+    X(isspace);
+    X(ldexp);
+    X(log);
+    X(log10);
+    X(lstrcmpW);
+    X(lstrcmpiW);
+    X(lstrlenW);
+    X(malloc);
+    X(memcmp);
+    X(memcpy);
+    X(memmove);
+    X(memset);
+    X(modf);
+    X(pow);
+    X(printf);
+    X(putc);
+    X(realloc);
+    X(rewind);
+    X(setvbuf);
+    X(sin);
+    X(sinh);
     X(sprintf);
+    X(sqrt);
     X(sscanf);
     X(strchr);
     X(strcmp);
@@ -3316,27 +3149,23 @@ static void* get_standard_runtime_function(char* name) {
     X(strncpy);
     X(strncpy);
     X(strnlen);
+    X(strrchr);
     X(strstr);
     X(strtol);
     X(system);
-    X(SystemTimeToFileTime);
-    X(SystemTimeToFileTime);
+    X(tan);
+    X(tanh);
     X(tolower);
-    X(uaw_lstrcmpiW);
     X(uaw_lstrcmpW);
+    X(uaw_lstrcmpiW);
     X(uaw_lstrlenW);
     X(uaw_wcschr);
     X(uaw_wcscpy);
     X(uaw_wcsicmp);
     X(uaw_wcslen);
     X(uaw_wcsrchr);
-    X(UnlockFile);
-    X(UnlockFileEx);
-    X(UnmapViewOfFile);
     X(vfprintf);
     X(vsprintf);
-    X(WaitForSingleObject);
-    X(WaitForSingleObjectEx);
     X(wcschr);
     X(wcscpy);
     X(wcscpy_s);
@@ -3344,48 +3173,14 @@ static void* get_standard_runtime_function(char* name) {
     X(wcsnlen);
     X(wcsrchr);
     X(wcstok);
-    X(WideCharToMultiByte);
-    X(WriteFile);
-    X(EnterCriticalSection);
-    X(GetCurrentThreadId);
-    X(InitializeCriticalSection);
-    X(LeaveCriticalSection);
-    X(TryEnterCriticalSection);
-    X(_beginthreadex);
-    X(_byteswap_ulong);
-    X(_byteswap_ushort);
-    X(_chgsign);
-    X(_copysign);
-    X(_endthreadex);
-    X(_hypot);
-    X(_hypotf);
-    X(_msize);
-    X(acos);
-    X(asin);
-    X(atan);
-    X(atan2);
-    X(ceil);
-    X(cos);
-    X(cosh);
-    X(exp);
-    X(fabs);
-    X(floor);
-    X(fmod);
-    X(frexp);
-    X(ldexp);
-    X(log);
-    X(log10);
-    X(modf);
-    X(pow);
-    X(sin);
-    X(sinh);
-    X(sqrt);
-    X(strrchr);
-    X(tan);
-    X(tanh);
 
     Y("__stosb", Xstosb);
     Y("_ReadWriteBarrier", XReadWriteBarrier);
+
+#ifndef NDEBUG
+    X(_wassert);
+#endif
+
 #undef X
   }
 
@@ -3444,6 +3239,12 @@ static bool link_all_files(void) {
   // Process fixups.
   for (size_t i = 0; i < uc->num_files; ++i) {
     FileLinkData* fld = &uc->files[i];
+
+    if (!make_memory_readwrite(fld->codeseg_base_address, fld->codeseg_size)) {
+      outaf("failed to make %p size %zu readwrite\n", fld->codeseg_base_address, fld->codeseg_size);
+      return false;
+    }
+
     for (int j = 0; j < fld->flen; ++j) {
       void* fixup_address = fld->fixups[j].at;
       char* name = fld->fixups[j].name;
@@ -3469,10 +3270,7 @@ static bool link_all_files(void) {
 
       *((uintptr_t*)fixup_address) = (uintptr_t)target_address + addend;
     }
-  }
 
-  for (size_t i = 0; i < uc->num_files; ++i) {
-    FileLinkData* fld = &uc->files[i];
     if (!make_memory_executable(fld->codeseg_base_address, fld->codeseg_size)) {
       outaf("failed to make %p size %zu executable\n", fld->codeseg_base_address,
             fld->codeseg_size);
@@ -3483,13 +3281,13 @@ static bool link_all_files(void) {
   return true;
 }
 //
-// END OF src/link.c
+// END OF ../../src/link.c
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF src/main.c
+// START OF ../../src/main.c
 //
 // Notes and todos
 // ---------------
@@ -3664,6 +3462,21 @@ static int default_output_fn(const char* fmt, va_list ap) {
   return ret;
 }
 
+static bool default_load_file_fn(const char* path, char** contents, size_t* size) {
+  FILE* fp = fopen(path, "rb");
+  if (!fp) {
+    return false;
+  }
+
+  fseek(fp, 0, SEEK_END);
+  *size = ftell(fp);
+  rewind(fp);
+  *contents = malloc(*size);
+  fread(*contents, 1, *size, fp);
+  fclose(fp);
+  return true;
+}
+
 DyibiccContext* dyibicc_set_environment(DyibiccEnviromentData* env_data) {
   alloc_init(AL_Temp);
 
@@ -3728,6 +3541,10 @@ DyibiccContext* dyibicc_set_environment(DyibiccEnviromentData* env_data) {
 
   UserContext* data = calloc(1, total_size);
 
+  data->load_file_contents = env_data->load_file_contents;
+  if (!data->load_file_contents) {
+    data->load_file_contents = default_load_file_fn;
+  }
   data->get_function_address = env_data->get_function_address;
   data->output_function = env_data->output_function;
   if (!data->output_function) {
@@ -3875,13 +3692,13 @@ void* dyibicc_find_export(DyibiccContext* context, char* name) {
   return hashmap_get(&ctx->exports[ctx->num_files], name);
 }
 //
-// END OF src/main.c
+// END OF ../../src/main.c
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF src/parse.c
+// START OF ../../src/parse.c
 //
 // This file contains a recursive descent parser for C.
 //
@@ -7621,13 +7438,13 @@ static Obj* parse(Token* tok) {
   return C(globals);
 }
 //
-// END OF src/parse.c
+// END OF ../../src/parse.c
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF src/preprocess.c
+// START OF ../../src/preprocess.c
 //
 // This file implements the C preprocessor.
 //
@@ -8872,13 +8689,13 @@ static Token* preprocess(Token* tok) {
   return tok;
 }
 //
-// END OF src/preprocess.c
+// END OF ../../src/preprocess.c
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF src/tokenize.c
+// START OF ../../src/tokenize.c
 //
 
 #if X64WIN
@@ -9608,19 +9425,19 @@ Token* tokenize_filecontents(char* path, char* p) {
 }
 
 Token* tokenize_file(char* path) {
-  char* p = read_file(path, AL_Compile);
+  char* p = read_file_wrap_user(path, AL_Compile);
   if (!p)
     return NULL;
   return tokenize_filecontents(path, p);
 }
 //
-// END OF src/tokenize.c
+// END OF ../../src/tokenize.c
 //
 #undef C
 #undef L
 #undef VOID
 //
-// START OF src/unicode.c
+// START OF ../../src/unicode.c
 //
 
 // Encode a given character in UTF-8.
@@ -9861,14 +9678,249 @@ static int display_width(char* p, int len) {
   return w;
 }
 //
-// END OF src/unicode.c
+// END OF ../../src/unicode.c
+//
+#undef C
+#undef L
+#undef VOID
+//
+// START OF ../../src/util.c
+//
+
+#ifdef _WIN64
+#include <windows.h>
+#else
+#include <errno.h>
+#include <sys/stat.h>
+#endif
+
+static char* bumpstrndup(const char* s, size_t n, AllocLifetime lifetime) {
+  size_t l = strnlen(s, n);
+  char* d = bumpcalloc(1, l + 1, lifetime);
+  if (!d)
+    return NULL;
+  memcpy(d, s, l);
+  d[l] = 0;
+  return d;
+}
+
+static char* bumpstrdup(const char* s, AllocLifetime lifetime) {
+  size_t l = strlen(s);
+  char* d = bumpcalloc(1, l + 1, lifetime);
+  if (!d)
+    return NULL;
+  memcpy(d, s, l);
+  d[l] = 0;
+  return d;
+}
+
+static char* dirname(char* s) {
+  size_t i;
+  if (!s || !*s)
+    return ".";
+  i = strlen(s) - 1;
+  for (; s[i] == '/' || s[i] == '\\'; i--)
+    if (!i)
+      return "/";
+  for (; s[i] != '/' || s[i] == '\\'; i--)
+    if (!i)
+      return ".";
+  for (; s[i] == '/' || s[i] == '\\'; i--)
+    if (!i)
+      return "/";
+  s[i + 1] = 0;
+  return s;
+}
+
+// Round up `n` to the nearest multiple of `align`. For instance,
+// align_to(5, 8) returns 8 and align_to(11, 8) returns 16.
+static uint64_t align_to_u(uint64_t n, uint64_t align) {
+  return (n + align - 1) / align * align;
+}
+
+static int64_t align_to_s(int64_t n, int64_t align) {
+  return (n + align - 1) / align * align;
+}
+
+static unsigned int get_page_size(void) {
+#if X64WIN
+  SYSTEM_INFO system_info;
+  GetSystemInfo(&system_info);
+  return system_info.dwPageSize;
+#else
+  return sysconf(_SC_PAGESIZE);
+#endif
+}
+
+static void strarray_push(StringArray* arr, char* s, AllocLifetime lifetime) {
+  if (!arr->data) {
+    arr->data = bumpcalloc(8, sizeof(char*), lifetime);
+    arr->capacity = 8;
+  }
+
+  if (arr->capacity == arr->len) {
+    arr->data = bumplamerealloc(arr->data, sizeof(char*) * arr->capacity,
+                                sizeof(char*) * arr->capacity * 2, lifetime);
+    arr->capacity *= 2;
+    for (int i = arr->len; i < arr->capacity; i++)
+      arr->data[i] = NULL;
+  }
+
+  arr->data[arr->len++] = s;
+}
+
+static void strintarray_push(StringIntArray* arr, StringInt item, AllocLifetime lifetime) {
+  if (!arr->data) {
+    arr->data = bumpcalloc(8, sizeof(StringInt), lifetime);
+    arr->capacity = 8;
+  }
+
+  if (arr->capacity == arr->len) {
+    arr->data = bumplamerealloc(arr->data, sizeof(StringInt) * arr->capacity,
+                                sizeof(StringInt) * arr->capacity * 2, lifetime);
+    arr->capacity *= 2;
+    for (int i = arr->len; i < arr->capacity; i++)
+      arr->data[i] = (StringInt){NULL, -1};
+  }
+
+  arr->data[arr->len++] = item;
+}
+
+// Returns the contents of a given file. Doesn't support '-' for reading from
+// stdin.
+static char* read_file_wrap_user(char* path, AllocLifetime lifetime) {
+  char* contents;
+  size_t size;
+  if (!user_context->load_file_contents(path, &contents, &size))
+    return NULL;
+
+  char* buf = bumpcalloc(1, size + 1, lifetime);  // TODO: doesn't really need a calloc
+  memcpy(buf, contents, size);
+  free(contents);
+  buf[size] = 0;
+  return buf;
+}
+
+// Takes a printf-style format string and returns a formatted string.
+static char* format(AllocLifetime lifetime, char* fmt, ...) {
+  char buf[4096];
+
+  va_list ap;
+  va_start(ap, fmt);
+  vsprintf(buf, fmt, ap);
+  va_end(ap);
+  return bumpstrdup(buf, lifetime);
+}
+
+static int outaf(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int ret = user_context->output_function(fmt, ap);
+  va_end(ap);
+  return ret;
+}
+
+#define ANSI_WHITE "\033[1;37m"
+#define ANSI_GREEN "\033[1;32m"
+#define ANSI_RED "\033[1;31m"
+#define ANSI_RESET "\033[0m"
+
+// Reports an error message in the following format.
+//
+// foo.c:10: x = y + 1;
+//               ^ <error message here>
+static void verror_at(char* filename, char* input, int line_no, char* loc, char* fmt, va_list ap) {
+  // Find a line containing `loc`.
+  char* line = loc;
+  while (input < line && line[-1] != '\n')
+    line--;
+
+  char* end = loc;
+  while (*end && *end != '\n')
+    end++;
+
+  // Print out the line.
+  if (user_context->use_ansi_codes)
+    outaf(ANSI_WHITE);
+
+  int indent = outaf("%s:%d: ", filename, line_no);
+
+  if (user_context->use_ansi_codes)
+    outaf(ANSI_RESET);
+
+  outaf("%.*s\n", (int)(end - line), line);
+
+  // Show the error message.
+  int pos = display_width(line, (int)(loc - line)) + indent;
+
+  outaf("%*s", pos, "");  // print pos spaces.
+
+  if (user_context->use_ansi_codes)
+    outaf("%s^ %serror: %s", ANSI_GREEN, ANSI_RED, ANSI_WHITE);
+  else
+    outaf("^ error: ");
+
+  user_context->output_function(fmt, ap);
+
+  outaf("\n");
+  if (user_context->use_ansi_codes)
+    outaf("%s", ANSI_RESET);
+}
+
+static void error_at(char* loc, char* fmt, ...) {
+  File* cf = compiler_state.tokenize__current_file;
+
+  int line_no = 1;
+  for (char* p = cf->contents; p < loc; p++)
+    if (*p == '\n')
+      line_no++;
+
+  va_list ap;
+  va_start(ap, fmt);
+  verror_at(cf->name, cf->contents, line_no, loc, fmt, ap);
+  longjmp(toplevel_update_jmpbuf, 1);
+}
+
+static void error_tok(Token* tok, char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  verror_at(tok->file->name, tok->file->contents, tok->line_no, tok->loc, fmt, ap);
+  longjmp(toplevel_update_jmpbuf, 1);
+}
+
+static void warn_tok(Token* tok, char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  verror_at(tok->file->name, tok->file->contents, tok->line_no, tok->loc, fmt, ap);
+  va_end(ap);
+}
+
+// Reports an error and exit update.
+static void error(char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  if (!user_context || !user_context->output_function) {
+    vfprintf(stderr, fmt, ap);
+  } else {
+    user_context->output_function(fmt, ap);
+    outaf("\n");
+  }
+  longjmp(toplevel_update_jmpbuf, 1);
+}
+
+static void error_internal(char* file, int line, char* msg) {
+  outaf("%sinternal error at %s:%d: %s%s\n%s", ANSI_RED, file, line, ANSI_WHITE, msg, ANSI_RESET);
+  longjmp(toplevel_update_jmpbuf, 1);
+}
+//
+// END OF ../../src/util.c
 //
 #if X64WIN
 #undef C
 #undef L
 #undef VOID
 //
-// START OF out/wr/codegen.w.c
+// START OF codegen.w.c
 //
 /*
 ** This file has been pre-processed with DynASM.
@@ -12734,15 +12786,6 @@ static void emit_data(Obj* prog) {
     //
     // for now, just continue with individual regular aligned_allocate
     // for all data objects and maintain their addresses here.
-    //
-    // LinkFixup won't work as is
-    // - offset is codeseg relative. it can be made a pointer for the
-    // codeseg imports instead because it's recreated for each compile
-    // anyway
-    // - need to remap initializer_code_relocation to name, but...
-    // actually we have the real address at this point now, so if the
-    // data was allocated it can just be written directly i think rather
-    // than deferred to a relocation
 
     UserContext* uc = user_context;
     // bool was_freed = false;
@@ -12818,12 +12861,12 @@ static void store_fp(int r, int offset, int sz) {
     case 4:
       //| movss dword [rbp+offset], xmm(r)
       dasm_put(Dst, 682, (r), offset);
-#line 2316 "../../src/codegen.in.c"
+#line 2307 "../../src/codegen.in.c"
       return;
     case 8:
       //| movsd qword [rbp+offset], xmm(r)
       dasm_put(Dst, 693, (r), offset);
-#line 2319 "../../src/codegen.in.c"
+#line 2310 "../../src/codegen.in.c"
       return;
   }
   unreachable();
@@ -12834,30 +12877,30 @@ static void store_gp(int r, int offset, int sz) {
     case 1:
       //| mov [rbp+offset], Rb(dasmargreg[r])
       dasm_put(Dst, 1497, (dasmargreg[r]), offset);
-#line 2328 "../../src/codegen.in.c"
+#line 2319 "../../src/codegen.in.c"
       return;
     case 2:
       //| mov [rbp+offset], Rw(dasmargreg[r])
       dasm_put(Dst, 1505, (dasmargreg[r]), offset);
-#line 2331 "../../src/codegen.in.c"
+#line 2322 "../../src/codegen.in.c"
       return;
       return;
     case 4:
       //| mov [rbp+offset], Rd(dasmargreg[r])
       dasm_put(Dst, 1506, (dasmargreg[r]), offset);
-#line 2335 "../../src/codegen.in.c"
+#line 2326 "../../src/codegen.in.c"
       return;
     case 8:
       //| mov [rbp+offset], Rq(dasmargreg[r])
       dasm_put(Dst, 1514, (dasmargreg[r]), offset);
-#line 2338 "../../src/codegen.in.c"
+#line 2329 "../../src/codegen.in.c"
       return;
     default:
       for (int i = 0; i < sz; i++) {
         //| mov [rbp+offset+i], Rb(dasmargreg[r])
         //| shr Rq(dasmargreg[r]), 8
         dasm_put(Dst, 704, (dasmargreg[r]), offset+i, (dasmargreg[r]));
-#line 2343 "../../src/codegen.in.c"
+#line 2334 "../../src/codegen.in.c"
       }
       return;
   }
@@ -12883,7 +12926,7 @@ static void emit_text(Obj* prog) {
 
     //|=>fn->dasm_entry_label:
     dasm_put(Dst, 1055, fn->dasm_entry_label);
-#line 2367 "../../src/codegen.in.c"
+#line 2358 "../../src/codegen.in.c"
 
     C(current_fn) = fn;
 
@@ -12893,7 +12936,7 @@ static void emit_text(Obj* prog) {
     //| push rbp
     //| mov rbp, rsp
     dasm_put(Dst, 1522);
-#line 2375 "../../src/codegen.in.c"
+#line 2366 "../../src/codegen.in.c"
 
 #if X64WIN
     // Stack probe on Windows if necessary. The MSDN reference for __chkstk says
@@ -12901,7 +12944,7 @@ static void emit_text(Obj* prog) {
     if (fn->stack_size >= 4096) {
       //| mov rax, fn->stack_size
       dasm_put(Dst, 924, fn->stack_size);
-#line 2381 "../../src/codegen.in.c"
+#line 2372 "../../src/codegen.in.c"
       int fixup_location = codegen_pclabel();
       strintarray_push(&C(fixups), (StringInt){"__chkstk", fixup_location}, AL_Compile);
 #ifdef _MSC_VER
@@ -12911,25 +12954,25 @@ static void emit_text(Obj* prog) {
       //|=>fixup_location:
       //| mov64 r10, 0xc0dec0dec0dec0de
       dasm_put(Dst, 1527, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
-#line 2389 "../../src/codegen.in.c"
+#line 2380 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
       //| call r10
       //| sub rsp, rax
       dasm_put(Dst, 1533);
-#line 2394 "../../src/codegen.in.c"
+#line 2385 "../../src/codegen.in.c"
     } else
 #endif
 
     {
       //| sub rsp, fn->stack_size
       dasm_put(Dst, 617, fn->stack_size);
-#line 2399 "../../src/codegen.in.c"
+#line 2390 "../../src/codegen.in.c"
     }
     //| mov [rbp+fn->alloca_bottom->offset], rsp
     dasm_put(Dst, 1541, fn->alloca_bottom->offset);
-#line 2401 "../../src/codegen.in.c"
+#line 2392 "../../src/codegen.in.c"
 
 #if !X64WIN
     // Save arg registers if function is variadic
@@ -12952,7 +12995,7 @@ static void emit_text(Obj* prog) {
       //| mov [rbp+off+16], rbp                // reg_save_area
       //| add qword [rbp+off+16], off+24
       dasm_put(Dst, 1546, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
-#line 2422 "../../src/codegen.in.c"
+#line 2413 "../../src/codegen.in.c"
 
       // __reg_save_area__
       //| mov [rbp + off + 24], rdi
@@ -12970,7 +13013,7 @@ static void emit_text(Obj* prog) {
       //| movsd qword [rbp + off + 120], xmm6
       //| movsd qword [rbp + off + 128], xmm7
       dasm_put(Dst, 1573, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
-#line 2438 "../../src/codegen.in.c"
+#line 2429 "../../src/codegen.in.c"
     }
 #endif
 
@@ -12983,7 +13026,7 @@ static void emit_text(Obj* prog) {
       //| mov [rbp + 32], CARG3
       //| mov [rbp + 40], CARG4
       dasm_put(Dst, 1646, 16, 24, 32, 40);
-#line 2449 "../../src/codegen.in.c"
+#line 2440 "../../src/codegen.in.c"
     } else {
       // Save passed-by-register arguments to the stack
       int reg = 0;
@@ -13056,7 +13099,7 @@ static void emit_text(Obj* prog) {
     if (strcmp(fn->name, "main") == 0) {
       //| mov rax, 0
       dasm_put(Dst, 734);
-#line 2520 "../../src/codegen.in.c"
+#line 2511 "../../src/codegen.in.c"
     }
 
     // Epilogue
@@ -13065,7 +13108,7 @@ static void emit_text(Obj* prog) {
     //| pop rbp
     //| ret
     dasm_put(Dst, 1663, fn->dasm_return_label);
-#line 2527 "../../src/codegen.in.c"
+#line 2518 "../../src/codegen.in.c"
   }
 }
 
@@ -13165,14 +13208,14 @@ static void codegen_free(void) {
   }
 }
 //
-// END OF out/wr/codegen.w.c
+// END OF codegen.w.c
 //
 #else // ^^^ X64WIN / !X64WIN vvv
 #undef C
 #undef L
 #undef VOID
 //
-// START OF out/lr/codegen.l.c
+// START OF codegen.l.c
 //
 /*
 ** This file has been pre-processed with DynASM.
@@ -16038,15 +16081,6 @@ static void emit_data(Obj* prog) {
     //
     // for now, just continue with individual regular aligned_allocate
     // for all data objects and maintain their addresses here.
-    //
-    // LinkFixup won't work as is
-    // - offset is codeseg relative. it can be made a pointer for the
-    // codeseg imports instead because it's recreated for each compile
-    // anyway
-    // - need to remap initializer_code_relocation to name, but...
-    // actually we have the real address at this point now, so if the
-    // data was allocated it can just be written directly i think rather
-    // than deferred to a relocation
 
     UserContext* uc = user_context;
     // bool was_freed = false;
@@ -16122,12 +16156,12 @@ static void store_fp(int r, int offset, int sz) {
     case 4:
       //| movss dword [rbp+offset], xmm(r)
       dasm_put(Dst, 682, (r), offset);
-#line 2316 "../../src/codegen.in.c"
+#line 2307 "../../src/codegen.in.c"
       return;
     case 8:
       //| movsd qword [rbp+offset], xmm(r)
       dasm_put(Dst, 693, (r), offset);
-#line 2319 "../../src/codegen.in.c"
+#line 2310 "../../src/codegen.in.c"
       return;
   }
   unreachable();
@@ -16138,30 +16172,30 @@ static void store_gp(int r, int offset, int sz) {
     case 1:
       //| mov [rbp+offset], Rb(dasmargreg[r])
       dasm_put(Dst, 1506, (dasmargreg[r]), offset);
-#line 2328 "../../src/codegen.in.c"
+#line 2319 "../../src/codegen.in.c"
       return;
     case 2:
       //| mov [rbp+offset], Rw(dasmargreg[r])
       dasm_put(Dst, 1514, (dasmargreg[r]), offset);
-#line 2331 "../../src/codegen.in.c"
+#line 2322 "../../src/codegen.in.c"
       return;
       return;
     case 4:
       //| mov [rbp+offset], Rd(dasmargreg[r])
       dasm_put(Dst, 1515, (dasmargreg[r]), offset);
-#line 2335 "../../src/codegen.in.c"
+#line 2326 "../../src/codegen.in.c"
       return;
     case 8:
       //| mov [rbp+offset], Rq(dasmargreg[r])
       dasm_put(Dst, 1523, (dasmargreg[r]), offset);
-#line 2338 "../../src/codegen.in.c"
+#line 2329 "../../src/codegen.in.c"
       return;
     default:
       for (int i = 0; i < sz; i++) {
         //| mov [rbp+offset+i], Rb(dasmargreg[r])
         //| shr Rq(dasmargreg[r]), 8
         dasm_put(Dst, 704, (dasmargreg[r]), offset+i, (dasmargreg[r]));
-#line 2343 "../../src/codegen.in.c"
+#line 2334 "../../src/codegen.in.c"
       }
       return;
   }
@@ -16187,7 +16221,7 @@ static void emit_text(Obj* prog) {
 
     //|=>fn->dasm_entry_label:
     dasm_put(Dst, 1058, fn->dasm_entry_label);
-#line 2367 "../../src/codegen.in.c"
+#line 2358 "../../src/codegen.in.c"
 
     C(current_fn) = fn;
 
@@ -16197,7 +16231,7 @@ static void emit_text(Obj* prog) {
     //| push rbp
     //| mov rbp, rsp
     dasm_put(Dst, 1531);
-#line 2375 "../../src/codegen.in.c"
+#line 2366 "../../src/codegen.in.c"
 
 #if X64WIN
     // Stack probe on Windows if necessary. The MSDN reference for __chkstk says
@@ -16205,7 +16239,7 @@ static void emit_text(Obj* prog) {
     if (fn->stack_size >= 4096) {
       //| mov rax, fn->stack_size
       dasm_put(Dst, 926, fn->stack_size);
-#line 2381 "../../src/codegen.in.c"
+#line 2372 "../../src/codegen.in.c"
       int fixup_location = codegen_pclabel();
       strintarray_push(&C(fixups), (StringInt){"__chkstk", fixup_location}, AL_Compile);
 #ifdef _MSC_VER
@@ -16215,25 +16249,25 @@ static void emit_text(Obj* prog) {
       //|=>fixup_location:
       //| mov64 r10, 0xc0dec0dec0dec0de
       dasm_put(Dst, 1536, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
-#line 2389 "../../src/codegen.in.c"
+#line 2380 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
       //| call r10
       //| sub rsp, rax
       dasm_put(Dst, 1542);
-#line 2394 "../../src/codegen.in.c"
+#line 2385 "../../src/codegen.in.c"
     } else
 #endif
 
     {
       //| sub rsp, fn->stack_size
       dasm_put(Dst, 617, fn->stack_size);
-#line 2399 "../../src/codegen.in.c"
+#line 2390 "../../src/codegen.in.c"
     }
     //| mov [rbp+fn->alloca_bottom->offset], rsp
     dasm_put(Dst, 1550, fn->alloca_bottom->offset);
-#line 2401 "../../src/codegen.in.c"
+#line 2392 "../../src/codegen.in.c"
 
 #if !X64WIN
     // Save arg registers if function is variadic
@@ -16256,7 +16290,7 @@ static void emit_text(Obj* prog) {
       //| mov [rbp+off+16], rbp                // reg_save_area
       //| add qword [rbp+off+16], off+24
       dasm_put(Dst, 1555, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
-#line 2422 "../../src/codegen.in.c"
+#line 2413 "../../src/codegen.in.c"
 
       // __reg_save_area__
       //| mov [rbp + off + 24], rdi
@@ -16274,7 +16308,7 @@ static void emit_text(Obj* prog) {
       //| movsd qword [rbp + off + 120], xmm6
       //| movsd qword [rbp + off + 128], xmm7
       dasm_put(Dst, 1582, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
-#line 2438 "../../src/codegen.in.c"
+#line 2429 "../../src/codegen.in.c"
     }
 #endif
 
@@ -16287,7 +16321,7 @@ static void emit_text(Obj* prog) {
       //| mov [rbp + 32], CARG3
       //| mov [rbp + 40], CARG4
       dasm_put(Dst, 1655, 16, 24, 32, 40);
-#line 2449 "../../src/codegen.in.c"
+#line 2440 "../../src/codegen.in.c"
     } else {
       // Save passed-by-register arguments to the stack
       int reg = 0;
@@ -16360,7 +16394,7 @@ static void emit_text(Obj* prog) {
     if (strcmp(fn->name, "main") == 0) {
       //| mov rax, 0
       dasm_put(Dst, 734);
-#line 2520 "../../src/codegen.in.c"
+#line 2511 "../../src/codegen.in.c"
     }
 
     // Epilogue
@@ -16369,7 +16403,7 @@ static void emit_text(Obj* prog) {
     //| pop rbp
     //| ret
     dasm_put(Dst, 1672, fn->dasm_return_label);
-#line 2527 "../../src/codegen.in.c"
+#line 2518 "../../src/codegen.in.c"
   }
 }
 
@@ -16469,6 +16503,6 @@ static void codegen_free(void) {
   }
 }
 //
-// END OF out/lr/codegen.l.c
+// END OF codegen.l.c
 //
 #endif // !X64WIN

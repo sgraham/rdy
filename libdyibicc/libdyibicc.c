@@ -11019,7 +11019,7 @@ static int push_args_win(Node* node, int* by_ref_copies_size) {
   assert((*by_ref_copies_size == 0 && !has_by_ref_args) ||
          (*by_ref_copies_size && has_by_ref_args));
 
-  if ((C(depth) + stack) % 2 == 1) {
+  if ((C(depth) + stack + (*by_ref_copies_size / 8)) % 2 == 1) {
     //| sub rsp, 8
     dasm_put(Dst, 645);
 #line 820 "../../src/codegen.in.c"
@@ -13041,7 +13041,11 @@ static void emit_text(Obj* prog) {
           case TY_UNION:
             // It's either small and so passed in a register, or isn't and then
             // we're instead storing the pointer to the larger struct.
-            store_gp(reg++, var->offset, MIN(8, ty->size));
+            if (type_passed_in_register(ty)) {
+              store_gp(reg++, var->offset, ty->size);
+            } else {
+              store_gp(reg++, var->offset, 8);
+            }
             break;
           case TY_FLOAT:
           case TY_DOUBLE:
@@ -13099,7 +13103,7 @@ static void emit_text(Obj* prog) {
     if (strcmp(fn->name, "main") == 0) {
       //| mov rax, 0
       dasm_put(Dst, 734);
-#line 2511 "../../src/codegen.in.c"
+#line 2515 "../../src/codegen.in.c"
     }
 
     // Epilogue
@@ -13108,7 +13112,7 @@ static void emit_text(Obj* prog) {
     //| pop rbp
     //| ret
     dasm_put(Dst, 1663, fn->dasm_return_label);
-#line 2518 "../../src/codegen.in.c"
+#line 2522 "../../src/codegen.in.c"
   }
 }
 
@@ -14314,7 +14318,7 @@ static int push_args_win(Node* node, int* by_ref_copies_size) {
   assert((*by_ref_copies_size == 0 && !has_by_ref_args) ||
          (*by_ref_copies_size && has_by_ref_args));
 
-  if ((C(depth) + stack) % 2 == 1) {
+  if ((C(depth) + stack + (*by_ref_copies_size / 8)) % 2 == 1) {
     //| sub rsp, 8
     dasm_put(Dst, 645);
 #line 820 "../../src/codegen.in.c"
@@ -16336,7 +16340,11 @@ static void emit_text(Obj* prog) {
           case TY_UNION:
             // It's either small and so passed in a register, or isn't and then
             // we're instead storing the pointer to the larger struct.
-            store_gp(reg++, var->offset, MIN(8, ty->size));
+            if (type_passed_in_register(ty)) {
+              store_gp(reg++, var->offset, ty->size);
+            } else {
+              store_gp(reg++, var->offset, 8);
+            }
             break;
           case TY_FLOAT:
           case TY_DOUBLE:
@@ -16394,7 +16402,7 @@ static void emit_text(Obj* prog) {
     if (strcmp(fn->name, "main") == 0) {
       //| mov rax, 0
       dasm_put(Dst, 734);
-#line 2511 "../../src/codegen.in.c"
+#line 2515 "../../src/codegen.in.c"
     }
 
     // Epilogue
@@ -16403,7 +16411,7 @@ static void emit_text(Obj* prog) {
     //| pop rbp
     //| ret
     dasm_put(Dst, 1672, fn->dasm_return_label);
-#line 2518 "../../src/codegen.in.c"
+#line 2522 "../../src/codegen.in.c"
   }
 }
 

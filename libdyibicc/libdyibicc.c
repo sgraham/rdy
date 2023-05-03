@@ -1,6 +1,6 @@
 //
 // Amalgamated (single file) build of https://github.com/sgraham/dyibicc.
-// Revision: 98c3387dcc54c28f1df9a1432694bcd6fffb9a07
+// Revision: 21dbc7d2225dcb583a0e8e38e0e184072fe751d4
 //
 // This file should not be edited or modified, patches should be to the
 // non-amalgamated files in src/. The user-facing API is in libdyibicc.h
@@ -96,6 +96,7 @@ typedef struct Relocation Relocation;
 typedef struct Hideset Hideset;
 typedef struct Token Token;
 typedef struct HashMap HashMap;
+typedef struct UserContext UserContext;
 
 //
 // alloc.c
@@ -182,6 +183,10 @@ static NORETURN void error_tok(Token* tok, char* fmt, ...)
 static NORETURN void error_internal(char* file, int line, char* msg);
 static int outaf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void warn_tok(Token* tok, char* fmt, ...) __attribute__((format(printf, 2, 3)));
+#if X64WIN
+static void register_function_table_data(UserContext* ctx, int func_count, char* base_addr);
+static void unregister_and_free_function_table_data(UserContext* ctx);
+#endif
 
 //
 // tokenize.c
@@ -278,6 +283,8 @@ struct Obj {
   bool is_static;
   int dasm_entry_label;
   int dasm_return_label;
+  int dasm_end_of_function_label;
+  int dasm_unwind_info_label;
 
   // Global variable
   bool is_tentative;
@@ -643,7 +650,7 @@ typedef struct FileLinkData {
 
 static void free_link_fixups(FileLinkData* fld);
 
-typedef struct UserContext {
+struct UserContext {
   DyibiccLoadFileContents load_file_contents;
   DyibiccFunctionLookupFn get_function_address;
   DyibiccOutputFn output_function;
@@ -664,7 +671,11 @@ typedef struct UserContext {
   HashMap* exports;
 
   HashMap reflect_types;
-} UserContext;
+
+#if X64WIN
+  char* function_table_data;
+#endif
+};
 
 typedef struct dasm_State dasm_State;
 
@@ -3619,6 +3630,9 @@ void dyibicc_free(DyibiccContext* context) {
   for (size_t i = 0; i < ctx->num_files; ++i) {
     free_link_fixups(&ctx->files[i]);
   }
+#if X64WIN
+  unregister_and_free_function_table_data(ctx);
+#endif
   free(ctx);
   user_context = NULL;
 }
@@ -9912,6 +9926,25 @@ static void error_internal(char* file, int line, char* msg) {
   outaf("%sinternal error at %s:%d: %s%s\n%s", ANSI_RED, file, line, ANSI_WHITE, msg, ANSI_RESET);
   longjmp(toplevel_update_jmpbuf, 1);
 }
+
+#if X64WIN
+static void register_function_table_data(UserContext* ctx, int func_count, char* base_addr) {
+  if (!RtlAddFunctionTable((RUNTIME_FUNCTION*)ctx->function_table_data, func_count,
+                           (DWORD64)base_addr)) {
+    error("failed to RtlAddFunctionTable");
+  }
+}
+
+static void unregister_and_free_function_table_data(UserContext* ctx) {
+  if (ctx->function_table_data) {
+    if (!RtlDeleteFunctionTable((RUNTIME_FUNCTION*)ctx->function_table_data)) {
+      error("failed to RtlDeleteFunctionTable");
+    }
+    free(ctx->function_table_data);
+    ctx->function_table_data = NULL;
+  }
+}
+#endif
 //
 // END OF ../../src/util.c
 //
@@ -9949,12 +9982,13 @@ static void error_internal(char* file, int line, char* msg) {
 #error "Version mismatch between DynASM and included encoding engine"
 #endif
 #line 19 "../../src/codegen.in.c"
-//| .section main
-#define DASM_SECTION_MAIN	0
-#define DASM_MAXSECTION		1
+//| .section code, pdata
+#define DASM_SECTION_CODE	0
+#define DASM_SECTION_PDATA	1
+#define DASM_MAXSECTION		2
 #line 20 "../../src/codegen.in.c"
 //| .actionlist dynasm_actions
-static const unsigned char dynasm_actions[1671] = {
+static const unsigned char dynasm_actions[1696] = {
   80,255,64,88,240,42,255,72,131,252,236,8,252,242,15,17,4,36,255,252,242,64,
   15,16,4,240,140,36,72,131,196,8,255,252,243,15,16,0,255,252,242,15,16,0,255,
   219,40,255,15,182,0,255,15,190,0,255,15,183,0,255,15,191,0,255,72,99,0,255,
@@ -10028,15 +10062,16 @@ static const unsigned char dynasm_actions[1671] = {
   255,15,133,245,249,255,72,129,252,248,239,255,72,137,193,72,129,252,233,239,
   72,129,252,249,239,255,137,193,129,252,233,239,129,252,249,239,255,15,134,
   245,255,252,233,245,255,252,255,224,255,64,136,133,253,240,131,233,255,102,
-  64,137,133,253,240,139,233,255,72,137,133,253,240,131,233,255,85,72,137,229,
-  255,249,73,186,237,237,255,65,252,255,210,72,41,196,255,72,137,165,233,255,
-  199,133,233,237,199,133,233,237,72,137,173,233,72,131,133,233,16,72,137,173,
-  233,72,129,133,233,239,255,72,137,189,233,72,137,181,233,72,137,149,233,72,
-  137,141,233,76,137,133,233,76,137,141,233,252,242,15,17,133,233,252,242,15,
-  17,141,233,252,242,15,17,149,233,252,242,15,17,157,233,252,242,15,17,165,
+  64,137,133,253,240,139,233,255,72,137,133,253,240,131,233,255,254,0,85,72,
+  137,229,255,249,73,186,237,237,255,65,252,255,210,72,41,196,255,254,1,250,
+  3,249,235,255,235,235,255,235,236,255,235,235,235,235,255,72,137,165,233,
+  255,199,133,233,237,199,133,233,237,72,137,173,233,72,131,133,233,16,72,137,
+  173,233,72,129,133,233,239,255,72,137,189,233,72,137,181,233,72,137,149,233,
+  72,137,141,233,76,137,133,233,76,137,141,233,252,242,15,17,133,233,252,242,
+  15,17,141,233,252,242,15,17,149,233,252,242,15,17,157,233,252,242,15,17,165,
   233,252,242,15,17,173,233,252,242,15,17,181,233,252,242,15,17,189,233,255,
-  72,137,141,233,72,137,149,233,76,137,133,233,76,137,141,233,255,249,72,137,
-  252,236,93,195,255
+  72,137,141,233,72,137,149,233,76,137,133,233,76,137,141,233,255,72,141,101,
+  0,255,72,137,252,236,255,93,195,255
 };
 
 #line 21 "../../src/codegen.in.c"
@@ -12587,7 +12622,7 @@ static void assign_lvar_offsets(Obj* prog) {
     // So, "top" means the highest numbered address corresponding the to root
     // function and bottom moves to the frames for the leaf-ward functions.
     int top = 16;
-    int bottom = 0;
+    int bottom = 8;
 
     int reg = 0;
 
@@ -12908,7 +12943,7 @@ static void store_gp(int r, int offset, int sz) {
 
 #if X64WIN
 extern int __chkstk(void);
-#endif
+#endif  // X64WIN
 
 static void emit_text(Obj* prog) {
   // Preallocate the dasm labels so they can be used in functions out of order.
@@ -12918,7 +12953,13 @@ static void emit_text(Obj* prog) {
 
     fn->dasm_return_label = codegen_pclabel();
     fn->dasm_entry_label = codegen_pclabel();
+    fn->dasm_end_of_function_label = codegen_pclabel();
+    fn->dasm_unwind_info_label = codegen_pclabel();
   }
+
+  //| .code
+  dasm_put(Dst, 1522);
+#line 2356 "../../src/codegen.in.c"
 
   for (Obj* fn = prog; fn; fn = fn->next) {
     if (!fn->is_function || !fn->is_definition || !fn->is_live)
@@ -12926,7 +12967,7 @@ static void emit_text(Obj* prog) {
 
     //|=>fn->dasm_entry_label:
     dasm_put(Dst, 1055, fn->dasm_entry_label);
-#line 2358 "../../src/codegen.in.c"
+#line 2362 "../../src/codegen.in.c"
 
     C(current_fn) = fn;
 
@@ -12935,8 +12976,8 @@ static void emit_text(Obj* prog) {
     // Prologue
     //| push rbp
     //| mov rbp, rsp
-    dasm_put(Dst, 1522);
-#line 2366 "../../src/codegen.in.c"
+    dasm_put(Dst, 1524);
+#line 2370 "../../src/codegen.in.c"
 
 #if X64WIN
     // Stack probe on Windows if necessary. The MSDN reference for __chkstk says
@@ -12944,7 +12985,7 @@ static void emit_text(Obj* prog) {
     if (fn->stack_size >= 4096) {
       //| mov rax, fn->stack_size
       dasm_put(Dst, 924, fn->stack_size);
-#line 2372 "../../src/codegen.in.c"
+#line 2376 "../../src/codegen.in.c"
       int fixup_location = codegen_pclabel();
       strintarray_push(&C(fixups), (StringInt){"__chkstk", fixup_location}, AL_Compile);
 #ifdef _MSC_VER
@@ -12953,26 +12994,118 @@ static void emit_text(Obj* prog) {
 #endif
       //|=>fixup_location:
       //| mov64 r10, 0xc0dec0dec0dec0de
-      dasm_put(Dst, 1527, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
-#line 2380 "../../src/codegen.in.c"
+      dasm_put(Dst, 1529, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
+#line 2384 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
       //| call r10
       //| sub rsp, rax
-      dasm_put(Dst, 1533);
-#line 2385 "../../src/codegen.in.c"
+      dasm_put(Dst, 1535);
+#line 2389 "../../src/codegen.in.c"
+
+      // TODO: pdata emission
     } else
 #endif
 
     {
       //| sub rsp, fn->stack_size
       dasm_put(Dst, 617, fn->stack_size);
-#line 2390 "../../src/codegen.in.c"
+#line 2396 "../../src/codegen.in.c"
+
+      // TODO: add a label here to assert that the prolog size is as expected
+
+#if X64WIN
+      // RtlAddFunctionTable() requires these to be at an offset with the same
+      // base as the function offsets, so we need to emit these into the main
+      // codeseg allocation, rather than just allocating them separately, since
+      // we can't easily guarantee a <4G offset to them otherwise.
+
+      // Unfortunately, we can't build another section with this as dynasm
+      // doesn't seem to allow resolving these offsets, so this is done later
+      //| .dword =>fn->dasm_entry_label
+      //| .dword =>fn->dasm_end_of_function_label
+      //| .dword =>fn->dasm_unwind_info_label
+
+      // TODO: probably need to relocate and add info about r11 used as a base
+      // for the value stack copies, and also rdi pushed for memsets.
+
+      // https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64?view=msvc-170
+      enum {
+        UWOP_PUSH_NONVOL = 0,
+        UWOP_ALLOC_LARGE = 1,
+        UWOP_ALLOC_SMALL = 2,
+        UWOP_SET_FPREG = 3,
+      };
+
+      // These are the UNWIND_INFO structure that is referenced by the third
+      // element of RUNTIME_FUNCTION.
+      //| .pdata
+      dasm_put(Dst, 1543);
+#line 2425 "../../src/codegen.in.c"
+      // This takes care of cases where CountOfCodes is odd.
+      //| .align 4
+      //|=>fn->dasm_unwind_info_label:
+      //| .byte 1  /* Version:3 (1) and Flags:5 (0) */
+      dasm_put(Dst, 1545, fn->dasm_unwind_info_label, 1  /* Version:3 (1) and Flags:5 (0) */);
+#line 2429 "../../src/codegen.in.c"
+      bool small_stack = fn->stack_size / 8 - 1 <= 15;
+      if (small_stack) {
+        // We just happen to "know" this is the form used for small stack sizes.
+        // xxxxxxxxxxxx0000 55                   push        rbp
+        // xxxxxxxxxxxx0001 48 89 E5             mov         rbp,rsp
+        // xxxxxxxxxxxx0004 48 83 EC 10          sub         rsp,10h
+        // xxxxxxxxxxxx0009 ...
+        //| .byte 8  /* SizeOfProlog */
+        //| .byte 3  /* CountOfCodes */
+        dasm_put(Dst, 1550, 8  /* SizeOfProlog */, 3  /* CountOfCodes */);
+#line 2438 "../../src/codegen.in.c"
+      } else {
+        // And this one for larger reservations.
+        // xxxxxxxxxxxx0000 55                   push        rbp
+        // xxxxxxxxxxxx0001 48 89 E5             mov         rbp,rsp
+        // xxxxxxxxxxxx0004 48 81 EC B0 01 00 00 sub         rsp,1B0h
+        // xxxxxxxxxxxx000b ...
+        //| .byte 11  /* SizeOfProlog */
+        //| .byte 4  /* CountOfCodes */
+        dasm_put(Dst, 1550, 11  /* SizeOfProlog */, 4  /* CountOfCodes */);
+#line 2446 "../../src/codegen.in.c"
+      }
+      //| .byte 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */
+      dasm_put(Dst, 981, 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */);
+#line 2448 "../../src/codegen.in.c"
+
+      if (small_stack) {
+        //| .byte 8  /* CodeOffset */
+        //| .byte UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4)
+        dasm_put(Dst, 1550, 8  /* CodeOffset */, UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4));
+#line 2452 "../../src/codegen.in.c"
+      } else {
+        //| .byte 11  /* CodeOffset */
+        dasm_put(Dst, 981, 11  /* CodeOffset */);
+#line 2454 "../../src/codegen.in.c"
+        assert(fn->stack_size / 8 <= 65535 && "todo; not UWOP_ALLOC_LARGE 0-style");
+        //| .byte UWOP_ALLOC_LARGE
+        //| .word fn->stack_size / 8
+        dasm_put(Dst, 1553, UWOP_ALLOC_LARGE, fn->stack_size / 8);
+#line 2457 "../../src/codegen.in.c"
+      }
+      //| .byte 4  /* CodeOffset */
+      //| .byte UWOP_SET_FPREG
+      //| .byte 1  /* CodeOffset */
+      //| .byte UWOP_PUSH_NONVOL | (5 /* RBP */ << 4)
+      dasm_put(Dst, 1556, 4  /* CodeOffset */, UWOP_SET_FPREG, 1  /* CodeOffset */, UWOP_PUSH_NONVOL | (5 /* RBP */ << 4));
+#line 2462 "../../src/codegen.in.c"
+
+      //| .code
+      dasm_put(Dst, 1522);
+#line 2464 "../../src/codegen.in.c"
+#endif
     }
+
     //| mov [rbp+fn->alloca_bottom->offset], rsp
-    dasm_put(Dst, 1541, fn->alloca_bottom->offset);
-#line 2392 "../../src/codegen.in.c"
+    dasm_put(Dst, 1561, fn->alloca_bottom->offset);
+#line 2468 "../../src/codegen.in.c"
 
 #if !X64WIN
     // Save arg registers if function is variadic
@@ -12994,8 +13127,8 @@ static void emit_text(Obj* prog) {
       //| add qword [rbp+off+8], 16
       //| mov [rbp+off+16], rbp                // reg_save_area
       //| add qword [rbp+off+16], off+24
-      dasm_put(Dst, 1546, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
-#line 2413 "../../src/codegen.in.c"
+      dasm_put(Dst, 1566, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
+#line 2489 "../../src/codegen.in.c"
 
       // __reg_save_area__
       //| mov [rbp + off + 24], rdi
@@ -13012,8 +13145,8 @@ static void emit_text(Obj* prog) {
       //| movsd qword [rbp + off + 112], xmm5
       //| movsd qword [rbp + off + 120], xmm6
       //| movsd qword [rbp + off + 128], xmm7
-      dasm_put(Dst, 1573, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
-#line 2429 "../../src/codegen.in.c"
+      dasm_put(Dst, 1593, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
+#line 2505 "../../src/codegen.in.c"
     }
 #endif
 
@@ -13025,8 +13158,8 @@ static void emit_text(Obj* prog) {
       //| mov [rbp + 24], CARG2
       //| mov [rbp + 32], CARG3
       //| mov [rbp + 40], CARG4
-      dasm_put(Dst, 1646, 16, 24, 32, 40);
-#line 2440 "../../src/codegen.in.c"
+      dasm_put(Dst, 1666, 16, 24, 32, 40);
+#line 2516 "../../src/codegen.in.c"
     } else {
       // Save passed-by-register arguments to the stack
       int reg = 0;
@@ -13103,16 +13236,32 @@ static void emit_text(Obj* prog) {
     if (strcmp(fn->name, "main") == 0) {
       //| mov rax, 0
       dasm_put(Dst, 734);
-#line 2515 "../../src/codegen.in.c"
+#line 2591 "../../src/codegen.in.c"
     }
 
     // Epilogue
     //|=>fn->dasm_return_label:
+    dasm_put(Dst, 1055, fn->dasm_return_label);
+#line 2595 "../../src/codegen.in.c"
+#if X64WIN
+    // https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog?view=msvc-170#epilog-code
+    // says this the required form to recognize an epilog.
+    //| lea rsp, [rbp]
+    dasm_put(Dst, 1683);
+#line 2599 "../../src/codegen.in.c"
+#else
     //| mov rsp, rbp
+    dasm_put(Dst, 1688);
+#line 2601 "../../src/codegen.in.c"
+#endif
     //| pop rbp
     //| ret
-    dasm_put(Dst, 1663, fn->dasm_return_label);
-#line 2522 "../../src/codegen.in.c"
+    dasm_put(Dst, 1693);
+#line 2604 "../../src/codegen.in.c"
+
+    //|=>fn->dasm_end_of_function_label:
+    dasm_put(Dst, 1055, fn->dasm_end_of_function_label);
+#line 2606 "../../src/codegen.in.c"
   }
 }
 
@@ -13155,6 +13304,55 @@ static void fill_out_fixups(FileLinkData* fld) {
   }
 }
 
+#if X64WIN
+
+typedef struct RuntimeFunction {
+  unsigned long BeginAddress;
+  unsigned long EndAddress;
+  unsigned long UnwindData;
+} RuntimeFunction;
+
+static void create_and_register_exception_function_table(Obj* prog, char* base_addr) {
+  int func_count = 0;
+  for (Obj* fn = prog; fn; fn = fn->next) {
+    if (!fn->is_function || !fn->is_definition || !fn->is_live)
+      continue;
+
+    ++func_count;
+  }
+
+  size_t alloc_size = (sizeof(RuntimeFunction) * func_count);
+
+  unregister_and_free_function_table_data(user_context);
+  char* function_table_data = malloc(alloc_size);
+  user_context->function_table_data = function_table_data;
+
+  char* pfuncs = function_table_data;
+
+  for (Obj* fn = prog; fn; fn = fn->next) {
+    if (!fn->is_function || !fn->is_definition || !fn->is_live)
+      continue;
+
+    RuntimeFunction* rf = (RuntimeFunction*)pfuncs;
+    int func_start_offset = dasm_getpclabel(&C(dynasm), fn->dasm_entry_label);
+    rf->BeginAddress = func_start_offset;
+    rf->EndAddress = dasm_getpclabel(&C(dynasm), fn->dasm_end_of_function_label);
+    rf->UnwindData = dasm_getpclabel(&C(dynasm), fn->dasm_unwind_info_label);
+    pfuncs += sizeof(RuntimeFunction);
+  }
+
+  register_function_table_data(user_context, func_count, base_addr);
+}
+
+#else  // !X64WIN
+
+static void create_and_register_exception_function_table(Obj* prog, char* base_addr) {
+  (void)prog;
+  (void)base_addr;
+}
+
+#endif
+
 static void codegen_init(void) {
   dasm_init(&C(dynasm), DASM_MAXSECTION);
   dasm_growpc(&C(dynasm), 1 << 16);  // Arbitrary number to avoid lots of reallocs of that array.
@@ -13184,6 +13382,7 @@ static void codegen(Obj* prog, size_t file_index) {
   if (code_size == 0)
     code_size = 1;
   unsigned int page_sized = (unsigned int)align_to_u(code_size, get_page_size());
+
   fld->codeseg_size = page_sized;
   fld->codeseg_base_address = allocate_writable_memory(page_sized);
   // outaf("code_size: %zu, page_sized: %zu\n", code_size, page_sized);
@@ -13196,11 +13395,13 @@ static void codegen(Obj* prog, size_t file_index) {
 
   dasm_encode(&C(dynasm), fld->codeseg_base_address);
 
-  int check_result = dasm_checkstep(&C(dynasm), DASM_SECTION_MAIN);
+  int check_result = dasm_checkstep(&C(dynasm), 0);
   if (check_result != DASM_S_OK) {
     outaf("check_result: 0x%08x\n", check_result);
     ABORT("dasm_checkstep failed");
   }
+
+  create_and_register_exception_function_table(prog, fld->codeseg_base_address);
 
   codegen_free();
 }
@@ -13248,12 +13449,13 @@ static void codegen_free(void) {
 #error "Version mismatch between DynASM and included encoding engine"
 #endif
 #line 19 "../../src/codegen.in.c"
-//| .section main
-#define DASM_SECTION_MAIN	0
-#define DASM_MAXSECTION		1
+//| .section code, pdata
+#define DASM_SECTION_CODE	0
+#define DASM_SECTION_PDATA	1
+#define DASM_MAXSECTION		2
 #line 20 "../../src/codegen.in.c"
 //| .actionlist dynasm_actions
-static const unsigned char dynasm_actions[1680] = {
+static const unsigned char dynasm_actions[1705] = {
   80,255,64,88,240,42,255,72,131,252,236,8,252,242,15,17,4,36,255,252,242,64,
   15,16,4,240,140,36,72,131,196,8,255,252,243,15,16,0,255,252,242,15,16,0,255,
   219,40,255,15,182,0,255,15,190,0,255,15,183,0,255,15,191,0,255,72,99,0,255,
@@ -13328,14 +13530,16 @@ static const unsigned char dynasm_actions[1680] = {
   255,72,137,199,72,129,252,239,239,72,129,252,255,239,255,137,199,129,252,
   239,239,129,252,255,239,255,15,134,245,255,252,233,245,255,252,255,224,255,
   64,136,133,253,240,131,233,255,102,64,137,133,253,240,139,233,255,72,137,
-  133,253,240,131,233,255,85,72,137,229,255,249,73,186,237,237,255,65,252,255,
-  210,72,41,196,255,72,137,165,233,255,199,133,233,237,199,133,233,237,72,137,
-  173,233,72,131,133,233,16,72,137,173,233,72,129,133,233,239,255,72,137,189,
-  233,72,137,181,233,72,137,149,233,72,137,141,233,76,137,133,233,76,137,141,
-  233,252,242,15,17,133,233,252,242,15,17,141,233,252,242,15,17,149,233,252,
-  242,15,17,157,233,252,242,15,17,165,233,252,242,15,17,173,233,252,242,15,
-  17,181,233,252,242,15,17,189,233,255,72,137,189,233,72,137,181,233,72,137,
-  149,233,72,137,141,233,255,249,72,137,252,236,93,195,255
+  133,253,240,131,233,255,254,0,85,72,137,229,255,249,73,186,237,237,255,65,
+  252,255,210,72,41,196,255,254,1,250,3,249,235,255,235,235,255,235,236,255,
+  235,235,235,235,255,72,137,165,233,255,199,133,233,237,199,133,233,237,72,
+  137,173,233,72,131,133,233,16,72,137,173,233,72,129,133,233,239,255,72,137,
+  189,233,72,137,181,233,72,137,149,233,72,137,141,233,76,137,133,233,76,137,
+  141,233,252,242,15,17,133,233,252,242,15,17,141,233,252,242,15,17,149,233,
+  252,242,15,17,157,233,252,242,15,17,165,233,252,242,15,17,173,233,252,242,
+  15,17,181,233,252,242,15,17,189,233,255,72,137,189,233,72,137,181,233,72,
+  137,149,233,72,137,141,233,255,72,141,101,0,255,72,137,252,236,255,93,195,
+  255
 };
 
 #line 21 "../../src/codegen.in.c"
@@ -15886,7 +16090,7 @@ static void assign_lvar_offsets(Obj* prog) {
     // So, "top" means the highest numbered address corresponding the to root
     // function and bottom moves to the frames for the leaf-ward functions.
     int top = 16;
-    int bottom = 0;
+    int bottom = 8;
 
     int reg = 0;
 
@@ -16207,7 +16411,7 @@ static void store_gp(int r, int offset, int sz) {
 
 #if X64WIN
 extern int __chkstk(void);
-#endif
+#endif  // X64WIN
 
 static void emit_text(Obj* prog) {
   // Preallocate the dasm labels so they can be used in functions out of order.
@@ -16217,7 +16421,13 @@ static void emit_text(Obj* prog) {
 
     fn->dasm_return_label = codegen_pclabel();
     fn->dasm_entry_label = codegen_pclabel();
+    fn->dasm_end_of_function_label = codegen_pclabel();
+    fn->dasm_unwind_info_label = codegen_pclabel();
   }
+
+  //| .code
+  dasm_put(Dst, 1531);
+#line 2356 "../../src/codegen.in.c"
 
   for (Obj* fn = prog; fn; fn = fn->next) {
     if (!fn->is_function || !fn->is_definition || !fn->is_live)
@@ -16225,7 +16435,7 @@ static void emit_text(Obj* prog) {
 
     //|=>fn->dasm_entry_label:
     dasm_put(Dst, 1058, fn->dasm_entry_label);
-#line 2358 "../../src/codegen.in.c"
+#line 2362 "../../src/codegen.in.c"
 
     C(current_fn) = fn;
 
@@ -16234,8 +16444,8 @@ static void emit_text(Obj* prog) {
     // Prologue
     //| push rbp
     //| mov rbp, rsp
-    dasm_put(Dst, 1531);
-#line 2366 "../../src/codegen.in.c"
+    dasm_put(Dst, 1533);
+#line 2370 "../../src/codegen.in.c"
 
 #if X64WIN
     // Stack probe on Windows if necessary. The MSDN reference for __chkstk says
@@ -16243,7 +16453,7 @@ static void emit_text(Obj* prog) {
     if (fn->stack_size >= 4096) {
       //| mov rax, fn->stack_size
       dasm_put(Dst, 926, fn->stack_size);
-#line 2372 "../../src/codegen.in.c"
+#line 2376 "../../src/codegen.in.c"
       int fixup_location = codegen_pclabel();
       strintarray_push(&C(fixups), (StringInt){"__chkstk", fixup_location}, AL_Compile);
 #ifdef _MSC_VER
@@ -16252,26 +16462,118 @@ static void emit_text(Obj* prog) {
 #endif
       //|=>fixup_location:
       //| mov64 r10, 0xc0dec0dec0dec0de
-      dasm_put(Dst, 1536, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
-#line 2380 "../../src/codegen.in.c"
+      dasm_put(Dst, 1538, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
+#line 2384 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
       //| call r10
       //| sub rsp, rax
-      dasm_put(Dst, 1542);
-#line 2385 "../../src/codegen.in.c"
+      dasm_put(Dst, 1544);
+#line 2389 "../../src/codegen.in.c"
+
+      // TODO: pdata emission
     } else
 #endif
 
     {
       //| sub rsp, fn->stack_size
       dasm_put(Dst, 617, fn->stack_size);
-#line 2390 "../../src/codegen.in.c"
+#line 2396 "../../src/codegen.in.c"
+
+      // TODO: add a label here to assert that the prolog size is as expected
+
+#if X64WIN
+      // RtlAddFunctionTable() requires these to be at an offset with the same
+      // base as the function offsets, so we need to emit these into the main
+      // codeseg allocation, rather than just allocating them separately, since
+      // we can't easily guarantee a <4G offset to them otherwise.
+
+      // Unfortunately, we can't build another section with this as dynasm
+      // doesn't seem to allow resolving these offsets, so this is done later
+      //| .dword =>fn->dasm_entry_label
+      //| .dword =>fn->dasm_end_of_function_label
+      //| .dword =>fn->dasm_unwind_info_label
+
+      // TODO: probably need to relocate and add info about r11 used as a base
+      // for the value stack copies, and also rdi pushed for memsets.
+
+      // https://learn.microsoft.com/en-us/cpp/build/exception-handling-x64?view=msvc-170
+      enum {
+        UWOP_PUSH_NONVOL = 0,
+        UWOP_ALLOC_LARGE = 1,
+        UWOP_ALLOC_SMALL = 2,
+        UWOP_SET_FPREG = 3,
+      };
+
+      // These are the UNWIND_INFO structure that is referenced by the third
+      // element of RUNTIME_FUNCTION.
+      //| .pdata
+      dasm_put(Dst, 1552);
+#line 2425 "../../src/codegen.in.c"
+      // This takes care of cases where CountOfCodes is odd.
+      //| .align 4
+      //|=>fn->dasm_unwind_info_label:
+      //| .byte 1  /* Version:3 (1) and Flags:5 (0) */
+      dasm_put(Dst, 1554, fn->dasm_unwind_info_label, 1  /* Version:3 (1) and Flags:5 (0) */);
+#line 2429 "../../src/codegen.in.c"
+      bool small_stack = fn->stack_size / 8 - 1 <= 15;
+      if (small_stack) {
+        // We just happen to "know" this is the form used for small stack sizes.
+        // xxxxxxxxxxxx0000 55                   push        rbp
+        // xxxxxxxxxxxx0001 48 89 E5             mov         rbp,rsp
+        // xxxxxxxxxxxx0004 48 83 EC 10          sub         rsp,10h
+        // xxxxxxxxxxxx0009 ...
+        //| .byte 8  /* SizeOfProlog */
+        //| .byte 3  /* CountOfCodes */
+        dasm_put(Dst, 1559, 8  /* SizeOfProlog */, 3  /* CountOfCodes */);
+#line 2438 "../../src/codegen.in.c"
+      } else {
+        // And this one for larger reservations.
+        // xxxxxxxxxxxx0000 55                   push        rbp
+        // xxxxxxxxxxxx0001 48 89 E5             mov         rbp,rsp
+        // xxxxxxxxxxxx0004 48 81 EC B0 01 00 00 sub         rsp,1B0h
+        // xxxxxxxxxxxx000b ...
+        //| .byte 11  /* SizeOfProlog */
+        //| .byte 4  /* CountOfCodes */
+        dasm_put(Dst, 1559, 11  /* SizeOfProlog */, 4  /* CountOfCodes */);
+#line 2446 "../../src/codegen.in.c"
+      }
+      //| .byte 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */
+      dasm_put(Dst, 983, 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */);
+#line 2448 "../../src/codegen.in.c"
+
+      if (small_stack) {
+        //| .byte 8  /* CodeOffset */
+        //| .byte UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4)
+        dasm_put(Dst, 1559, 8  /* CodeOffset */, UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4));
+#line 2452 "../../src/codegen.in.c"
+      } else {
+        //| .byte 11  /* CodeOffset */
+        dasm_put(Dst, 983, 11  /* CodeOffset */);
+#line 2454 "../../src/codegen.in.c"
+        assert(fn->stack_size / 8 <= 65535 && "todo; not UWOP_ALLOC_LARGE 0-style");
+        //| .byte UWOP_ALLOC_LARGE
+        //| .word fn->stack_size / 8
+        dasm_put(Dst, 1562, UWOP_ALLOC_LARGE, fn->stack_size / 8);
+#line 2457 "../../src/codegen.in.c"
+      }
+      //| .byte 4  /* CodeOffset */
+      //| .byte UWOP_SET_FPREG
+      //| .byte 1  /* CodeOffset */
+      //| .byte UWOP_PUSH_NONVOL | (5 /* RBP */ << 4)
+      dasm_put(Dst, 1565, 4  /* CodeOffset */, UWOP_SET_FPREG, 1  /* CodeOffset */, UWOP_PUSH_NONVOL | (5 /* RBP */ << 4));
+#line 2462 "../../src/codegen.in.c"
+
+      //| .code
+      dasm_put(Dst, 1531);
+#line 2464 "../../src/codegen.in.c"
+#endif
     }
+
     //| mov [rbp+fn->alloca_bottom->offset], rsp
-    dasm_put(Dst, 1550, fn->alloca_bottom->offset);
-#line 2392 "../../src/codegen.in.c"
+    dasm_put(Dst, 1570, fn->alloca_bottom->offset);
+#line 2468 "../../src/codegen.in.c"
 
 #if !X64WIN
     // Save arg registers if function is variadic
@@ -16293,8 +16595,8 @@ static void emit_text(Obj* prog) {
       //| add qword [rbp+off+8], 16
       //| mov [rbp+off+16], rbp                // reg_save_area
       //| add qword [rbp+off+16], off+24
-      dasm_put(Dst, 1555, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
-#line 2413 "../../src/codegen.in.c"
+      dasm_put(Dst, 1575, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
+#line 2489 "../../src/codegen.in.c"
 
       // __reg_save_area__
       //| mov [rbp + off + 24], rdi
@@ -16311,8 +16613,8 @@ static void emit_text(Obj* prog) {
       //| movsd qword [rbp + off + 112], xmm5
       //| movsd qword [rbp + off + 120], xmm6
       //| movsd qword [rbp + off + 128], xmm7
-      dasm_put(Dst, 1582, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
-#line 2429 "../../src/codegen.in.c"
+      dasm_put(Dst, 1602, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
+#line 2505 "../../src/codegen.in.c"
     }
 #endif
 
@@ -16324,8 +16626,8 @@ static void emit_text(Obj* prog) {
       //| mov [rbp + 24], CARG2
       //| mov [rbp + 32], CARG3
       //| mov [rbp + 40], CARG4
-      dasm_put(Dst, 1655, 16, 24, 32, 40);
-#line 2440 "../../src/codegen.in.c"
+      dasm_put(Dst, 1675, 16, 24, 32, 40);
+#line 2516 "../../src/codegen.in.c"
     } else {
       // Save passed-by-register arguments to the stack
       int reg = 0;
@@ -16402,16 +16704,32 @@ static void emit_text(Obj* prog) {
     if (strcmp(fn->name, "main") == 0) {
       //| mov rax, 0
       dasm_put(Dst, 734);
-#line 2515 "../../src/codegen.in.c"
+#line 2591 "../../src/codegen.in.c"
     }
 
     // Epilogue
     //|=>fn->dasm_return_label:
+    dasm_put(Dst, 1058, fn->dasm_return_label);
+#line 2595 "../../src/codegen.in.c"
+#if X64WIN
+    // https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog?view=msvc-170#epilog-code
+    // says this the required form to recognize an epilog.
+    //| lea rsp, [rbp]
+    dasm_put(Dst, 1692);
+#line 2599 "../../src/codegen.in.c"
+#else
     //| mov rsp, rbp
+    dasm_put(Dst, 1697);
+#line 2601 "../../src/codegen.in.c"
+#endif
     //| pop rbp
     //| ret
-    dasm_put(Dst, 1672, fn->dasm_return_label);
-#line 2522 "../../src/codegen.in.c"
+    dasm_put(Dst, 1702);
+#line 2604 "../../src/codegen.in.c"
+
+    //|=>fn->dasm_end_of_function_label:
+    dasm_put(Dst, 1058, fn->dasm_end_of_function_label);
+#line 2606 "../../src/codegen.in.c"
   }
 }
 
@@ -16454,6 +16772,55 @@ static void fill_out_fixups(FileLinkData* fld) {
   }
 }
 
+#if X64WIN
+
+typedef struct RuntimeFunction {
+  unsigned long BeginAddress;
+  unsigned long EndAddress;
+  unsigned long UnwindData;
+} RuntimeFunction;
+
+static void create_and_register_exception_function_table(Obj* prog, char* base_addr) {
+  int func_count = 0;
+  for (Obj* fn = prog; fn; fn = fn->next) {
+    if (!fn->is_function || !fn->is_definition || !fn->is_live)
+      continue;
+
+    ++func_count;
+  }
+
+  size_t alloc_size = (sizeof(RuntimeFunction) * func_count);
+
+  unregister_and_free_function_table_data(user_context);
+  char* function_table_data = malloc(alloc_size);
+  user_context->function_table_data = function_table_data;
+
+  char* pfuncs = function_table_data;
+
+  for (Obj* fn = prog; fn; fn = fn->next) {
+    if (!fn->is_function || !fn->is_definition || !fn->is_live)
+      continue;
+
+    RuntimeFunction* rf = (RuntimeFunction*)pfuncs;
+    int func_start_offset = dasm_getpclabel(&C(dynasm), fn->dasm_entry_label);
+    rf->BeginAddress = func_start_offset;
+    rf->EndAddress = dasm_getpclabel(&C(dynasm), fn->dasm_end_of_function_label);
+    rf->UnwindData = dasm_getpclabel(&C(dynasm), fn->dasm_unwind_info_label);
+    pfuncs += sizeof(RuntimeFunction);
+  }
+
+  register_function_table_data(user_context, func_count, base_addr);
+}
+
+#else  // !X64WIN
+
+static void create_and_register_exception_function_table(Obj* prog, char* base_addr) {
+  (void)prog;
+  (void)base_addr;
+}
+
+#endif
+
 static void codegen_init(void) {
   dasm_init(&C(dynasm), DASM_MAXSECTION);
   dasm_growpc(&C(dynasm), 1 << 16);  // Arbitrary number to avoid lots of reallocs of that array.
@@ -16483,6 +16850,7 @@ static void codegen(Obj* prog, size_t file_index) {
   if (code_size == 0)
     code_size = 1;
   unsigned int page_sized = (unsigned int)align_to_u(code_size, get_page_size());
+
   fld->codeseg_size = page_sized;
   fld->codeseg_base_address = allocate_writable_memory(page_sized);
   // outaf("code_size: %zu, page_sized: %zu\n", code_size, page_sized);
@@ -16495,11 +16863,13 @@ static void codegen(Obj* prog, size_t file_index) {
 
   dasm_encode(&C(dynasm), fld->codeseg_base_address);
 
-  int check_result = dasm_checkstep(&C(dynasm), DASM_SECTION_MAIN);
+  int check_result = dasm_checkstep(&C(dynasm), 0);
   if (check_result != DASM_S_OK) {
     outaf("check_result: 0x%08x\n", check_result);
     ABORT("dasm_checkstep failed");
   }
+
+  create_and_register_exception_function_table(prog, fld->codeseg_base_address);
 
   codegen_free();
 }

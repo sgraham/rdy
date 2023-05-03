@@ -10,6 +10,7 @@ vim.opt.wrap = false
 vim.opt.clipboard:append('unnamedplus')
 vim.opt.listchars='tab:>-,trail:.,extends:>'
 vim.opt.list = true
+vim.opt.gdefault = true
 
 vim.cmd([[
 map H ^

@@ -48,18 +48,55 @@ static void Log(const char* fmt, ...) {
   console_main_vprintf(fmt, ap);
 }
 
+static void qq_fmt(char* into, void* data, _ReflectType* type) {
+  char tmp[256];
+  if (type->kind == _REFLECT_KIND_INT) {
+    sprintf(tmp, "%d", *(int*)data);
+    strcat(into, tmp);
+  } else if (type->kind == _REFLECT_KIND_FLOAT) {
+    sprintf(tmp, "%f", *(float*)data);
+    strcat(into, tmp);
+  } else if (type->kind == _REFLECT_KIND_DOUBLE) {
+    sprintf(tmp, "%f", *(double*)data);
+    strcat(into, tmp);
+  } else {
+    strcat(into, "TODO");
+  }
+}
+
 static void qq_eval(char* file, int line, _ReflectType* type, ...) {
-  char buf[256];
+  char buf[1024];
 
   va_list ap;
   va_start(ap, type);
+  sprintf(buf, "= ");
   if (type->kind == _REFLECT_KIND_INT) {
-    sprintf(buf, "= %d (%s)", va_arg(ap, int), type->name);
+    int x = va_arg(ap, int);
+    qq_fmt(buf, &x, type);
+  } else if (type->kind == _REFLECT_KIND_FLOAT) {
+    // '...' passes as double, even if a float is specified.
+    float x = (float)va_arg(ap, double);
+    qq_fmt(buf, &x, type);
   } else if (type->kind == _REFLECT_KIND_DOUBLE) {
-    sprintf(buf, "= %f (%s)", va_arg(ap, double), type->name);
+    double x = va_arg(ap, double);
+    qq_fmt(buf, &x, type);
+  } else if (type->kind == _REFLECT_KIND_STRUCT) {
+    strcat(buf, "{");
+    char* p = va_arg(ap, char*);
+    for (size_t i = 0; i < type->su.num_members; ++i) {
+      strcat(buf, type->su.members[i].name);
+      strcat(buf, "=");
+      qq_fmt(buf, (p + type->su.members[i].offset), type->su.members[i].type);
+      if (i < type->su.num_members - 1)
+        strcat(buf, ",");
+    }
+    strcat(buf, "}");
   } else {
     sprintf(buf, "...todo");
   }
+  strcat(buf, " (");
+  strcat(buf, type->name);
+  strcat(buf, ")");
   va_end(ap);
 
   nvim_connection_send_extmark_update(connection_handle, file, line - 1, buf);
@@ -705,6 +742,7 @@ int main(void) {
   };
   const char* files[] = {
       fullpath(".\\project\\entry.c"),
+      fullpath(".\\project\\player.c"),
       NULL,
   };
 

@@ -1,10 +1,7 @@
 #ifdef __dyibicc__
 #include <reflect.h>
 
-#define QQ(expr)                                \
-  qq_eval(                                      \
-      __FILE__, __LINE__, _ReflectTypeOf(expr), \
-      expr)
+#define QQ(expr) qq_eval(__FILE__, __LINE__, _ReflectTypeOf(expr), expr)
 
 void qq_eval(const char* file, int line, int num_args, ...);
 #else
@@ -24,29 +21,31 @@ void do_player_movement(void);
 
 static bool is_fullscreen;
 
-Camera2D cam = {0}; //(Vector2){0,0}, (Vector2){0,0}, 0.f, 1.f };
+Camera2D cam = {0};  //(Vector2){0,0}, (Vector2){0,0}, 0.f, 1.f };
 Texture2D texall;
 bool edit_mode;
 
 #define MAX_LEVEL_SIZE 4096
-unsigned char raw_level_data[MAX_LEVEL_SIZE*MAX_LEVEL_SIZE];
+unsigned char raw_level_data[MAX_LEVEL_SIZE * MAX_LEVEL_SIZE];
 
 static unsigned char get_level_at(int x, int y) {
-  return raw_level_data[y*MAX_LEVEL_SIZE+x];
+  return raw_level_data[y * MAX_LEVEL_SIZE + x];
 }
 
 bool level_is_set(int x, int y, int layer) {
-  if (y < 0 || y >= MAX_LEVEL_SIZE) return false;
-  if (x < 0 || x >= MAX_LEVEL_SIZE) return false;
-  return raw_level_data[y*MAX_LEVEL_SIZE+x] & (1<<layer);
+  if (y < 0 || y >= MAX_LEVEL_SIZE)
+    return false;
+  if (x < 0 || x >= MAX_LEVEL_SIZE)
+    return false;
+  return raw_level_data[y * MAX_LEVEL_SIZE + x] & (1 << layer);
 }
 
 static void set_level_at(int x, int y, int layer) {
-  raw_level_data[y*MAX_LEVEL_SIZE+x] |= (unsigned char)(1<<layer);
+  raw_level_data[y * MAX_LEVEL_SIZE + x] |= (unsigned char)(1 << layer);
 }
 
 static void clear_level_at(int x, int y, int layer) {
-  raw_level_data[y*MAX_LEVEL_SIZE+x] &= (unsigned char)(~(1<<layer));
+  raw_level_data[y * MAX_LEVEL_SIZE + x] &= (unsigned char)(~(1 << layer));
 }
 
 static void init(void) {
@@ -59,15 +58,23 @@ static void init(void) {
     fread(raw_level_data, sizeof(raw_level_data), 1, f);
     fclose(f);
   }
+  for (int i = 0; i < MAX_LEVEL_SIZE; ++i) {
+    set_level_at(i, 0, 0);
+    set_level_at(i, MAX_LEVEL_SIZE - 1, 0);
+    set_level_at(0, i, 0);
+    set_level_at(MAX_LEVEL_SIZE - 1, i, 0);
+  }
 }
 
 static void toggle_fullscreen(void) {
   if (!is_fullscreen) {
-    SetWindowState(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_TOPMOST);
-    SetWindowPosition(0,0);
+    SetWindowState(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED |
+                   FLAG_WINDOW_TOPMOST);
+    SetWindowPosition(0, 0);
     SetWindowSize(GetMonitorWidth(0), GetMonitorHeight(0));
   } else {
-    ClearWindowState(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED | FLAG_WINDOW_TOPMOST);
+    ClearWindowState(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED |
+                     FLAG_WINDOW_TOPMOST);
     SetWindowSize(1920, 1080);
     SetWindowPosition(10, 50);
   }
@@ -216,10 +223,11 @@ static bool find_tile_by_rule(int x, int y, Rectangle* rect) {
     return false;  // Not strictly correct, but true for
                    // all our rules right now.
 
-  for (size_t i = 0; i < sizeof(rules)/sizeof(rules[0]); ++i) {
+  for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); ++i) {
     Rule* rule = &rules[i];
     // todo; multiple layers (and early out above)
-    if (rule->pattern[4] != '0') Log("%s", "EXPECTING MIDDLE 0");
+    if (rule->pattern[4] != '0')
+      Log("%s", "EXPECTING MIDDLE 0");
 
     // skip if looking at left column while at left edge of map
     if ((rule->pattern[0] != '.' || rule->pattern[3] != '.' ||
@@ -249,16 +257,24 @@ static bool find_tile_by_rule(int x, int y, Rectangle* rect) {
       continue;
     }
 
-    if (rule->pattern[0] == 'x' && level_is_set(x-1, y-1, 0)) continue;
-    if (rule->pattern[1] == 'x' && level_is_set(x, y-1, 0)) continue;
-    if (rule->pattern[2] == 'x' && level_is_set(x+1, y-1, 0)) continue;
-    if (rule->pattern[3] == 'x' && level_is_set(x-1, y, 0)) continue;
-    //if (rule->pattern[3] == '0' && !level_is_set(x-1, y, 0)) continue;
-    if (rule->pattern[5] == 'x' && level_is_set(x+1, y, 0)) continue;
-    if (rule->pattern[6] == 'x' && level_is_set(x-1, y+1, 0)) continue;
-    if (rule->pattern[7] == 'x' && level_is_set(x, y+1, 0)) continue;
-    //if (rule->pattern[7] == '0' && !level_is_set(x, y+1, 0)) continue;
-    if (rule->pattern[8] == 'x' && level_is_set(x+1, y+1, 0)) continue;
+    if (rule->pattern[0] == 'x' && level_is_set(x - 1, y - 1, 0))
+      continue;
+    if (rule->pattern[1] == 'x' && level_is_set(x, y - 1, 0))
+      continue;
+    if (rule->pattern[2] == 'x' && level_is_set(x + 1, y - 1, 0))
+      continue;
+    if (rule->pattern[3] == 'x' && level_is_set(x - 1, y, 0))
+      continue;
+    // if (rule->pattern[3] == '0' && !level_is_set(x-1, y, 0)) continue;
+    if (rule->pattern[5] == 'x' && level_is_set(x + 1, y, 0))
+      continue;
+    if (rule->pattern[6] == 'x' && level_is_set(x - 1, y + 1, 0))
+      continue;
+    if (rule->pattern[7] == 'x' && level_is_set(x, y + 1, 0))
+      continue;
+    // if (rule->pattern[7] == '0' && !level_is_set(x, y+1, 0)) continue;
+    if (rule->pattern[8] == 'x' && level_is_set(x + 1, y + 1, 0))
+      continue;
 
     rect->x = rule->tx * GRID;
     rect->y = rule->ty * GRID;
@@ -271,7 +287,7 @@ static void draw_world(void) {
   Rectangle texcoords = {0, 0, GRID, GRID};
   for (int y = 0; y < GetRenderHeight(); y += GRID) {
     for (int x = 0; x < GetRenderWidth(); x += GRID) {
-      if (find_tile_by_rule(x/GRID, y/GRID, &texcoords)) {
+      if (find_tile_by_rule(x / GRID, y / GRID, &texcoords)) {
         DrawTextureRec(texall, texcoords, (Vector2){x, y}, WHITE);
       }
     }
@@ -304,16 +320,16 @@ static void update(void) {
 
   BeginMode2D(cam);
 
-  //QQ(cam.zoom);
+  // QQ(cam.zoom);
 
-  QQ(GetMouseX());
-  QQ(GetMouseY());
+  // QQ(GetMouseX());
+  // QQ(GetMouseY());
   Vector2 world = GetScreenToWorld2D(GetMousePosition(), cam);
 
   int x_tile = (int)(world.x / GRID);
   int y_tile = (int)(world.y / GRID);
-  QQ(x_tile);
-  QQ(y_tile);
+  // QQ(x_tile);
+  // QQ(y_tile);
 
   if (IsKeyPressed(KEY_SPACE)) {
     edit_mode = !edit_mode;
@@ -337,8 +353,10 @@ static void update(void) {
   if (IsKeyDown(KEY_DOWN)) {
     cam.offset.y -= GRID;
   }
-  if (cam.offset.x > 0) cam.offset.x = 0;
-  if (cam.offset.y > 0) cam.offset.y = 0;
+  if (cam.offset.x > 0)
+    cam.offset.x = 0;
+  if (cam.offset.y > 0)
+    cam.offset.y = 0;
 
   if (IsKeyDown(KEY_F1)) {
     DrawTexture(texall, 0, 0, WHITE);
@@ -364,7 +382,7 @@ static void update(void) {
     }
 
     DrawRectangle(x_tile * GRID, y_tile * GRID, GRID, GRID, Fade(GREEN, .25f));
-    DrawText(TextFormat("%d %d", x_tile, y_tile), x_tile * GRID + GRID,
+    DrawText(TextFormat("%d,%d", x_tile, y_tile), x_tile * GRID + GRID,
              y_tile * GRID + GRID, 12, GREEN);
   } else {
     cam.zoom = 4.f;

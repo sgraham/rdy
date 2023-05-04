@@ -11,6 +11,7 @@ vim.opt.clipboard:append('unnamedplus')
 vim.opt.listchars='tab:>-,trail:.,extends:>'
 vim.opt.list = true
 vim.opt.gdefault = true
+vim.opt.ffs = {'unix', 'dos'}
 
 vim.cmd([[
 map H ^
@@ -27,6 +28,8 @@ execute "map ,sv :so " . stdpath('config') . "/init.lua<CR>"
 map ,i0 dO#if 0<CR>#endif<ESC>kp
 
 map <silent> <C-F5> :if expand("%:p:h") != ""<CR>:!start explorer.exe %:p:h,/e<CR>:endif<CR><CR>
+
+nnoremap <silent> <ESC> :noh<CR><ESC>
 
 map <silent> <F12> :CtrlPMRU<cr>
 imap <silent> <F12> <ESC>:CtrlPMRU<cr>

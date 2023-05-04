@@ -53,6 +53,9 @@ static void qq_fmt(char* into, void* data, _ReflectType* type) {
   if (type->kind == _REFLECT_KIND_INT) {
     sprintf(tmp, "%d", *(int*)data);
     strcat(into, tmp);
+  } else if (type->kind == _REFLECT_KIND_BOOL) {
+      sprintf(tmp, "%s", *(bool*)data ? "true" : "false");
+      strcat(into, tmp);
   } else if (type->kind == _REFLECT_KIND_FLOAT) {
     sprintf(tmp, "%f", *(float*)data);
     strcat(into, tmp);
@@ -72,6 +75,10 @@ static void qq_eval(char* file, int line, _ReflectType* type, ...) {
   sprintf(buf, "= ");
   if (type->kind == _REFLECT_KIND_INT) {
     int x = va_arg(ap, int);
+    qq_fmt(buf, &x, type);
+  } else if (type->kind == _REFLECT_KIND_BOOL) {
+    // '...' passes as int, even if a bool is specified.
+    bool x = (bool)va_arg(ap, int);
     qq_fmt(buf, &x, type);
   } else if (type->kind == _REFLECT_KIND_FLOAT) {
     // '...' passes as double, even if a float is specified.

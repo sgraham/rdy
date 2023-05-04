@@ -93,7 +93,7 @@ static const Rule rules[] = {
         .pattern = ".x."
                    "x0x"
                    ".x.",
-        .tx = 20,
+        .tx = 0,
         .ty = 0,
     },
     {
@@ -101,7 +101,7 @@ static const Rule rules[] = {
         .pattern = ".x."
                    ".0x"
                    ".x.",
-        .tx = 23,
+        .tx = 3,
         .ty = 0,
     },
     {
@@ -109,7 +109,7 @@ static const Rule rules[] = {
         .pattern = ".x."
                    "x0."
                    ".x.",
-        .tx = 21,
+        .tx = 1,
         .ty = 0,
     },
     {
@@ -117,7 +117,7 @@ static const Rule rules[] = {
         .pattern = ".x."
                    ".0."
                    ".x.",
-        .tx = 22,
+        .tx = 2,
         .ty = 0,
     },
     {
@@ -125,7 +125,7 @@ static const Rule rules[] = {
         .pattern = ".x."
                    "x0x"
                    "...",
-        .tx = 20,
+        .tx = 0,
         .ty = 1,
     },
     {
@@ -133,7 +133,7 @@ static const Rule rules[] = {
         .pattern = "..."
                    "x0x"
                    ".x.",
-        .tx = 20,
+        .tx = 0,
         .ty = 3,
     },
     {
@@ -141,7 +141,7 @@ static const Rule rules[] = {
         .pattern = "..."
                    "x0x"
                    "...",
-        .tx = 20,
+        .tx = 0,
         .ty = 2,
     },
     {
@@ -149,7 +149,7 @@ static const Rule rules[] = {
         .pattern = ".x."
                    "x0."
                    "...",
-        .tx = 21,
+        .tx = 1,
         .ty = 1,
     },
     {
@@ -157,7 +157,7 @@ static const Rule rules[] = {
         .pattern = ".x."
                    ".0x"
                    "...",
-        .tx = 23,
+        .tx = 3,
         .ty = 1,
     },
     {
@@ -165,7 +165,7 @@ static const Rule rules[] = {
         .pattern = "..."
                    "x0."
                    ".x.",
-        .tx = 21,
+        .tx = 1,
         .ty = 3,
     },
     {
@@ -173,7 +173,7 @@ static const Rule rules[] = {
         .pattern = "..."
                    ".0x"
                    ".x.",
-        .tx = 23,
+        .tx = 3,
         .ty = 3,
     },
     {
@@ -181,7 +181,7 @@ static const Rule rules[] = {
         .pattern = ".x."
                    ".0."
                    "...",
-        .tx = 22,
+        .tx = 2,
         .ty = 1,
     },
     {
@@ -189,7 +189,7 @@ static const Rule rules[] = {
         .pattern = "..."
                    ".0."
                    ".x.",
-        .tx = 22,
+        .tx = 2,
         .ty = 3,
     },
     {
@@ -197,7 +197,7 @@ static const Rule rules[] = {
         .pattern = "..."
                    "x0."
                    "...",
-        .tx = 21,
+        .tx = 1,
         .ty = 2,
     },
     {
@@ -205,7 +205,7 @@ static const Rule rules[] = {
         .pattern = "..."
                    ".0x"
                    "...",
-        .tx = 23,
+        .tx = 3,
         .ty = 2,
     },
     {
@@ -213,10 +213,13 @@ static const Rule rules[] = {
         .pattern = "..."
                    ".0."
                    "...",
-        .tx = 22,
+        .tx = 2,
         .ty = 2,
     },
 };
+
+int rule_tile_x = 20;
+int rule_tile_y = 0;
 
 static bool find_tile_by_rule(int x, int y, Rectangle* rect) {
   if (!level_is_set(x, y, 0))
@@ -265,19 +268,17 @@ static bool find_tile_by_rule(int x, int y, Rectangle* rect) {
       continue;
     if (rule->pattern[3] == 'x' && level_is_set(x - 1, y, 0))
       continue;
-    // if (rule->pattern[3] == '0' && !level_is_set(x-1, y, 0)) continue;
     if (rule->pattern[5] == 'x' && level_is_set(x + 1, y, 0))
       continue;
     if (rule->pattern[6] == 'x' && level_is_set(x - 1, y + 1, 0))
       continue;
     if (rule->pattern[7] == 'x' && level_is_set(x, y + 1, 0))
       continue;
-    // if (rule->pattern[7] == '0' && !level_is_set(x, y+1, 0)) continue;
     if (rule->pattern[8] == 'x' && level_is_set(x + 1, y + 1, 0))
       continue;
 
-    rect->x = rule->tx * GRID;
-    rect->y = rule->ty * GRID;
+    rect->x = (rule->tx + rule_tile_x) * GRID;
+    rect->y = (rule->ty + rule_tile_y) * GRID;
     return true;
   }
   return false;
@@ -333,6 +334,20 @@ static void update(void) {
 
   if (IsKeyPressed(KEY_SPACE)) {
     edit_mode = !edit_mode;
+  }
+
+  if (IsKeyPressed('D')) {
+    rule_tile_x = 20;
+    rule_tile_y = 0;
+  } else if (IsKeyPressed('S')) {
+    rule_tile_x = 0;
+    rule_tile_y = 4;
+  } else if (IsKeyPressed('M')) {
+    rule_tile_x = 20;
+    rule_tile_y = 7;
+  } else if (IsKeyPressed('G')) {
+    rule_tile_x = 0;
+    rule_tile_y = 0;
   }
 
   if (IsKeyDown(KEY_LEFT_SHIFT)) {

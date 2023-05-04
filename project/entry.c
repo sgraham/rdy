@@ -13,6 +13,8 @@ void qq_eval(const char* file, int line, int num_args, ...);
 #include "raylib.h"
 #include "raymath.h"
 
+#define SCREEN_WIDTH 1920
+#define SCREEN_HEIGHT 1080
 #define GRID 18
 
 void Log(const char* fmt, ...);
@@ -85,6 +87,7 @@ typedef struct Rule {
   char pattern[10];
   int tx;
   int ty;
+  bool fixed;
 } Rule;
 
 static const Rule rules[] = {
@@ -112,6 +115,26 @@ static const Rule rules[] = {
         .tx = 1,
         .ty = 0,
     },
+#if 0 // too many extra tiles needed for these for thin parts
+    {
+      // inside corner bottom left
+      .pattern = "00."
+                 "00."
+                 "x0.",
+      .tx = 5,
+      .ty = 0,
+      .fixed = true,
+    },
+    {
+      // inside corner bottom right
+      .pattern = ".00"
+                 ".00"
+                 ".0x",
+      .tx = 4,
+      .ty = 0,
+      .fixed = true,
+    },
+#endif
     {
         // bridge centre
         .pattern = ".x."
@@ -260,25 +283,30 @@ static bool find_tile_by_rule(int x, int y, Rectangle* rect) {
       continue;
     }
 
-    if (rule->pattern[0] == 'x' && level_is_set(x - 1, y - 1, 0))
-      continue;
-    if (rule->pattern[1] == 'x' && level_is_set(x, y - 1, 0))
-      continue;
-    if (rule->pattern[2] == 'x' && level_is_set(x + 1, y - 1, 0))
-      continue;
-    if (rule->pattern[3] == 'x' && level_is_set(x - 1, y, 0))
-      continue;
-    if (rule->pattern[5] == 'x' && level_is_set(x + 1, y, 0))
-      continue;
-    if (rule->pattern[6] == 'x' && level_is_set(x - 1, y + 1, 0))
-      continue;
-    if (rule->pattern[7] == 'x' && level_is_set(x, y + 1, 0))
-      continue;
-    if (rule->pattern[8] == 'x' && level_is_set(x + 1, y + 1, 0))
-      continue;
+    if (rule->pattern[0] == 'x' && level_is_set(x - 1, y - 1, 0)) continue;
+    if (rule->pattern[0] == '0' && !level_is_set(x - 1, y - 1, 0)) continue;
+    if (rule->pattern[1] == 'x' && level_is_set(x, y - 1, 0)) continue;
+    if (rule->pattern[1] == '0' && !level_is_set(x, y - 1, 0)) continue;
+    if (rule->pattern[2] == 'x' && level_is_set(x + 1, y - 1, 0)) continue;
+    if (rule->pattern[2] == '0' && !level_is_set(x + 1, y - 1, 0)) continue;
+    if (rule->pattern[3] == 'x' && level_is_set(x - 1, y, 0)) continue;
+    if (rule->pattern[3] == '0' && !level_is_set(x - 1, y, 0)) continue;
+    if (rule->pattern[5] == 'x' && level_is_set(x + 1, y, 0)) continue;
+    if (rule->pattern[5] == '0' && !level_is_set(x + 1, y, 0)) continue;
+    if (rule->pattern[6] == 'x' && level_is_set(x - 1, y + 1, 0)) continue;
+    if (rule->pattern[6] == '0' && !level_is_set(x - 1, y + 1, 0)) continue;
+    if (rule->pattern[7] == 'x' && level_is_set(x, y + 1, 0)) continue;
+    if (rule->pattern[7] == '0' && !level_is_set(x, y + 1, 0)) continue;
+    if (rule->pattern[8] == 'x' && level_is_set(x + 1, y + 1, 0)) continue;
+    if (rule->pattern[8] == '0' && !level_is_set(x + 1, y + 1, 0)) continue;
 
-    rect->x = (rule->tx + rule_tile_x) * GRID;
-    rect->y = (rule->ty + rule_tile_y) * GRID;
+    if (rule->fixed) {
+      rect->x = rule->tx * GRID;
+      rect->y = rule->ty * GRID;
+    } else {
+      rect->x = (rule->tx + rule_tile_x) * GRID;
+      rect->y = (rule->ty + rule_tile_y) * GRID;
+    }
     return true;
   }
   return false;
@@ -286,8 +314,8 @@ static bool find_tile_by_rule(int x, int y, Rectangle* rect) {
 
 static void draw_world(void) {
   Rectangle texcoords = {0, 0, GRID, GRID};
-  for (int y = 0; y < GetRenderHeight(); y += GRID) {
-    for (int x = 0; x < GetRenderWidth(); x += GRID) {
+  for (int y = 0; y < SCREEN_HEIGHT; y += GRID) {
+    for (int x = 0; x < SCREEN_WIDTH; x += GRID) {
       if (find_tile_by_rule(x / GRID, y / GRID, &texcoords)) {
         DrawTextureRec(texall, texcoords, (Vector2){x, y}, WHITE);
       }
@@ -296,8 +324,8 @@ static void draw_world(void) {
 }
 
 static void draw_world_raw(void) {
-  for (int y = 0; y < GetRenderHeight(); y += GRID) {
-    for (int x = 0; x < GetRenderWidth(); x += GRID) {
+  for (int y = 0; y < SCREEN_HEIGHT; y += GRID) {
+    for (int x = 0; x < SCREEN_WIDTH; x += GRID) {
       if (get_level_at(x / GRID, y / GRID) & 1) {
         DrawRectangle(x, y, GRID, GRID, WHITE);
       }
@@ -323,9 +351,9 @@ static void update(void) {
 
   // QQ(cam.zoom);
 
-  // QQ(GetMouseX());
-  // QQ(GetMouseY());
-  Vector2 world = GetScreenToWorld2D(GetMousePosition(), cam);
+  double mx = (double)GetMouseX() * SCREEN_WIDTH / GetRenderWidth();
+  double my = (double)GetMouseY() * SCREEN_HEIGHT / GetRenderHeight();
+  Vector2 world = GetScreenToWorld2D((Vector2){mx, my}, cam);
 
   int x_tile = (int)(world.x / GRID);
   int y_tile = (int)(world.y / GRID);
@@ -389,11 +417,11 @@ static void update(void) {
       clear_level_at(x_tile, y_tile, current_layer);
     }
 
-    for (int x = 0; x < GetRenderWidth(); x += GRID) {
-      DrawLine(x, 0, x, GetRenderHeight(), GREEN);
+    for (int x = 0; x < SCREEN_WIDTH; x += GRID) {
+      DrawLine(x, 0, x, SCREEN_HEIGHT, GREEN);
     }
-    for (int y = 0; y < GetRenderHeight(); y += GRID) {
-      DrawLine(0, y, GetRenderWidth(), y, GREEN);
+    for (int y = 0; y < SCREEN_HEIGHT; y += GRID) {
+      DrawLine(0, y, SCREEN_WIDTH, y, GREEN);
     }
 
     DrawRectangle(x_tile * GRID, y_tile * GRID, GRID, GRID, Fade(GREEN, .25f));
@@ -410,6 +438,8 @@ static void update(void) {
   do_player_movement();
 
   EndMode2D();
+
+  DrawFPS(4, 1060);
 }
 
 // 0 = init

@@ -41,6 +41,8 @@ Rectangle anim_jump_rects[] = {
 };
 Animation anim_jump = {1, &anim_jump_rects, "jump"};
 
+Rectangle egg_rect = {360, 288, 9, 11};
+
 double clamp_walk = 2;  // maximum walking speed
 double clamp_fall_speed = 6;
 
@@ -80,6 +82,16 @@ bool grounded;
 
 double x = 30;
 double y = 50;
+
+#define MAX_PARTICLES 300
+typedef struct Particle {
+  Rectangle* src_tex_rect;
+  Vector2 position;
+  Vector2 velocity;
+  Vector2 gravity;
+  int frames_until_death;
+} Particle;
+Particle particles[MAX_PARTICLES];
 
 int record_frame;
 #define RECORD_COUNT 150
@@ -226,15 +238,47 @@ void move_contact_solid(double direction, double amount) {
 }
 
 #endif
+
+static Particle* find_particle_slot(void) {
+  for (size_t i = 0; i < MAX_PARTICLES; ++i) {
+    if (!particles[i].src_tex_rect) {
+      return &particles[i];
+    }
+  }
+  return NULL;
+}
+
+static void update_particles(void) {
+  for (size_t i = 0; i < MAX_PARTICLES; ++i) {
+    Particle*p = &particles[i];
+    if (p->src_tex_rect) {
+      if (p->frames_until_death-- == 0) {
+        p->src_tex_rect = NULL;
+        break;
+      }
+      p->position.x += p->velocity.x;
+      p->position.y += p->velocity.y;
+      p->velocity.x += p->gravity.x;
+      p->velocity.y += p->gravity.y;
+
+      DrawTextureRec(texall, *p->src_tex_rect, p->position, WHITE);
+    }
+  }
+}
+
 void do_player_movement(void) {
   bool want_left = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_LEFT) ||
                    GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X) < -0.5f;
   bool want_right = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT) ||
                     GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X) > 0.5f;
+  bool want_up = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_UP) ||
+                 GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_Y) < -0.5f;
 
   bool want_jump = IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
   bool jump_released =
       IsGamepadButtonReleased(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
+
+  bool want_egg = IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_LEFT);
 
   if (IsKeyPressed(KEY_ESCAPE)) {
     x = 30;
@@ -580,6 +624,37 @@ void do_player_movement(void) {
   } else {
     cur_anim = &anim_jump;
   }
+
+  if (want_egg) {
+    Particle* p = find_particle_slot();
+    if (p) {
+      p->src_tex_rect = &egg_rect;
+      if (h_flip_render) {
+        p->position.x = x - 8;
+      } else {
+        p->position.x = x - 2;
+      }
+
+      if (want_up) {
+        p->position.y = y-30;
+
+        p->velocity.x = 0;
+        p->velocity.y = -8;
+      } else {
+        p->position.y = y-20;
+        if (h_flip_render) {
+          p->velocity.x = -6;
+        } else {
+          p->velocity.x = 6;
+        }
+        p->velocity.y = -3.5;
+      }
+      p->gravity.x = 0;
+      p->gravity.y = .3;
+      p->frames_until_death = 180;
+    }
+  }
+
   while (frame_counter >= cur_anim->num_frames)
     frame_counter -= cur_anim->num_frames;
   if (h_flip_render) {
@@ -587,8 +662,6 @@ void do_player_movement(void) {
     copy.width = -copy.width;
     DrawTextureRec(texall, copy, (Vector2){(int)x - 16, (int)y - 32}, WHITE);
   } else {
-    QQ(cur_anim->rects[(int)frame_counter].x);
-    QQ(cur_anim->rects[(int)frame_counter].width);
     DrawTextureRec(texall, cur_anim->rects[(int)frame_counter],
                    (Vector2){(int)x - 16, (int)y - 32}, WHITE);
   }
@@ -604,4 +677,6 @@ void do_player_movement(void) {
     DrawText(cur_anim->name, (int)x + COLL_L, (int)y + COLL_T - 10, 10,
              Fade(BLUE, .4f));
   }
+
+  update_particles();
 }

@@ -738,6 +738,8 @@ int main(void) {
   SetTraceLogCallback(custom_raylib_log);
 
   InitWindow(1920, 1080, "Rdy");
+  RenderTexture2D target = LoadRenderTexture(1920, 1080);
+
   SetTargetFPS(60);
 
   console_init();
@@ -784,7 +786,9 @@ int main(void) {
 
     commit_last_change_for_each_file();
 
-    BeginDrawing();
+    // We render in to a texture so that non-mode-changing fullscreen
+    // isn't a hassle in game render code.
+    BeginTextureMode(target);
 
 #define ENTRY_POINT_NAME "RdyEntryPoint"
     void* entry = NULL;
@@ -807,6 +811,13 @@ int main(void) {
 
     console_update();
 
+    EndTextureMode();
+
+    BeginDrawing();
+    Rectangle source_rect = {0.0f, 0.0f, (float)target.texture.width,
+                             -(float)target.texture.height};
+    Rectangle dest_rect = {0, 0, (float)GetRenderWidth(), (float)GetRenderHeight()};
+    DrawTexturePro(target.texture, source_rect, dest_rect, (Vector2){0,0}, 0.0f, WHITE);
     EndDrawing();
   }
 

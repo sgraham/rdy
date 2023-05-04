@@ -278,6 +278,15 @@ void do_player_movement(void) {
   bool jump_released =
       IsGamepadButtonReleased(0, GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
 
+  double egg_x = GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_X);
+  double egg_y = GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_Y);
+  bool want_egg_spray;
+  double egg_angle = 0.0;
+  want_egg_spray = sqrt(egg_x*egg_x + egg_y*egg_y) > 0.5;
+  if (want_egg_spray) {
+    egg_angle = atan2(egg_y, egg_x);
+  }
+
   bool want_egg = IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_LEFT);
 
   if (IsKeyPressed(KEY_ESCAPE)) {
@@ -649,6 +658,24 @@ void do_player_movement(void) {
         }
         p->velocity.y = -3.5;
       }
+      p->gravity.x = 0;
+      p->gravity.y = .3;
+      p->frames_until_death = 180;
+    }
+  }
+
+  static int frames_since_last_egg_spray = 0;
+  if (want_egg_spray) {
+    if (frames_since_last_egg_spray > 0) {
+      frames_since_last_egg_spray--;
+    } else {
+      frames_since_last_egg_spray = 12;
+      Particle *p = find_particle_slot();
+      p->src_tex_rect = &egg_rect;
+      p->position.x = x - 5 + 8*cos(egg_angle);
+      p->position.y = y - 22 + 3*sin(egg_angle);
+      p->velocity.x = 7 * cos(egg_angle);
+      p->velocity.y = 7 * sin(egg_angle);
       p->gravity.x = 0;
       p->gravity.y = .3;
       p->frames_until_death = 180;

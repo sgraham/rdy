@@ -737,6 +737,7 @@ int main(void) {
   console_preinit();
   SetTraceLogCallback(custom_raylib_log);
 
+  SetConfigFlags(FLAG_VSYNC_HINT);
   InitWindow(1920, 1080, "Rdy");
   RenderTexture2D target = LoadRenderTexture(1920, 1080);
 

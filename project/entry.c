@@ -19,7 +19,7 @@ void qq_eval(const char* file, int line, int num_args, ...);
 
 void Log(const char* fmt, ...);
 
-void do_player_movement(void);
+void do_player_movement(Camera2D* cam);
 
 static bool is_fullscreen;
 
@@ -435,7 +435,7 @@ static void update(void) {
     save_level("level0.dat");
   }
 
-  do_player_movement();
+  do_player_movement(&cam);
 
   EndMode2D();
 

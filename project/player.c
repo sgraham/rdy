@@ -15,17 +15,18 @@ void qq_eval(const char* file, int line, int num_args, ...);
 typedef struct Animation {
   int num_frames;
   Rectangle* rects;
-  char* name;
 } Animation;
 
 #define PW 32
 #define PH 32
 #define GRID 18
+#define SCREEN_WIDTH 1920
+#define SCREEN_HEIGHT 1080
 
 Rectangle anim_idle_rects[] = {{176, 162, PW, PH}, {176, 194, PW, PH},
                                {176, 226, PW, PH}, {176, 258, PW, PH},
                                {176, 290, PW, PH}, {176, 322, PW, PH}};
-Animation anim_idle = {6, &anim_idle_rects, "idle"};
+Animation anim_idle = {6, &anim_idle_rects};
 
 Rectangle anim_run_rects[] = {
     {144, 162, PW, PH}, {144, 194, PW, PH}, {144, 226, PW, PH},
@@ -33,32 +34,32 @@ Rectangle anim_run_rects[] = {
     {144, 354, PW, PH}, {144, 386, PW, PH}, {144, 418, PW, PH},
     {144, 450, PW, PH},
 };
-Animation anim_run = {10, &anim_run_rects, "run"};
+Animation anim_run = {10, &anim_run_rects};
 
 // TODO: reusing a run frame
 Rectangle anim_jump_rects[] = {
     {144, 386, PW, PH},
 };
-Animation anim_jump = {1, &anim_jump_rects, "jump"};
+Animation anim_jump = {1, &anim_jump_rects};
 
 Rectangle egg_rect = {360, 288, 9, 11};
 
-double clamp_walk = 2;  // maximum walking speed
-double clamp_fall_speed = 6;
+double clamp_walk = 1.3;  // maximum walking speed
+double clamp_fall_speed = 5;
 
-double walk_acceleration =
-    2;  // when holding button how fast to get to max speed
-double walk_deceleration = 1.4;  // when no button is held how fast to get to 0
+// when holding button how fast to get to max speed
+const double walk_acceleration = .3;
+const double walk_deceleration = .15;  // when no button is held how fast to get to 0
 
-double jump_height = 5.1;  // 4 bricks
+const double jump_height = 5.8;  // 4 bricks
 bool jump_early_end = false;
 
 double current_h_speed = 0;  // how fast the player would like to move
 double current_v_speed = 0;
 
-double fall_speed = .18;
-double fall_speed_min = .18;
-double fall_speed_max = .25;
+const double fall_speed = .25;
+const double fall_speed_min = .13;
+const double fall_speed_max = .25;
 
 bool grounded = false;
 bool touched_ground_since_last_jump = false;
@@ -72,13 +73,11 @@ int jump_frames_ago = 999;
 int frames_going_down = 999;
 
 bool at_apex = false;       // this isnt the apex but the top 4th
-double speed_for_apex = 6;  // if they are going slower than this and in the air
+double speed_for_apex = 2;  // if they are going slower than this and in the air
                             // we call this the apex
 
 double current_h_speed;
 double current_v_speed;
-bool at_apex;
-bool grounded;
 
 double x = 30;
 double y = 50;
@@ -116,7 +115,7 @@ typedef enum Helper {
 bool helper_on[Helper_NumElements] = {
     [Helper_anti_gravity_apex] = true,      [Helper_early_fall] = true,
     [Helper_jump_buffering] = false,        [Helper_sticky_feet] = false,
-    [Helper_speedy_apex] = false,           [Helper_coyote_jump] = true,
+    [Helper_speedy_apex] = true,           [Helper_coyote_jump] = true,
     [Helper_clamp_fall_speed] = true,       [Helper_catch_missed_jump] = false,
     [Helper_bumped_head_on_corner] = false,
 };
@@ -131,9 +130,9 @@ extern Texture2D texall;
 extern bool level_is_set(int x, int y, int layer);
 extern bool level_is_set(int x, int y, int layer);
 
-#define COLL_L (-7)
+#define COLL_L (-9)
 #define COLL_T (-32)
-#define COLL_R (11)
+#define COLL_R (9)
 #define COLL_B (0)
 
 bool place_free(double x, double y) {
@@ -266,7 +265,14 @@ static void update_particles(void) {
   }
 }
 
-void do_player_movement(void) {
+static void update_camera(Camera2D* cam) {
+  //QQ(cam->offset.x);
+  //QQ(cam->offset.y);
+  //cam->offset.x = (SCREEN_WIDTH/2/cam->zoom - x)*cam->zoom;
+  //cam->offset.y = (SCREEN_HEIGHT/2/cam->zoom - y)*cam->zoom;
+}
+
+void do_player_movement(Camera2D* cam) {
   bool want_left = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_LEFT) ||
                    GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X) < -0.5f;
   bool want_right = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT) ||
@@ -299,11 +305,6 @@ void do_player_movement(void) {
   if (IsKeyPressed(KEY_F5)) {
     bounding_boxes = !bounding_boxes;
   }
-
-  walk_acceleration = .3;
-  walk_deceleration = .3;
-  clamp_walk = 1.3;
-  clamp_fall_speed = 6;
 
   if (want_left || want_right) {  // they are moving left / right
     current_h_speed += (want_right - want_left) * (walk_acceleration * DT);
@@ -345,7 +346,7 @@ void do_player_movement(void) {
   if (grounded == true) {
     can_jump = true;
   }
-  if (helper_on[Helper_coyote_jump] && grounded_frames_ago < 8 &&
+  if (helper_on[Helper_coyote_jump] && grounded_frames_ago < 4 &&
       grounded == false && helper_on[Helper_coyote_jump]) {
     can_jump = true;
   }
@@ -361,6 +362,7 @@ void do_player_movement(void) {
   }
 
   // DO THE JUMP
+  bool coyote_used = false;
   if (use_jump && can_jump) {
     current_v_speed = -(jump_height);
     touched_ground_since_last_jump = false;
@@ -368,6 +370,7 @@ void do_player_movement(void) {
 
     if (grounded == false) {
       // coyote_jump was used
+      coyote_used = true;
     }
   }
 
@@ -612,6 +615,9 @@ void do_player_movement(void) {
   if (at_apex) {
     record_line_colour[record_frame] = BLUE;
   }
+  if (coyote_used) {
+    record_line_colour[record_frame] = GREEN;
+  }
   if (current_v_speed >= clamp_fall_speed - 0.5) {
     record_line_colour[record_frame] = RED;
   }
@@ -701,9 +707,16 @@ void do_player_movement(void) {
     // DrawCircle((int)x+1, (int)y-22, 10, Fade(RED, .4f));
     DrawRectangleLines((int)x + COLL_L, (int)y + COLL_T, COLL_R - COLL_L,
                        COLL_B - COLL_T, Fade(BLUE, .4f));
-    DrawText(cur_anim->name, (int)x + COLL_L, (int)y + COLL_T - 10, 10,
-             Fade(BLUE, .4f));
+
+    for (int i = 0; i < RECORD_COUNT; ++i) {
+      int j = (i + 1) % RECORD_COUNT;
+      if (i == record_frame) continue;
+      DrawLine(record_line_x[i], record_line_y[i], record_line_x[j],
+               record_line_y[j], record_line_colour[i]);
+    }
   }
 
   update_particles();
+
+  update_camera(cam);
 }

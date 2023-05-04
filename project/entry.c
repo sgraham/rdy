@@ -87,10 +87,31 @@ typedef struct Rule {
   char pattern[10];
   int tx;
   int ty;
+  float inv_prob;
   bool fixed;
 } Rule;
 
 static const Rule rules[] = {
+    {
+        // grass
+        .pattern = "..."
+                   ".x."
+                   ".0.",
+        .tx = 4,
+        .ty = 6,
+        .inv_prob = .9,
+        .fixed = true,
+    },
+    {
+        // grass
+        .pattern = "..."
+                   ".x."
+                   ".0.",
+        .tx = 5,
+        .ty = 6,
+        .inv_prob = .9,
+        .fixed = true,
+    },
     {
         // island
         .pattern = ".x."
@@ -245,15 +266,8 @@ int rule_tile_x = 20;
 int rule_tile_y = 0;
 
 static bool find_tile_by_rule(int x, int y, Rectangle* rect) {
-  if (!level_is_set(x, y, 0))
-    return false;  // Not strictly correct, but true for
-                   // all our rules right now.
-
   for (size_t i = 0; i < sizeof(rules) / sizeof(rules[0]); ++i) {
     Rule* rule = &rules[i];
-    // todo; multiple layers (and early out above)
-    if (rule->pattern[4] != '0')
-      Log("%s", "EXPECTING MIDDLE 0");
 
     // skip if looking at left column while at left edge of map
     if ((rule->pattern[0] != '.' || rule->pattern[3] != '.' ||
@@ -291,6 +305,8 @@ static bool find_tile_by_rule(int x, int y, Rectangle* rect) {
     if (rule->pattern[2] == '0' && !level_is_set(x + 1, y - 1, 0)) continue;
     if (rule->pattern[3] == 'x' && level_is_set(x - 1, y, 0)) continue;
     if (rule->pattern[3] == '0' && !level_is_set(x - 1, y, 0)) continue;
+    if (rule->pattern[4] == 'x' && level_is_set(x, y, 0)) continue;
+    if (rule->pattern[4] == '0' && !level_is_set(x, y, 0)) continue;
     if (rule->pattern[5] == 'x' && level_is_set(x + 1, y, 0)) continue;
     if (rule->pattern[5] == '0' && !level_is_set(x + 1, y, 0)) continue;
     if (rule->pattern[6] == 'x' && level_is_set(x - 1, y + 1, 0)) continue;
@@ -300,19 +316,28 @@ static bool find_tile_by_rule(int x, int y, Rectangle* rect) {
     if (rule->pattern[8] == 'x' && level_is_set(x + 1, y + 1, 0)) continue;
     if (rule->pattern[8] == '0' && !level_is_set(x + 1, y + 1, 0)) continue;
 
-    if (rule->fixed) {
-      rect->x = rule->tx * GRID;
-      rect->y = rule->ty * GRID;
-    } else {
-      rect->x = (rule->tx + rule_tile_x) * GRID;
-      rect->y = (rule->ty + rule_tile_y) * GRID;
+    bool match = true;
+    if (rule->inv_prob != 0) {
+      if (GetRandomValue(0, 100) / 100.0 < (rule->inv_prob)) {
+        match = false;
+      }
     }
-    return true;
+    if (match) {
+      if (rule->fixed) {
+        rect->x = rule->tx * GRID;
+        rect->y = rule->ty * GRID;
+      } else {
+        rect->x = (rule->tx + rule_tile_x) * GRID;
+        rect->y = (rule->ty + rule_tile_y) * GRID;
+      }
+      return true;
+    }
   }
   return false;
 }
 
 static void draw_world(void) {
+  SetRandomSeed(0x12345);
   Rectangle texcoords = {0, 0, GRID, GRID};
   for (int y = 0; y < SCREEN_HEIGHT; y += GRID) {
     for (int x = 0; x < SCREEN_WIDTH; x += GRID) {

@@ -1,6 +1,6 @@
 //
 // Amalgamated (single file) build of https://github.com/sgraham/dyibicc.
-// Revision: 21dbc7d2225dcb583a0e8e38e0e184072fe751d4
+// Revision: 503358cde06ee9dc61a7d32c0fb5dbc40f72d7fb
 //
 // This file should not be edited or modified, patches should be to the
 // non-amalgamated files in src/. The user-facing API is in libdyibicc.h
@@ -6161,7 +6161,7 @@ static Node* new_sub(Node* lhs, Node* rhs, Token* tok) {
     return new_binary(ND_SUB, lhs, rhs, tok);
 
   // VLA + num
-  if (lhs->ty->base->kind == TY_VLA) {
+  if (lhs->ty->base && lhs->ty->base->kind == TY_VLA) {
     rhs = new_binary(ND_MUL, rhs, new_var_node(lhs->ty->base->vla_size, tok), tok);
     add_type(rhs);
     Node* node = new_binary(ND_SUB, lhs, rhs, tok);

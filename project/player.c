@@ -84,8 +84,7 @@ double current_v_speed;
 double x = 30;
 double y = 50;
 
-float screen_target_x;
-bool changing_screens;
+Vector2 camera_target;
 
 #define MAX_PARTICLES 300
 typedef struct Particle {
@@ -316,14 +315,24 @@ static void new_interpf(float* start_and_into,
   interp->on_complete = on_complete;
 }
 
+#if 0
 static void set_changing_screen_off(float* p) {
   changing_screens = false;
 }
+#endif
 
 double SineEaseInOut(double);
 double QuadraticEaseOut(double);
 double BounceEaseOut(double);
 
+static void update_camera(Camera2D* cam) {
+  camera_target.x = fminf(0, -x * cam->zoom + SCREEN_WIDTH/2);
+  camera_target.y = fminf(0, -y * cam->zoom + SCREEN_HEIGHT/2);
+  cam->offset.x = Lerp(cam->offset.x, camera_target.x, .05f);
+  cam->offset.y = Lerp(cam->offset.y, camera_target.y, .05f);
+}
+
+#if 0
 static void update_camera(Camera2D* cam) {
 #define AT_EDGE (2*GRID)
 #define PAST_EDGE (6*GRID)
@@ -350,6 +359,8 @@ static void update_camera(Camera2D* cam) {
   }
   if (y + cam->offset.y/cam->zoom + COLL_T < AT_EDGE) {
     float target = fminf(0, cam->offset.y + (ZOOM_HEIGHT - PAST_EDGE) * cam->zoom);
+    QQ(target);
+    QQ(cam->offset.y);
     if (!FloatEquals(target, cam->offset.y)) {
       changing_screens = true;
       new_interpf(&cam->offset.y, target, 30, SineEaseInOut,
@@ -357,9 +368,11 @@ static void update_camera(Camera2D* cam) {
     }
   }
 }
+#endif
 
 static void update_interps(void) {
   for (int i = 0; i < MAX_INTERPS; ++i) {
+    QQ(i);
     Interp* interp = &interps[i];
     if (!interp->into)
       continue;
@@ -377,9 +390,11 @@ static void update_interps(void) {
 void do_player_movement(Camera2D* cam) {
   update_interps();
 
+#if 0
   if (changing_screens) {
     goto draw_only;
   }
+#endif
 
   bool want_left = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_LEFT) ||
                    GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X) < -0.5f;
@@ -410,6 +425,7 @@ void do_player_movement(Camera2D* cam) {
     current_v_speed = 0;
     cam->offset.x = 0;
     cam->offset.y = 0;
+    camera_target = (Vector2){0,0};
   }
 
   if (IsKeyPressed(KEY_F5)) {
@@ -813,12 +829,6 @@ draw_only:
                    (Vector2){(int)x - 16, (int)y - 32}, WHITE);
   }
   if (bounding_boxes) {
-    Rectangle copy = cur_anim->rects[(int)frame_counter];
-    copy.x = (int)x - 16;
-    copy.y = (int)y - 32;
-    // DrawRectangleRec(copy, Fade(RED, .4f));
-    // DrawCircle((int)x+1, (int)y-10, 10, Fade(RED, .4f));
-    // DrawCircle((int)x+1, (int)y-22, 10, Fade(RED, .4f));
     DrawRectangleLines((int)x + COLL_L, (int)y + COLL_T, COLL_R - COLL_L,
                        COLL_B - COLL_T, Fade(BLUE, .4f));
 

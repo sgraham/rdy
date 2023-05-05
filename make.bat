@@ -1,6 +1,6 @@
 @echo off
 
-set CFLAGS=/nologo /c /Ox /GL /Zi /MT /Ilibdyibicc/include/all /D_CRT_SECURE_NO_DEPRECATE /DPLATFORM_DESKTOP /DMPACK_EXTENSIONS=1
+set CFLAGS=/nologo /c /Od /GL /Zi /MT /Ilibdyibicc/include/all /D_CRT_SECURE_NO_DEPRECATE /DPLATFORM_DESKTOP /DMPACK_EXTENSIONS=1
 :: /fsanitize=address
 :: /DMPACK_DEBUG=1
 

@@ -1,6 +1,6 @@
 //
 // Amalgamated (single file) build of https://github.com/sgraham/dyibicc.
-// Revision: 503358cde06ee9dc61a7d32c0fb5dbc40f72d7fb
+// Revision: 6088b4979e09d74174d3bd8c972957f585c0136c
 //
 // This file should not be edited or modified, patches should be to the
 // non-amalgamated files in src/. The user-facing API is in libdyibicc.h
@@ -6137,14 +6137,18 @@ static Node* new_add(Node* lhs, Node* rhs, Token* tok) {
   }
 
   // VLA + num
-  if (lhs->ty->base->kind == TY_VLA) {
+  if (lhs->ty->base && lhs->ty->base->kind == TY_VLA) {
     rhs = new_binary(ND_MUL, rhs, new_var_node(lhs->ty->base->vla_size, tok), tok);
     return new_binary(ND_ADD, lhs, rhs, tok);
   }
 
   // ptr + num
-  rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
-  return new_binary(ND_ADD, lhs, rhs, tok);
+  if (lhs->ty->base && is_integer(rhs->ty)) {
+    rhs = new_binary(ND_MUL, rhs, new_long(lhs->ty->base->size, tok), tok);
+    return new_binary(ND_ADD, lhs, rhs, tok);
+  }
+
+  error_tok(tok, "invalid operands");
 }
 
 // Like `+`, `-` is overloaded for the pointer type.

@@ -397,6 +397,7 @@ static void update(void) {
 
   if (IsKeyPressed(KEY_SPACE)) {
     edit_mode = !edit_mode;
+    // separate camera?
   }
 
   if (IsKeyPressed('D')) {
@@ -419,23 +420,6 @@ static void update(void) {
     draw_world();
   }
 
-  if (IsKeyDown(KEY_LEFT)) {
-    cam.offset.x += GRID;
-  }
-  if (IsKeyDown(KEY_RIGHT)) {
-    cam.offset.x -= GRID;
-  }
-  if (IsKeyDown(KEY_UP)) {
-    cam.offset.y += GRID;
-  }
-  if (IsKeyDown(KEY_DOWN)) {
-    cam.offset.y -= GRID;
-  }
-  if (cam.offset.x > 0)
-    cam.offset.x = 0;
-  if (cam.offset.y > 0)
-    cam.offset.y = 0;
-
   if (IsKeyDown(KEY_F1)) {
     DrawTexture(texall, 0, 0, WHITE);
   }
@@ -452,11 +436,11 @@ static void update(void) {
       clear_level_at(x_tile, y_tile, current_layer);
     }
 
-    for (int x = 0; x < SCREEN_WIDTH; x += GRID) {
-      DrawLine(x, 0, x, SCREEN_HEIGHT, GREEN);
+    for (int x = 0; x < MAX_LEVEL_SIZE*GRID; x += GRID) {
+      DrawLine(x, 0, x, MAX_LEVEL_SIZE*GRID, GREEN);
     }
-    for (int y = 0; y < SCREEN_HEIGHT; y += GRID) {
-      DrawLine(0, y, SCREEN_WIDTH, y, GREEN);
+    for (int y = 0; y < MAX_LEVEL_SIZE*GRID; y += GRID) {
+      DrawLine(0, y, MAX_LEVEL_SIZE*GRID, y, GREEN);
     }
 
     DrawRectangle(x_tile * GRID, y_tile * GRID, GRID, GRID, Fade(GREEN, .25f));

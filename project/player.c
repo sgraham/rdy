@@ -20,8 +20,10 @@ typedef struct Animation {
 #define PW 32
 #define PH 32
 #define GRID 18
-#define SCREEN_WIDTH 1920
+#define SCREEN_WIDTH 1872
 #define SCREEN_HEIGHT 1080
+#define ZOOM_WIDTH (SCREEN_WIDTH/4)
+#define ZOOM_HEIGHT (SCREEN_HEIGHT/4)
 
 Rectangle anim_idle_rects[] = {{176, 162, PW, PH}, {176, 194, PW, PH},
                                {176, 226, PW, PH}, {176, 258, PW, PH},
@@ -82,6 +84,9 @@ double current_v_speed;
 double x = 30;
 double y = 50;
 
+float screen_target_x;
+bool changing_screens;
+
 #define MAX_PARTICLES 300
 typedef struct Particle {
   Rectangle* src_tex_rect;
@@ -91,6 +96,18 @@ typedef struct Particle {
   int frames_until_death;
 } Particle;
 Particle particles[MAX_PARTICLES];
+
+typedef struct Interp {
+  float* into;
+  float start;
+  float end;
+  int cur_tick;
+  int total_ticks;
+  double (*func)(double);
+  void (*on_complete)(float*);
+} Interp;
+#define MAX_INTERPS 16
+static Interp interps[MAX_INTERPS];
 
 int record_frame;
 #define RECORD_COUNT 150
@@ -130,9 +147,9 @@ extern Texture2D texall;
 extern bool level_is_set(int x, int y, int layer);
 extern bool level_is_set(int x, int y, int layer);
 
-#define COLL_L (-9)
+#define COLL_L (-7)
 #define COLL_T (-32)
-#define COLL_R (9)
+#define COLL_R (7)
 #define COLL_B (0)
 
 bool place_free(double x, double y) {
@@ -259,20 +276,111 @@ static void update_particles(void) {
       p->position.y += p->velocity.y;
       p->velocity.x += p->gravity.x;
       p->velocity.y += p->gravity.y;
+    }
+  }
+}
 
+static void draw_particles(void) {
+  for (size_t i = 0; i < MAX_PARTICLES; ++i) {
+    Particle*p = &particles[i];
+    if (p->src_tex_rect) {
       DrawTextureRec(texall, *p->src_tex_rect, p->position, WHITE);
     }
   }
 }
 
+static Interp* find_interp_slot(void) {
+  for (int i = 0; i < MAX_INTERPS; ++i) {
+    Interp* interp = &interps[i];
+    if (!interp->into) {
+      return interp;
+    }
+  }
+  return NULL;
+}
+
+static void new_interpf(float* start_and_into,
+                       float target,
+                       int ticks,
+                       double (*func)(double),
+                       void (*on_complete)(float*)) {
+  Interp* interp = find_interp_slot();
+  if (!interp)
+    return;
+  interp->into = start_and_into;
+  interp->start = *start_and_into;
+  interp->end = target;
+  interp->cur_tick = 0;
+  interp->total_ticks = ticks;
+  interp->func = func;
+  interp->on_complete = on_complete;
+}
+
+static void set_changing_screen_off(float* p) {
+  changing_screens = false;
+}
+
+double SineEaseInOut(double);
+double QuadraticEaseOut(double);
+double BounceEaseOut(double);
+
 static void update_camera(Camera2D* cam) {
-  //QQ(cam->offset.x);
-  //QQ(cam->offset.y);
-  //cam->offset.x = (SCREEN_WIDTH/2/cam->zoom - x)*cam->zoom;
-  //cam->offset.y = (SCREEN_HEIGHT/2/cam->zoom - y)*cam->zoom;
+#define AT_EDGE (2*GRID)
+#define PAST_EDGE (6*GRID)
+  if (x + cam->offset.x/cam->zoom + COLL_R > ZOOM_WIDTH - AT_EDGE) {
+    // Entering last grid on RHS
+    changing_screens = true;
+    new_interpf(&cam->offset.x,
+               cam->offset.x - (ZOOM_WIDTH - PAST_EDGE) * cam->zoom, 40,
+               SineEaseInOut, set_changing_screen_off);
+  }
+  if (x + cam->offset.x/cam->zoom + COLL_L < AT_EDGE) {
+    float target = fminf(0, cam->offset.x + (ZOOM_WIDTH - PAST_EDGE) * cam->zoom);
+    if (!FloatEquals(target, cam->offset.x)) {
+      changing_screens = true;
+      new_interpf(&cam->offset.x, target, 40, SineEaseInOut,
+                  set_changing_screen_off);
+    }
+  }
+  if (y + cam->offset.y/cam->zoom + COLL_B > ZOOM_HEIGHT - AT_EDGE) {
+    changing_screens = true;
+    new_interpf(&cam->offset.y,
+                cam->offset.y - (ZOOM_HEIGHT - PAST_EDGE) * cam->zoom, 30,
+                SineEaseInOut, set_changing_screen_off);
+  }
+  if (y + cam->offset.y/cam->zoom + COLL_T < AT_EDGE) {
+    float target = fminf(0, cam->offset.y + (ZOOM_HEIGHT - PAST_EDGE) * cam->zoom);
+    if (!FloatEquals(target, cam->offset.y)) {
+      changing_screens = true;
+      new_interpf(&cam->offset.y, target, 30, SineEaseInOut,
+                  set_changing_screen_off);
+    }
+  }
+}
+
+static void update_interps(void) {
+  for (int i = 0; i < MAX_INTERPS; ++i) {
+    Interp* interp = &interps[i];
+    if (!interp->into)
+      continue;
+    *interp->into =
+        Lerp(interp->start, interp->end,
+             interp->func((float)++interp->cur_tick / interp->total_ticks));
+    QQ(*interp->into);
+    if (interp->cur_tick == interp->total_ticks) {
+      interp->on_complete(interp->into);
+      interp->into = NULL;
+    }
+  }
 }
 
 void do_player_movement(Camera2D* cam) {
+  update_interps();
+
+  if (changing_screens) {
+    goto draw_only;
+  }
+
   bool want_left = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_LEFT) ||
                    GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X) < -0.5f;
   bool want_right = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT) ||
@@ -300,6 +408,8 @@ void do_player_movement(Camera2D* cam) {
     y = 50;
     current_h_speed = 0;
     current_v_speed = 0;
+    cam->offset.x = 0;
+    cam->offset.y = 0;
   }
 
   if (IsKeyPressed(KEY_F5)) {
@@ -688,8 +798,12 @@ void do_player_movement(Camera2D* cam) {
     }
   }
 
+  update_particles();
+
   while (frame_counter >= cur_anim->num_frames)
     frame_counter -= cur_anim->num_frames;
+
+draw_only:
   if (h_flip_render) {
     Rectangle copy = cur_anim->rects[(int)frame_counter];
     copy.width = -copy.width;
@@ -716,7 +830,7 @@ void do_player_movement(Camera2D* cam) {
     }
   }
 
-  update_particles();
+  draw_particles();
 
   update_camera(cam);
 }

@@ -26,6 +26,12 @@ static bool is_fullscreen;
 Camera2D cam = {0};  //(Vector2){0,0}, (Vector2){0,0}, 0.f, 1.f };
 Texture2D texall;
 bool edit_mode;
+char* level_names[] = {
+  "proto.level",
+  "fraser.level",
+};
+int cur_level = 0;
+char* level_name = "proto.level";
 
 #define MAX_LEVEL_SIZE 4096
 unsigned char raw_level_data[MAX_LEVEL_SIZE * MAX_LEVEL_SIZE];
@@ -50,12 +56,8 @@ static void clear_level_at(int x, int y, int layer) {
   raw_level_data[y * MAX_LEVEL_SIZE + x] &= (unsigned char)(~(1 << layer));
 }
 
-static void init(void) {
-  SetWindowPosition(10, 50);
-  cam.zoom = 4.f;
-  texall = LoadTexture("project/assets/all.dds");
-
-  FILE* f = fopen("level0.dat", "rb");
+static void load_level(void) {
+  FILE* f = fopen(level_name, "rb");
   if (f) {
     fread(raw_level_data, sizeof(raw_level_data), 1, f);
     fclose(f);
@@ -66,6 +68,21 @@ static void init(void) {
     set_level_at(0, i, 0);
     set_level_at(MAX_LEVEL_SIZE - 1, i, 0);
   }
+}
+
+static void save_level(void) {
+  FILE* f = fopen(level_name, "wb");
+  fwrite(raw_level_data, sizeof(raw_level_data), 1, f);
+  fclose(f);
+  DrawText("SAVED!", 10, 10, 40, WHITE);
+}
+
+static void init(void) {
+  SetWindowPosition(10, 50);
+  cam.zoom = 4.f;
+  texall = LoadTexture("project/assets/all.dds");
+
+  load_level();
 }
 
 static void toggle_fullscreen(void) {
@@ -358,13 +375,6 @@ static void draw_world_raw(void) {
   }
 }
 
-static void save_level(char* fn) {
-  FILE* f = fopen("level0.dat", "wb");
-  fwrite(raw_level_data, sizeof(raw_level_data), 1, f);
-  fclose(f);
-  DrawText("SAVED!", 10, 10, 40, WHITE);
-}
-
 static void update(void) {
   if (IsKeyPressed(KEY_F11)) {
     toggle_fullscreen();
@@ -457,13 +467,28 @@ static void update(void) {
   }
 
   if (IsKeyPressed(KEY_ENTER)) {
-    save_level("level0.dat");
+    save_level();
+  }
+  if (IsKeyPressed(KEY_PAGE_UP)) {
+    cur_level--;
+    if (cur_level < 0)
+      cur_level = sizeof(level_names) / sizeof(level_names[0]) - 1;
+    level_name = level_names[cur_level];
+    load_level();
+  }
+  if (IsKeyPressed(KEY_PAGE_DOWN)) {
+    cur_level++;
+    if (cur_level >= sizeof(level_names) / sizeof(level_names[0]))
+      cur_level = 0;
+    level_name = level_names[cur_level];
+    load_level();
   }
 
   do_player_movement(&cam);
 
   EndMode2D();
 
+  DrawText(TextFormat("Level: %s", level_name), 4, 1040, 20, WHITE);
   DrawFPS(4, 1060);
 }
 

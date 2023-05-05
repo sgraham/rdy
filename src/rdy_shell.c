@@ -2,9 +2,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <reflect.h>
+#include <math.h>
 
 #include "libdyibicc.h"
 #include "raylib.h"
+
+#include "easing.c"
 
 static DyibiccContext* cc_ctx;
 static bool last_compile_successful;
@@ -127,7 +130,42 @@ static void* provide_function(const char* name) {
     return (void*)n;
   X(Log);
   X(qq_eval);
+  X(fmaxf);
+  X(fminf);
 
+  // easing.c
+  X(LinearInterpolation);
+  X(QuadraticEaseIn);
+  X(QuadraticEaseOut);
+  X(QuadraticEaseInOut);
+  X(CubicEaseIn);
+  X(CubicEaseOut);
+  X(CubicEaseInOut);
+  X(QuarticEaseIn);
+  X(QuarticEaseOut);
+  X(QuarticEaseInOut);
+  X(QuinticEaseIn);
+  X(QuinticEaseOut);
+  X(QuinticEaseInOut);
+  X(SineEaseIn);
+  X(SineEaseInOut);
+  X(CircularEaseIn);
+  X(CircularEaseOut);
+  X(CircularEaseInOut);
+  X(ExponentialEaseIn);
+  X(ExponentialEaseOut);
+  X(ExponentialEaseInOut);
+  X(ElasticEaseIn);
+  X(ElasticEaseOut);
+  X(ElasticEaseInOut);
+  X(BackEaseIn);
+  X(BackEaseOut);
+  X(BackEaseInOut);
+  X(BounceEaseIn);
+  X(BounceEaseOut);
+  X(BounceEaseInOut);
+
+  // raylib
   X(InitWindow);
   X(WindowShouldClose);
   X(CloseWindow);
@@ -739,7 +777,7 @@ int main(void) {
 
   SetConfigFlags(FLAG_VSYNC_HINT);
   InitWindow(1920, 1080, "Rdy");
-  RenderTexture2D target = LoadRenderTexture(1920, 1080);
+  RenderTexture2D target = LoadRenderTexture(1872, 1080);
 
   SetTargetFPS(60);
 
@@ -815,9 +853,12 @@ int main(void) {
     EndTextureMode();
 
     BeginDrawing();
+    ClearBackground(DARKGRAY);
     Rectangle source_rect = {0.0f, 0.0f, (float)target.texture.width,
                              -(float)target.texture.height};
-    Rectangle dest_rect = {0, 0, (float)GetRenderWidth(), (float)GetRenderHeight()};
+    int side_edges = (1920-1872)/2;
+    Rectangle dest_rect = {(float)(side_edges / 2), 0, (float)(GetRenderWidth() - side_edges),
+                           (float)GetRenderHeight()};
     DrawTexturePro(target.texture, source_rect, dest_rect, (Vector2){0,0}, 0.0f, WHITE);
     EndDrawing();
   }

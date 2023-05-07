@@ -19,13 +19,14 @@ void qq_eval(const char* file, int line, int num_args, ...);
 
 void Log(const char* fmt, ...);
 
-void do_player_movement(Camera2D* cam);
+void do_game_obj_update(Camera2D* cam);
 
 static bool is_fullscreen;
 
 Camera2D cam = {0};  //(Vector2){0,0}, (Vector2){0,0}, 0.f, 1.f };
 Texture2D texall;
 bool edit_mode;
+int edit_insert_type;
 char* level_names[] = {
   "proto.level",
   "fraser.level",
@@ -33,8 +34,24 @@ char* level_names[] = {
 int cur_level = 0;
 char* level_name = "proto.level";
 
+void destroy_all_game_objects(void);
+void create_game_object(unsigned int x, unsigned int y, unsigned int obj_type);
+
 #define MAX_LEVEL_SIZE 4096
 unsigned char raw_level_data[MAX_LEVEL_SIZE * MAX_LEVEL_SIZE];
+#define MAX_NUM_OBJECTS 512
+typedef struct ObjectLocation {
+  unsigned int x:12;
+  unsigned int y:12;
+  unsigned int obj_type:8;
+} ObjectLocation;
+extern unsigned char ObjectLocation_is_wrong_size[sizeof(ObjectLocation) == 4 ? 1 : -1];
+ObjectLocation raw_objects_data[MAX_NUM_OBJECTS];
+
+Rectangle item_proto_rect[] = {
+  {0,0,0,0},
+  {35,427,11,11},
+};
 
 static unsigned char get_level_at(int x, int y) {
   return raw_level_data[y * MAX_LEVEL_SIZE + x];
@@ -56,10 +73,31 @@ static void clear_level_at(int x, int y, int layer) {
   raw_level_data[y * MAX_LEVEL_SIZE + x] &= (unsigned char)(~(1 << layer));
 }
 
+static void refresh_objects(void) {
+  destroy_all_game_objects();
+  for (int i = 0; i < MAX_NUM_OBJECTS; ++i) {
+    ObjectLocation* ol = &raw_objects_data[i];
+    if (ol->obj_type != 0) {
+      create_game_object(ol->x, ol->y, ol->obj_type);
+      Log("created %d %d %d\n", ol->x, ol->y, ol->obj_type);
+    }
+  }
+}
+
+static ObjectLocation* find_raw_objects_slot(void) {
+  for (int i = 0; i < MAX_NUM_OBJECTS; ++i) {
+    if (raw_objects_data[i].obj_type == 0) {
+      return &raw_objects_data[i];
+    }
+  }
+  return NULL;
+}
+
 static void load_level(void) {
   FILE* f = fopen(level_name, "rb");
   if (f) {
     fread(raw_level_data, sizeof(raw_level_data), 1, f);
+    fread(raw_objects_data, sizeof(raw_objects_data), 1, f);
     fclose(f);
   }
   for (int i = 0; i < MAX_LEVEL_SIZE; ++i) {
@@ -68,11 +106,13 @@ static void load_level(void) {
     set_level_at(0, i, 0);
     set_level_at(MAX_LEVEL_SIZE - 1, i, 0);
   }
+  refresh_objects();
 }
 
 static void save_level(void) {
   FILE* f = fopen(level_name, "wb");
   fwrite(raw_level_data, sizeof(raw_level_data), 1, f);
+  fwrite(raw_objects_data, sizeof(raw_objects_data), 1, f);
   fclose(f);
   DrawText("SAVED!", 10, 10, 40, WHITE);
 }
@@ -397,6 +437,12 @@ static void update(void) {
 
   if (IsKeyPressed(KEY_SPACE)) {
     edit_mode = !edit_mode;
+    if (edit_mode) {
+      edit_insert_type = 0;
+      destroy_all_game_objects();
+    } else {
+      refresh_objects();
+    }
     // separate camera?
   }
 
@@ -412,6 +458,10 @@ static void update(void) {
   } else if (IsKeyPressed('G')) {
     rule_tile_x = 0;
     rule_tile_y = 0;
+  } else if (IsKeyPressed('0')) {
+    edit_insert_type = 0;
+  } else if (IsKeyPressed('1')) {
+    edit_insert_type = 1;
   }
 
   if (IsKeyDown(KEY_LEFT_SHIFT)) {
@@ -428,12 +478,43 @@ static void update(void) {
     cam.zoom += GetMouseWheelMove();
     cam.zoom = Clamp(cam.zoom, 1, 10);
 
-    static int current_layer = 0;
+    for (int i =0 ; i <MAX_NUM_OBJECTS; ++i) {
+      ObjectLocation* ol = &raw_objects_data[i];
+      if (ol->obj_type) {
+        DrawTexturePro(texall, item_proto_rect[ol->obj_type],
+                       (Rectangle){ol->x * GRID, ol->y * GRID, GRID, GRID},
+                       (Vector2){0, 0}, 0.f, Fade(GREEN, .25f));
+      }
+    }
 
-    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-      set_level_at(x_tile, y_tile, current_layer);
-    } else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-      clear_level_at(x_tile, y_tile, current_layer);
+    if (edit_insert_type == 0) {
+      DrawRectangle(x_tile * GRID, y_tile * GRID, GRID, GRID,
+                    Fade(GREEN, .25f));
+      if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        set_level_at(x_tile, y_tile, 0);
+      } else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+        clear_level_at(x_tile, y_tile, 0);
+      }
+    } else {
+      DrawTexturePro(texall, item_proto_rect[edit_insert_type],
+                     (Rectangle){x_tile * GRID, y_tile * GRID, GRID, GRID},
+                     (Vector2){0, 0}, 0.f, GREEN);
+      if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        ObjectLocation* ol = find_raw_objects_slot();
+        if (ol) {
+          ol->x = x_tile;
+          ol->y = y_tile;
+          ol->obj_type = edit_insert_type;
+        }
+      } else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+        for (int i = 0; i <MAX_NUM_OBJECTS; ++i) {
+          if (raw_objects_data[i].x == x_tile &&
+              raw_objects_data[i].y == y_tile) {
+            raw_objects_data[i].obj_type = 0;
+            // no break.
+          }
+        }
+      }
     }
 
     for (int x = 0; x < MAX_LEVEL_SIZE*GRID; x += GRID) {
@@ -443,7 +524,6 @@ static void update(void) {
       DrawLine(0, y, MAX_LEVEL_SIZE*GRID, y, GREEN);
     }
 
-    DrawRectangle(x_tile * GRID, y_tile * GRID, GRID, GRID, Fade(GREEN, .25f));
     DrawText(TextFormat("%d,%d", x_tile, y_tile), x_tile * GRID + GRID,
              y_tile * GRID + GRID, 12, GREEN);
   } else {
@@ -468,7 +548,7 @@ static void update(void) {
     load_level();
   }
 
-  do_player_movement(&cam);
+  do_game_obj_update(&cam);
 
   EndMode2D();
 

@@ -8,6 +8,7 @@ void qq_eval(const char* file, int line, int num_args, ...);
 #define QQ(expr) ((void)expr)
 #endif
 
+#include <assert.h>
 #include <math.h>
 #include "raylib.h"
 #include "raymath.h"
@@ -45,6 +46,38 @@ Rectangle anim_jump_rects[] = {
 Animation anim_jump = {1, &anim_jump_rects};
 
 Rectangle egg_rect = {360, 288, 9, 11};
+
+#define CHICKW 12
+#define CHICKH 12
+Rectangle chick_idle_rects[] = {
+    {36, 426, CHICKW, CHICKH},
+    {48, 426, CHICKW, CHICKH},
+    {60, 426, CHICKW, CHICKH},
+    {60, 426, CHICKW, CHICKH},
+    {60, 426, CHICKW, CHICKH},
+    {60, 426, CHICKW, CHICKH},
+    {60, 426, CHICKW, CHICKH},
+    {60, 426, CHICKW, CHICKH},
+    {60, 426, CHICKW, CHICKH},
+    {60, 426, CHICKW, CHICKH},
+    {60, 426, CHICKW, CHICKH},
+    {48, 426, CHICKW, CHICKH},
+    {36, 426, CHICKW, CHICKH},
+};
+
+Animation anim_chick_idle = {13, &chick_idle_rects};
+
+Rectangle chick_walk_rects[] = {
+    {0, 414, CHICKW, CHICKH},
+    {12, 414, CHICKW, CHICKH},
+    {24, 414, CHICKW, CHICKH},
+    {36, 414, CHICKW, CHICKH},
+    {48, 414, CHICKW, CHICKH},
+    {60, 414, CHICKW, CHICKH},
+    {72, 414, CHICKW, CHICKH},
+};
+Animation anim_chick_walk = {7, &chick_walk_rects};
+
 
 double clamp_walk = 1.3;  // maximum walking speed
 double clamp_fall_speed = 5;
@@ -140,119 +173,80 @@ double DT = 1.0;
 
 bool bounding_boxes;
 
-Animation* cur_anim = &anim_idle;
+int num_followers = 0;
 
 extern Texture2D texall;
 extern bool level_is_set(int x, int y, int layer);
 extern bool level_is_set(int x, int y, int layer);
+
+typedef struct GameObj GameObj;
+struct GameObj {
+  int x;
+  int y;
+  bool h_flip;
+  bool v_flip;
+  Animation* anim;
+  double anim_frame;
+  Rectangle bbox;
+  void (*update)(GameObj* self);
+  void (*collided_player)(GameObj* self);
+  unsigned char extra[32];
+};
+
+typedef struct ChickExtra ChickExtra;
+struct ChickExtra {
+  int follower;
+};
+
+void player_update(GameObj* self);
+void chick_update(GameObj* self);
+void chick_collided_player(GameObj* self);
 
 #define COLL_L (-7)
 #define COLL_T (-32)
 #define COLL_R (7)
 #define COLL_B (0)
 
+GameObj game_objs[100] = {
+    {30, 50, false, false, &anim_idle, 0.0,
+     {COLL_L, COLL_T, COLL_R - COLL_L, COLL_B - COLL_T},
+     &player_update, NULL, {0}},
+};
+int num_game_objs;
+
+void destroy_all_game_objects(void) {
+  num_game_objs = 1;  // player is 0.
+  num_followers = 0;
+}
+
+void create_game_object(unsigned int x_, unsigned int y_, unsigned int obj_type) {
+  if (obj_type == 255) {
+    x = x_;
+    y = y_;
+  } else {
+    assert(num_game_objs < sizeof(game_objs)/sizeof(game_objs[0]));
+    GameObj* go = &game_objs[num_game_objs++];
+    go->x = x_*GRID + GRID/2;
+    go->y = y_*GRID + GRID;
+    go->h_flip = false;
+    go->v_flip = false;
+    if (obj_type == 1) {
+      go->anim = &anim_chick_idle;
+      go->anim_frame = GetRandomValue(0, anim_chick_idle.num_frames);
+      go->bbox = (Rectangle){-6, -12, 10, 12};
+      go->update = chick_update;
+      go->collided_player = chick_collided_player;
+      ChickExtra* extra = (ChickExtra*)&go->extra;
+      extra->follower = 0;
+    }
+  }
+}
+
 bool place_free(double x, double y) {
   int grid_x = x / GRID;
   int grid_y = y / GRID;
   return !level_is_set(grid_x, grid_y, 0);
 }
-
-#if 0
-#define MIN(x, y) ((x) < (y) ? (x) : (y))
-
-double ray_intersect_level(double origin_x,
-                           double origin_y,
-                           double dist_x,
-                           double dist_y) {
-  int grid_origin_x = origin_x / GRID;
-  int grid_origin_y = origin_y / GRID;
-  double end_x = origin_x + dist_x;
-  double end_y = origin_y + dist_y;
-  QQ(origin_x);
-  QQ(origin_y);
-  QQ(end_x);
-  QQ(end_y);
-  int grid_end_x = end_x / GRID;
-  int grid_end_y = end_y / GRID;
-  if (grid_origin_x == grid_end_x && grid_origin_y == grid_end_y) {
-    if (!level_is_set(grid_origin_x, grid_origin_y, 0))
-       return 1.0;
-  }
-  if (grid_origin_x == grid_end_x && grid_origin_y != grid_end_y) {
-    // vertical
-    double wall_y = grid_end_y * GRID;
-    if (dist_y < 0) wall_y -= GRID;
-    return wall_y / (end_y - origin_y);
-  } else if (grid_origin_y == grid_end_y && grid_origin_x != grid_end_x) {
-    // horizontal
-    double wall_x = grid_end_x * GRID;
-    if (dist_x < 0) wall_x -= GRID;
-    return wall_x / (end_x - origin_x);
-  } else {
-    //Log("%s", "unhandled intersect (%f %f)+(%f %f)", origin_x, origin_y, dist_x, dist_y);
-    return 0.0;
-  }
-}
-
-void move_contact_solid(double direction, double amount) {
-  QQ(amount);
-  if (direction == 270) {
-    // Check bottom left and bottom right of BB.
-    double fraction_left = ray_intersect_level(x + COLL_L, y + COLL_T, 0, amount);
-    double fraction_right =
-        ray_intersect_level(x + COLL_L, y + COLL_B, 0, amount);
-    y += amount * MIN(fraction_left, fraction_right);
-  } else if (direction == 0) {
-    // Check top and bottom right of BB.
-    double fraction_top =
-        ray_intersect_level(x + COLL_R, y + COLL_T, amount, 0);
-    double fraction_bottom =
-        ray_intersect_level(x + COLL_R, y + COLL_B, amount, 0);
-    x += amount * MIN(fraction_top, fraction_bottom);
-  } else if (direction == 180) {
-    // Check top and bottom left of BB.
-    double fraction_top =
-        ray_intersect_level(x + COLL_L, y + COLL_T, -amount, 0);
-    double fraction_bottom =
-        ray_intersect_level(x + COLL_L, y - 1 + COLL_B, -amount, 0);
-    x += -amount * MIN(fraction_top, fraction_bottom);
-  } else if (direction == 180) {
-    // Check top left and right of BB.
-    double fraction_left =
-        ray_intersect_level(x + COLL_L, y + COLL_T, 0, amount);
-    double fraction_right =
-        ray_intersect_level(x + COLL_R, y + COLL_T, 0, amount);
-    y += -amount * MIN(fraction_left, fraction_right);
-  }
-#if 0
-  QQ(direction);
-  QQ(amount);
-  double dx = 0;
-  double dy = 0;
-  if (direction == 0) {
-    dx = .01;
-  } else if (direction == 180) {
-    dx = -.01;
-  } else if (direction == 90) {
-    dy = -.01;
-  } else if (direction == 270) {
-    dy = .01;
-  }
-
-  QQ(dx);
-  QQ(dy);
-
-  while (amount > 0) {
-    if (!place_free(x+dx, y+dy)) return;
-    x += dx;
-    y += dy;
-    amount -= dx;
-    amount -= dy;
-  }
-#endif
-}
-
-#endif
 
 static Particle* find_particle_slot(void) {
   for (size_t i = 0; i < MAX_PARTICLES; ++i) {
@@ -315,12 +309,6 @@ static void new_interpf(float* start_and_into,
   interp->on_complete = on_complete;
 }
 
-#if 0
-static void set_changing_screen_off(float* p) {
-  changing_screens = false;
-}
-#endif
-
 double SineEaseInOut(double);
 double QuadraticEaseOut(double);
 double BounceEaseOut(double);
@@ -332,47 +320,8 @@ static void update_camera(Camera2D* cam) {
   cam->offset.y = Lerp(cam->offset.y, camera_target.y, .05f);
 }
 
-#if 0
-static void update_camera(Camera2D* cam) {
-#define AT_EDGE (2*GRID)
-#define PAST_EDGE (6*GRID)
-  if (x + cam->offset.x/cam->zoom + COLL_R > ZOOM_WIDTH - AT_EDGE) {
-    // Entering last grid on RHS
-    changing_screens = true;
-    new_interpf(&cam->offset.x,
-               cam->offset.x - (ZOOM_WIDTH - PAST_EDGE) * cam->zoom, 40,
-               SineEaseInOut, set_changing_screen_off);
-  }
-  if (x + cam->offset.x/cam->zoom + COLL_L < AT_EDGE) {
-    float target = fminf(0, cam->offset.x + (ZOOM_WIDTH - PAST_EDGE) * cam->zoom);
-    if (!FloatEquals(target, cam->offset.x)) {
-      changing_screens = true;
-      new_interpf(&cam->offset.x, target, 40, SineEaseInOut,
-                  set_changing_screen_off);
-    }
-  }
-  if (y + cam->offset.y/cam->zoom + COLL_B > ZOOM_HEIGHT - AT_EDGE) {
-    changing_screens = true;
-    new_interpf(&cam->offset.y,
-                cam->offset.y - (ZOOM_HEIGHT - PAST_EDGE) * cam->zoom, 30,
-                SineEaseInOut, set_changing_screen_off);
-  }
-  if (y + cam->offset.y/cam->zoom + COLL_T < AT_EDGE) {
-    float target = fminf(0, cam->offset.y + (ZOOM_HEIGHT - PAST_EDGE) * cam->zoom);
-    QQ(target);
-    QQ(cam->offset.y);
-    if (!FloatEquals(target, cam->offset.y)) {
-      changing_screens = true;
-      new_interpf(&cam->offset.y, target, 30, SineEaseInOut,
-                  set_changing_screen_off);
-    }
-  }
-}
-#endif
-
 static void update_interps(void) {
   for (int i = 0; i < MAX_INTERPS; ++i) {
-    QQ(i);
     Interp* interp = &interps[i];
     if (!interp->into)
       continue;
@@ -387,15 +336,36 @@ static void update_interps(void) {
   }
 }
 
-void do_player_movement(Camera2D* cam) {
-  update_interps();
-
-#if 0
-  if (changing_screens) {
-    goto draw_only;
+void chick_update(GameObj* go) {
+  ChickExtra* extra = (ChickExtra*)&go->extra;
+  if (extra->follower) {
+    int loc_idx = record_frame - 8 * extra->follower;
+    while (loc_idx < 0) loc_idx += RECORD_COUNT;
+    go->x = record_line_x[loc_idx];
+    go->y = record_line_y[loc_idx];
+    if ((int)x != (int)go->x || (int)y != (int)go->y) {
+      go->anim = &anim_chick_walk;
+      go->h_flip = x < go->x;
+    } else {
+      go->anim = &anim_chick_idle;
+    }
+  } else {
+    go->anim = &anim_chick_idle;
   }
-#endif
+  go->anim_frame += 15.0/60.0;
+  while (go->anim_frame >= go->anim->num_frames) {
+    go->anim_frame -= go->anim->num_frames;
+  }
+}
 
+void chick_collided_player(GameObj* go) {
+  ChickExtra* extra = (ChickExtra*)&go->extra;
+  if (!extra->follower) {
+    extra->follower = ++num_followers;
+  }
+}
+
+void player_update(GameObj* go) {
   bool want_left = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_LEFT) ||
                    GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X) < -0.5f;
   bool want_right = IsGamepadButtonDown(0, GAMEPAD_BUTTON_LEFT_FACE_RIGHT) ||
@@ -417,16 +387,6 @@ void do_player_movement(Camera2D* cam) {
   }
 
   bool want_egg = IsGamepadButtonPressed(0, GAMEPAD_BUTTON_RIGHT_FACE_LEFT);
-
-  if (IsKeyPressed(KEY_ESCAPE)) {
-    x = 30;
-    y = 50;
-    current_h_speed = 0;
-    current_v_speed = 0;
-    cam->offset.x = 0;
-    cam->offset.y = 0;
-    camera_target = (Vector2){0,0};
-  }
 
   if (IsKeyPressed(KEY_F5)) {
     bounding_boxes = !bounding_boxes;
@@ -732,7 +692,7 @@ void do_player_movement(Camera2D* cam) {
   }
 
   record_frame++;
-  if (record_frame > RECORD_COUNT) {
+  if (record_frame >= RECORD_COUNT) {
     record_frame = 0;
   }
   record_line_x[record_frame] = x;
@@ -748,29 +708,27 @@ void do_player_movement(Camera2D* cam) {
     record_line_colour[record_frame] = RED;
   }
 
-  static double frame_counter;
-  static h_flip_render = false;
-  frame_counter += 10.0 / 60.0;
+  go->anim_frame += 10.0/60.0;
 
   if (current_h_speed > 0)
-    h_flip_render = false;
+    go->h_flip = false;
   else if (current_h_speed < 0)
-    h_flip_render = true;
+    go->h_flip = true;
   if (grounded) {
     if (current_h_speed == 0) {
-      cur_anim = &anim_idle;
+      go->anim = &anim_idle;
     } else {
-      cur_anim = &anim_run;
+      go->anim = &anim_run;
     }
   } else {
-    cur_anim = &anim_jump;
+    go->anim = &anim_jump;
   }
 
   if (want_egg) {
     Particle* p = find_particle_slot();
     if (p) {
       p->src_tex_rect = &egg_rect;
-      if (h_flip_render) {
+      if (go->h_flip) {
         p->position.x = x - 8;
       } else {
         p->position.x = x - 2;
@@ -783,7 +741,7 @@ void do_player_movement(Camera2D* cam) {
         p->velocity.y = -8;
       } else {
         p->position.y = y-20;
-        if (h_flip_render) {
+        if (go->h_flip) {
           p->velocity.x = -6;
         } else {
           p->velocity.x = 6;
@@ -814,29 +772,73 @@ void do_player_movement(Camera2D* cam) {
     }
   }
 
+  Rectangle player_rect = {x + game_objs[0].bbox.x, y + game_objs[0].bbox.y,
+                           game_objs[0].bbox.width, game_objs[0].bbox.height};
+  for (int i = 1; i < num_game_objs; ++i) {
+    GameObj* go = &game_objs[i];
+    Rectangle obj_rect = {go->x + go->bbox.x, go->y + go->bbox.y,
+                          go->bbox.width, go->bbox.height};
+    if (CheckCollisionRecs(player_rect, obj_rect)) {
+      go->collided_player(go);
+    }
+  }
+
+  go->x = x;
+  go->y = y;
+  while (go->anim_frame >= go->anim->num_frames) {
+    go->anim_frame -= go->anim->num_frames;
+  }
+}
+
+void do_game_obj_update(Camera2D* cam) {
+  update_interps();
+
+  if (IsKeyPressed(KEY_ESCAPE)) {
+    x = 30;
+    y = 50;
+    current_h_speed = 0;
+    current_v_speed = 0;
+    cam->offset.x = 0;
+    cam->offset.y = 0;
+    camera_target = (Vector2){0,0};
+  }
+
+  for (int i = 0; i < num_game_objs; ++i) {
+    GameObj* go = &game_objs[i];
+    go->update(go);
+  }
+
   update_particles();
 
-  while (frame_counter >= cur_anim->num_frames)
-    frame_counter -= cur_anim->num_frames;
+  for (int i = 0; i < num_game_objs; ++i) {
+    GameObj* go = &game_objs[i];
 
-draw_only:
-  if (h_flip_render) {
-    Rectangle copy = cur_anim->rects[(int)frame_counter];
-    copy.width = -copy.width;
-    DrawTextureRec(texall, copy, (Vector2){(int)x - 16, (int)y - 32}, WHITE);
-  } else {
-    DrawTextureRec(texall, cur_anim->rects[(int)frame_counter],
-                   (Vector2){(int)x - 16, (int)y - 32}, WHITE);
-  }
-  if (bounding_boxes) {
-    DrawRectangleLines((int)x + COLL_L, (int)y + COLL_T, COLL_R - COLL_L,
-                       COLL_B - COLL_T, Fade(BLUE, .4f));
+    Rectangle copy = go->anim->rects[(int)go->anim_frame];
+    if (go->h_flip) {
+      copy.width = -copy.width;
+      DrawTextureRec(texall, copy,
+                     (Vector2){go->x + copy.width / 2, go->y - copy.height},
+                     WHITE);
+    } else {
+      DrawTextureRec(texall, copy,
+                     (Vector2){go->x - copy.width / 2, go->y - copy.height},
+                     WHITE);
+    }
 
-    for (int i = 0; i < RECORD_COUNT; ++i) {
-      int j = (i + 1) % RECORD_COUNT;
-      if (i == record_frame) continue;
-      DrawLine(record_line_x[i], record_line_y[i], record_line_x[j],
-               record_line_y[j], record_line_colour[i]);
+    if (bounding_boxes) {
+      DrawRectangleLines(go->x + go->bbox.x, go->y + go->bbox.y, go->bbox.width,
+                         go->bbox.height, Fade(BLUE, .4f));
+
+      if (i == 0) {
+        DrawText(TextFormat("%d", record_frame), go->x, go->y, 10, GREEN);
+        for (int i = 0; i < RECORD_COUNT; ++i) {
+          int j = (i + 1) % RECORD_COUNT;
+          if (i == record_frame)
+            continue;
+          DrawLine(record_line_x[i], record_line_y[i], record_line_x[j],
+              record_line_y[j], record_line_colour[i]);
+        }
+      }
     }
   }
 

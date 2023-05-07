@@ -1,6 +1,6 @@
 //
 // Amalgamated (single file) build of https://github.com/sgraham/dyibicc.
-// Revision: 6088b4979e09d74174d3bd8c972957f585c0136c
+// Revision: 8b9dbf8ed174892a30ed077e69d128d0f70db0c6
 //
 // This file should not be edited or modified, patches should be to the
 // non-amalgamated files in src/. The user-facing API is in libdyibicc.h
@@ -2399,8 +2399,16 @@ static void add_type(Node* node) {
         error_tok(node->lhs->tok, "value of type %.*s can't be assigned to a pointer",
                   node->rhs->ty->name->len, node->rhs->ty->name->loc);
       }
-      if (node->lhs->ty->kind != TY_STRUCT)
+      if (node->lhs->ty->kind != TY_STRUCT) {
         node->rhs = new_cast(node->rhs, node->lhs->ty);
+      } else {
+        if (node->rhs->ty->kind != TY_STRUCT) {
+          error_tok(node->lhs->tok, "cannot assign to struct");
+        }
+        if (node->lhs->ty->members != node->rhs->ty->members) {
+          error_tok(node->lhs->tok, "cannot assign incompatible structs");
+        }
+      }
       node->ty = node->lhs->ty;
       return;
     case ND_EQ:

@@ -777,7 +777,7 @@ int main(void) {
 
   SetConfigFlags(FLAG_VSYNC_HINT);
   InitWindow(1920, 1080, "Rdy");
-  RenderTexture2D target = LoadRenderTexture(1872, 1080);
+  RenderTexture2D target = LoadRenderTexture(1920, 1080);
 
   SetTargetFPS(60);
 
@@ -856,8 +856,7 @@ int main(void) {
     ClearBackground(DARKGRAY);
     Rectangle source_rect = {0.0f, 0.0f, (float)target.texture.width,
                              -(float)target.texture.height};
-    int side_edges = (1920-1872)/2;
-    Rectangle dest_rect = {(float)(side_edges / 2), 0, (float)(GetRenderWidth() - side_edges),
+    Rectangle dest_rect = {0, 0, (float)(GetRenderWidth(),
                            (float)GetRenderHeight()};
     DrawTexturePro(target.texture, source_rect, dest_rect, (Vector2){0,0}, 0.0f, WHITE);
     EndDrawing();

@@ -93,6 +93,15 @@ static ObjectLocation* find_raw_objects_slot(void) {
   return NULL;
 }
 
+static void remove_objects_at(int x_tile, int y_tile) {
+  for (int i = 0; i < MAX_NUM_OBJECTS; ++i) {
+    if (raw_objects_data[i].x == x_tile && raw_objects_data[i].y == y_tile) {
+      raw_objects_data[i].obj_type = 0;
+      // no break.
+    }
+  }
+}
+
 static void load_level(void) {
   FILE* f = fopen(level_name, "rb");
   if (f) {
@@ -134,7 +143,7 @@ static void toggle_fullscreen(void) {
   } else {
     ClearWindowState(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_UNDECORATED |
                      FLAG_WINDOW_TOPMOST);
-    SetWindowSize(1920, 1080);
+    SetWindowSize(1872, 1080);
     SetWindowPosition(10, 50);
   }
   is_fullscreen = !is_fullscreen;
@@ -426,14 +435,18 @@ static void update(void) {
 
   // QQ(cam.zoom);
 
-  double mx = (double)GetMouseX() * SCREEN_WIDTH / GetRenderWidth();
-  double my = (double)GetMouseY() * SCREEN_HEIGHT / GetRenderHeight();
-  Vector2 world = GetScreenToWorld2D((Vector2){mx, my}, cam);
-
-  int x_tile = (int)(world.x / GRID);
-  int y_tile = (int)(world.y / GRID);
-  // QQ(x_tile);
-  // QQ(y_tile);
+  int x_tile;
+  int y_tile;
+  //if (GetMouseX() >= (1920-SCREEN_WIDTH)/2 && GetMouseX() < 1920-(1920-SCREEN_WIDTH)/2) {
+    double mx = (double)GetMouseX() * SCREEN_WIDTH / GetRenderWidth();
+    double my = (double)GetMouseY() * SCREEN_HEIGHT / GetRenderHeight();
+    Vector2 world = GetScreenToWorld2D((Vector2){mx, my}, cam);
+    x_tile = (int)(world.x / GRID);
+    y_tile = (int)(world.y / GRID);
+  //} else {
+    //x_tile = -1;
+    //y_tile = -1;
+  //}
 
   if (IsKeyPressed(KEY_SPACE)) {
     edit_mode = !edit_mode;
@@ -487,36 +500,37 @@ static void update(void) {
       }
     }
 
-    if (edit_insert_type == 0) {
-      DrawRectangle(x_tile * GRID, y_tile * GRID, GRID, GRID,
-                    Fade(GREEN, .25f));
-      if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-        set_level_at(x_tile, y_tile, 0);
-      } else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-        clear_level_at(x_tile, y_tile, 0);
-      }
-    } else {
-      DrawTexturePro(texall, item_proto_rect[edit_insert_type],
-                     (Rectangle){x_tile * GRID, y_tile * GRID, GRID, GRID},
-                     (Vector2){0, 0}, 0.f, GREEN);
-      if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-        ObjectLocation* ol = find_raw_objects_slot();
-        if (ol) {
-          ol->x = x_tile;
-          ol->y = y_tile;
-          ol->obj_type = edit_insert_type;
+    if (x_tile >= 0 && y_tile >= 0) {
+      if (edit_insert_type == 0) {
+        DrawRectangle(x_tile * GRID, y_tile * GRID, GRID, GRID,
+                      Fade(GREEN, .25f));
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+          set_level_at(x_tile, y_tile, 0);
+        } else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+          clear_level_at(x_tile, y_tile, 0);
+          remove_objects_at(x_tile, y_tile);
         }
-      } else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-        for (int i = 0; i <MAX_NUM_OBJECTS; ++i) {
-          if (raw_objects_data[i].x == x_tile &&
-              raw_objects_data[i].y == y_tile) {
-            raw_objects_data[i].obj_type = 0;
-            // no break.
+      } else {
+        DrawTexturePro(texall, item_proto_rect[edit_insert_type],
+                       (Rectangle){x_tile * GRID, y_tile * GRID, GRID, GRID},
+                       (Vector2){0, 0}, 0.f, GREEN);
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+          remove_objects_at(x_tile, y_tile);
+          ObjectLocation* ol = find_raw_objects_slot();
+          if (ol) {
+            ol->x = x_tile;
+            ol->y = y_tile;
+            ol->obj_type = edit_insert_type;
           }
+        } else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+          clear_level_at(x_tile, y_tile, 0);
+          remove_objects_at(x_tile, y_tile);
         }
       }
-    }
 
+      DrawText(TextFormat("%d,%d", x_tile, y_tile), x_tile * GRID + GRID,
+               y_tile * GRID + GRID, 12, GREEN);
+    }
     for (int x = 0; x < MAX_LEVEL_SIZE*GRID; x += GRID) {
       DrawLine(x, 0, x, MAX_LEVEL_SIZE*GRID, GREEN);
     }
@@ -524,8 +538,6 @@ static void update(void) {
       DrawLine(0, y, MAX_LEVEL_SIZE*GRID, y, GREEN);
     }
 
-    DrawText(TextFormat("%d,%d", x_tile, y_tile), x_tile * GRID + GRID,
-             y_tile * GRID + GRID, 12, GREEN);
   } else {
     cam.zoom = 4.f;
   }

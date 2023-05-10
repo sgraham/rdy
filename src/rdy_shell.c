@@ -856,8 +856,7 @@ int main(void) {
     ClearBackground(DARKGRAY);
     Rectangle source_rect = {0.0f, 0.0f, (float)target.texture.width,
                              -(float)target.texture.height};
-    Rectangle dest_rect = {0, 0, (float)(GetRenderWidth(),
-                           (float)GetRenderHeight()};
+    Rectangle dest_rect = {0, 0, (float)GetRenderWidth(), (float)GetRenderHeight()};
     DrawTexturePro(target.texture, source_rect, dest_rect, (Vector2){0,0}, 0.0f, WHITE);
     EndDrawing();
   }

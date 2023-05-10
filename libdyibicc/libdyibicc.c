@@ -1,6 +1,6 @@
 //
 // Amalgamated (single file) build of https://github.com/sgraham/dyibicc.
-// Revision: 8b9dbf8ed174892a30ed077e69d128d0f70db0c6
+// Revision: ffeffe8b83233d02cbae10fa1a9b1dec9d1633bd
 //
 // This file should not be edited or modified, patches should be to the
 // non-amalgamated files in src/. The user-facing API is in libdyibicc.h
@@ -445,7 +445,7 @@ struct Node {
 };
 
 static Node* new_cast(Node* expr, Type* ty);
-static int64_t const_expr(Token** rest, Token* tok);
+static int64_t pp_const_expr(Token** rest, Token* tok);
 static Obj* parse(Token* tok);
 
 //
@@ -545,7 +545,7 @@ static bool is_compatible(Type* t1, Type* t2);
 static Type* copy_type(Type* ty);
 static Type* pointer_to(Type* base);
 static Type* func_type(Type* return_ty);
-static Type* array_of(Type* base, int size);
+static Type* array_of(Type* base, int size, Token* err_tok);
 static Type* vla_of(Type* base, Node* expr);
 static Type* enum_type(void);
 static Type* struct_type(void);
@@ -711,6 +711,7 @@ typedef struct CompilerState {
   Obj* parse__builtin_alloca;
   int parse__unique_name_id;
   HashMap parse__typename_map;
+  bool parse__evaluating_pp_const;
 
   // codegen.in.c
   int codegen__depth;
@@ -2289,7 +2290,10 @@ static Type* func_type(Type* return_ty) {
   return ty;
 }
 
-static Type* array_of(Type* base, int len) {
+static Type* array_of(Type* base, int len, Token* err_tok) {
+  int64_t arr_size = (int64_t)base->size * len;
+  if (arr_size > INT_MAX)
+    error_tok(err_tok, "array too large");
   Type* ty = new_type(TY_ARRAY, base->size * len, base->align);
   ty->base = base;
   ty->array_len = len;
@@ -2433,6 +2437,8 @@ static void add_type(Node* node) {
       return;
     case ND_VAR:
     case ND_VLA_PTR:
+      if (!node->var)
+        error_tok(node->tok, "non-constant value");
       node->ty = node->var->ty;
       return;
     case ND_COND:
@@ -3816,6 +3822,7 @@ static Node* expr(Token** rest, Token* tok);
 static int64_t eval(Node* node);
 static int64_t eval2(Node* node, char*** label, int** pclabel);
 static int64_t eval_rval(Node* node, char*** label, int** pclabel);
+static int64_t const_expr(Token** rest, Token* tok);
 static bool is_const_expr(Node* node);
 static Node* assign(Token** rest, Token* tok);
 static Node* logor(Token** rest, Token* tok);
@@ -3953,7 +3960,7 @@ static VarScope* push_scope(char* name) {
   return sc;
 }
 
-static Initializer* new_initializer(Type* ty, bool is_flexible) {
+static Initializer* new_initializer(Type* ty, bool is_flexible, Token* err_tok) {
   Initializer* init = bumpcalloc(1, sizeof(Initializer), AL_Compile);
   init->ty = ty;
 
@@ -3963,9 +3970,13 @@ static Initializer* new_initializer(Type* ty, bool is_flexible) {
       return init;
     }
 
+    if (ty->array_len < 0) {
+      error_tok(err_tok, "array has incomplete element type");
+    }
+
     init->children = bumpcalloc(ty->array_len, sizeof(Initializer*), AL_Compile);
     for (int i = 0; i < ty->array_len; i++)
-      init->children[i] = new_initializer(ty->base, false);
+      init->children[i] = new_initializer(ty->base, false, err_tok);
     return init;
   }
 
@@ -3984,7 +3995,7 @@ static Initializer* new_initializer(Type* ty, bool is_flexible) {
         child->is_flexible = true;
         init->children[mem->idx] = child;
       } else {
-        init->children[mem->idx] = new_initializer(mem->ty, false);
+        init->children[mem->idx] = new_initializer(mem->ty, false, err_tok);
       }
     }
     return init;
@@ -4340,17 +4351,20 @@ static Type* func_params(Token** rest, Token* tok, Type* ty) {
     ty2 = declarator(&tok, tok, ty2);
 
     Token* name = ty2->name;
+    Token* name_pos = ty2->name_pos;
 
     if (ty2->kind == TY_ARRAY) {
       // "array of T" is converted to "pointer to T" only in the parameter
       // context. For example, *argv[] is converted to **argv by this.
       ty2 = pointer_to(ty2->base);
       ty2->name = name;
+      ty2->name_pos = name_pos;
     } else if (ty2->kind == TY_FUNC) {
       // Likewise, a function is converted to a pointer to a function
       // only in the parameter context.
       ty2 = pointer_to(ty2);
       ty2->name = name;
+      ty2->name_pos = name_pos;
     }
 
     cur = cur->next = copy_type(ty2);
@@ -4373,7 +4387,7 @@ static Type* array_dimensions(Token** rest, Token* tok, Type* ty) {
 
   if (equal(tok, "]")) {
     ty = type_suffix(rest, tok->next, ty);
-    return array_of(ty, -1);
+    return array_of(ty, -1, tok);
   }
 
   Node* expr = conditional(&tok, tok);
@@ -4382,7 +4396,11 @@ static Type* array_dimensions(Token** rest, Token* tok, Type* ty) {
 
   if (ty->kind == TY_VLA || !is_const_expr(expr))
     return vla_of(ty, expr);
-  return array_of(ty, (int)eval(expr));
+  int dim = (int)eval(expr);
+  if (dim < 0) {
+    error_tok(expr->tok, "array declared with negative bounds");
+  }
+  return array_of(ty, dim, tok);
 }
 
 // type-suffix = "(" func-params
@@ -4653,7 +4671,7 @@ static Token* skip_excess_element(Token* tok) {
 // string-initializer = string-literal
 static void string_initializer(Token** rest, Token* tok, Initializer* init) {
   if (init->is_flexible)
-    *init = *new_initializer(array_of(init->ty->base, tok->ty->array_len), false);
+    *init = *new_initializer(array_of(init->ty->base, tok->ty->array_len, tok), false, tok);
 
   int len = MIN(init->ty->array_len, tok->ty->array_len);
 
@@ -4710,12 +4728,12 @@ static void string_initializer(Token** rest, Token* tok, Initializer* init) {
 // The above initializer sets x.c to 5.
 static void array_designator(Token** rest, Token* tok, Type* ty, int* begin, int* end) {
   *begin = (int)const_expr(&tok, tok->next);
-  if (*begin >= ty->array_len)
+  if (*begin >= ty->array_len || *begin < 0)
     error_tok(tok, "array designator index exceeds array bounds");
 
   if (equal(tok, "...")) {
     *end = (int)const_expr(&tok, tok->next);
-    if (*end >= ty->array_len)
+    if (*end >= ty->array_len || *end < 0)
       error_tok(tok, "array designator index exceeds array bounds");
     if (*end < *begin)
       error_tok(tok, "array designator range [%d, %d] is empty", *begin, *end);
@@ -4765,8 +4783,12 @@ static void designation(Token** rest, Token* tok, Initializer* init) {
     array_designator(&tok, tok, init->ty, &begin, &end);
 
     Token* tok2 = NULL;
-    for (int i = begin; i <= end; i++)
+    for (int i = begin; i <= end; i++) {
+      if (!init->children) {
+        error_tok(tok, "incomplete array element type");
+      }
       designation(&tok2, tok, init->children[i]);
+    }
     array_initializer2(rest, tok2, init, begin + 1);
     return;
   }
@@ -4799,7 +4821,7 @@ static void designation(Token** rest, Token* tok, Initializer* init) {
 // of initializer elements.
 static int count_array_init_elements(Token* tok, Type* ty) {
   bool first = true;
-  Initializer* dummy = new_initializer(ty->base, true);
+  Initializer* dummy = new_initializer(ty->base, true, tok);
 
   int i = 0, max = 0;
 
@@ -4830,14 +4852,14 @@ static void array_initializer1(Token** rest, Token* tok, Initializer* init) {
 
   if (init->is_flexible) {
     int len = count_array_init_elements(tok, init->ty);
-    *init = *new_initializer(array_of(init->ty->base, len), false);
+    *init = *new_initializer(array_of(init->ty->base, len, tok), false, tok);
   }
 
   bool first = true;
 
   if (init->is_flexible) {
     int len = count_array_init_elements(tok, init->ty);
-    *init = *new_initializer(array_of(init->ty->base, len), false);
+    *init = *new_initializer(array_of(init->ty->base, len, tok), false, tok);
   }
 
   for (int i = 0; !consume_end(rest, tok); i++) {
@@ -4868,7 +4890,7 @@ static void array_initializer1(Token** rest, Token* tok, Initializer* init) {
 static void array_initializer2(Token** rest, Token* tok, Initializer* init, int i) {
   if (init->is_flexible) {
     int len = count_array_init_elements(tok, init->ty);
-    *init = *new_initializer(array_of(init->ty->base, len), false);
+    *init = *new_initializer(array_of(init->ty->base, len, tok), false, tok);
   }
 
   for (; i < init->ty->array_len && !is_end(tok); i++) {
@@ -5035,7 +5057,7 @@ static Type* copy_struct_type(Type* ty) {
 }
 
 static Initializer* initializer(Token** rest, Token* tok, Type* ty, Type** new_ty) {
-  Initializer* init = new_initializer(ty, true);
+  Initializer* init = new_initializer(ty, true, tok);
   initializer2(rest, tok, init);
 
   if ((ty->kind == TY_STRUCT || ty->kind == TY_UNION) && ty->is_flexible) {
@@ -5626,16 +5648,24 @@ static int64_t eval2(Node* node, char*** label, int** pclabel) {
       return eval2(node->lhs, label, pclabel) - eval(node->rhs);
     case ND_MUL:
       return eval(node->lhs) * eval(node->rhs);
-    case ND_DIV:
+    case ND_DIV: {
+      int64_t divisor = eval(node->rhs);
+      if (divisor == 0)
+        error_tok(node->tok, "division by zero");
       if (node->ty->is_unsigned)
-        return (uint64_t)eval(node->lhs) / eval(node->rhs);
-      return eval(node->lhs) / eval(node->rhs);
+        return (uint64_t)eval(node->lhs) / divisor;
+      return eval(node->lhs) / divisor;
+    }
     case ND_NEG:
       return -eval(node->lhs);
-    case ND_MOD:
+    case ND_MOD: {
+      int64_t divisor = eval(node->rhs);
+      if (divisor == 0)
+        error_tok(node->tok, "division by zero");
       if (node->ty->is_unsigned)
-        return (uint64_t)eval(node->lhs) % eval(node->rhs);
-      return eval(node->lhs) % eval(node->rhs);
+        return (uint64_t)eval(node->lhs) % divisor;
+      return eval(node->lhs) % divisor;
+    }
     case ND_BITAND:
       return eval(node->lhs) & eval(node->rhs);
     case ND_BITOR:
@@ -5693,6 +5723,8 @@ static int64_t eval2(Node* node, char*** label, int** pclabel) {
     case ND_ADDR:
       return eval_rval(node->lhs, label, pclabel);
     case ND_LABEL_VAL:
+      if (!pclabel)
+        error_tok(node->tok, "not a compile-time constant");
       *pclabel = &node->pc_label;
       return 0;
     case ND_MEMBER:
@@ -5720,7 +5752,7 @@ static int64_t eval2(Node* node, char*** label, int** pclabel) {
 static int64_t eval_rval(Node* node, char*** label, int** pclabel) {
   switch (node->kind) {
     case ND_VAR:
-      if (node->var->is_local)
+      if (node->var->is_local || !label)
         error_tok(node->tok, "not a compile-time constant");
       *label = &node->var->name;
       return 0;
@@ -5774,6 +5806,13 @@ static bool is_const_expr(Node* node) {
 
 static int64_t const_expr(Token** rest, Token* tok) {
   Node* node = conditional(rest, tok);
+  return eval(node);
+}
+
+static int64_t pp_const_expr(Token** rest, Token* tok) {
+  C(evaluating_pp_const) = true;
+  Node* node = conditional(rest, tok);
+  C(evaluating_pp_const) = false;
   return eval(node);
 }
 
@@ -6307,12 +6346,18 @@ static Node* unary(Token** rest, Token* tok) {
     return new_unary(ND_BITNOT, cast(rest, tok->next), tok);
 
   // Read ++i as i+=1
-  if (equal(tok, "++"))
+  if (equal(tok, "++")) {
+    if (C(evaluating_pp_const))
+      error_tok(tok, "invalid preprocessor token");
     return to_assign(new_add(unary(rest, tok->next), new_num(1, tok), tok));
+  }
 
   // Read --i as i-=1
-  if (equal(tok, "--"))
+  if (equal(tok, "--")) {
+    if (C(evaluating_pp_const))
+      error_tok(tok, "invalid preprocessor token");
     return to_assign(new_sub(unary(rest, tok->next), new_num(1, tok), tok));
+  }
 
   // [GNU] labels-as-values
   if (equal(tok, "&&")) {
@@ -6373,7 +6418,7 @@ static void struct_members(Token** rest, Token* tok, Type* ty) {
   // called a "flexible array member". It should behave as if
   // if were a zero-sized array.
   if (cur != &head && cur->ty->kind == TY_ARRAY && cur->ty->array_len < 0) {
-    cur->ty = array_of(cur->ty->base, 0);
+    cur->ty = array_of(cur->ty->base, 0, tok);
     ty->is_flexible = true;
   }
 
@@ -6644,12 +6689,16 @@ static Node* postfix(Token** rest, Token* tok) {
     }
 
     if (equal(tok, "++")) {
+      if (C(evaluating_pp_const))
+        error_tok(tok, "invalid token in preprocessor expression");
       node = new_inc_dec(node, tok, 1);
       tok = tok->next;
       continue;
     }
 
     if (equal(tok, "--")) {
+      if (C(evaluating_pp_const))
+        error_tok(tok, "invalid token in preprocessor expression");
       node = new_inc_dec(node, tok, -1);
       tok = tok->next;
       continue;
@@ -7183,6 +7232,9 @@ static Node* primary(Token** rest, Token* tok) {
   }
 
   if (tok->kind == TK_STR) {
+    if (C(evaluating_pp_const)) {
+      error_tok(tok, "invalid token in preprocessor expression");
+    }
     Obj* var = new_string_literal(tok->str, tok->ty);
     *rest = tok->next;
     return new_var_node(var, tok);
@@ -7332,7 +7384,7 @@ static Token* function(Token* tok, Type* basety, VarAttr* attr) {
 
 #if !X64WIN
   if (ty->is_variadic)
-    fn->va_area = new_lvar("__va_area__", array_of(ty_char, 136));
+    fn->va_area = new_lvar("__va_area__", array_of(ty_char, 136, NULL));
 #endif
   fn->alloca_bottom = new_lvar("__alloca_size__", pointer_to(ty_char));
 
@@ -7342,11 +7394,11 @@ static Token* function(Token* tok, Type* basety, VarAttr* attr) {
   // automatically defined as a local variable containing the
   // current function name.
   push_scope("__func__")->var =
-      new_string_literal(fn->name, array_of(ty_char, (int)strlen(fn->name) + 1));
+      new_string_literal(fn->name, array_of(ty_char, (int)strlen(fn->name) + 1, NULL));
 
   // [GNU] __FUNCTION__ is yet another name of __func__.
   push_scope("__FUNCTION__")->var =
-      new_string_literal(fn->name, array_of(ty_char, (int)strlen(fn->name) + 1));
+      new_string_literal(fn->name, array_of(ty_char, (int)strlen(fn->name) + 1, NULL));
 
   fn->body = compound_stmt(&tok, tok);
   fn->locals = C(locals);
@@ -7363,6 +7415,8 @@ static Token* global_variable(Token* tok, Type* basety, VarAttr* attr) {
       tok = skip(tok, ",");
     first = false;
 
+    Token* start = tok;
+
     Type* ty = declarator(&tok, tok, basety);
     if (!ty->name)
       error_tok(ty->name_pos, "variable name omitted");
@@ -7378,6 +7432,9 @@ static Token* global_variable(Token* tok, Type* basety, VarAttr* attr) {
       gvar_initializer(&tok, tok->next, var);
     else if (!attr->is_extern && !attr->is_tls)
       var->is_tentative = true;
+
+    if (!attr->is_extern && var->ty->kind == TY_ARRAY && var->ty->size < 0)
+      error_tok(start, "incomplete type for array");
   }
   return tok;
 }
@@ -7696,7 +7753,7 @@ static Token* copy_line(Token** rest, Token* tok) {
   Token head = {0};
   Token* cur = &head;
 
-  for (; !tok->at_bol; tok = tok->next)
+  for (; tok->kind != TK_EOF && !tok->at_bol; tok = tok->next)
     cur = cur->next = copy_token(tok);
 
   cur->next = new_eof(tok);
@@ -7767,7 +7824,7 @@ static long eval_const_expr(Token** rest, Token* tok) {
   convert_pp_tokens(expr);
 
   Token* rest2;
-  long val = (long)const_expr(&rest2, expr);
+  long val = (long)pp_const_expr(&rest2, expr);
   if (rest2->kind != TK_EOF)
     error_tok(rest2, "extra token");
   return val;
@@ -8378,6 +8435,9 @@ static Token* preprocess2(Token* tok) {
     if (equal(tok, "ifdef")) {
       bool defined = find_macro(tok->next);
       push_cond_incl(tok, defined);
+      if (tok->next->kind == TK_EOF) {
+        error_tok(tok, "unterminated #ifdef");
+      }
       tok = skip_line(tok->next->next);
       if (!defined)
         tok = skip_cond_incl(tok);
@@ -8387,6 +8447,9 @@ static Token* preprocess2(Token* tok) {
     if (equal(tok, "ifndef")) {
       bool defined = find_macro(tok->next);
       push_cond_incl(tok, !defined);
+      if (tok->next->kind == TK_EOF) {
+        error_tok(tok, "unterminated #ifndef");
+      }
       tok = skip_line(tok->next->next);
       if (defined)
         tok = skip_cond_incl(tok);
@@ -8695,7 +8758,7 @@ static void join_adjacent_string_literals(Token* tok) {
     }
 
     *tok1 = *copy_token(tok1);
-    tok1->ty = array_of(tok1->ty->base, len);
+    tok1->ty = array_of(tok1->ty->base, len, tok1);
     tok1->str = buf;
     tok1->next = tok2;
     tok1 = tok2;
@@ -8958,7 +9021,7 @@ static Token* read_string_literal(char* start, char* quote) {
   }
 
   Token* tok = new_token(TK_STR, start, end + 1);
-  tok->ty = array_of(ty_char, len + 1);
+  tok->ty = array_of(ty_char, len + 1, NULL);
   tok->str = buf;
   return tok;
 }
@@ -8994,7 +9057,7 @@ static Token* read_utf16_string_literal(char* start, char* quote) {
   }
 
   Token* tok = new_token(TK_STR, start, end + 1);
-  tok->ty = array_of(ty_ushort, len + 1);
+  tok->ty = array_of(ty_ushort, len + 1, NULL);
   tok->str = (char*)buf;
   return tok;
 }
@@ -9016,7 +9079,7 @@ static Token* read_utf32_string_literal(char* start, char* quote, Type* ty) {
   }
 
   Token* tok = new_token(TK_STR, start, end + 1);
-  tok->ty = array_of(ty, len + 1);
+  tok->ty = array_of(ty, len + 1, NULL);
   tok->str = (char*)buf;
   return tok;
 }
@@ -9203,7 +9266,7 @@ Token* tokenize(File* file) {
     // Skip line comments.
     if (p[0] == '/' && p[1] == '/') {
       p += 2;
-      while (*p != '\n')
+      while (*p && *p != '\n')
         p++;
       C(has_space) = true;
       continue;
@@ -9425,6 +9488,8 @@ static void convert_universal_chars(char* p) {
       }
     } else if (p[0] == '\\') {
       *q++ = *p++;
+      if (!*p)
+        break;
       *q++ = *p++;
     } else {
       *q++ = *p++;
@@ -9501,8 +9566,6 @@ static int encode_utf8(char* buf, uint32_t c) {
 // identical to ASCII. Non-ASCII characters are encoded using more
 // than one byte.
 static uint32_t decode_utf8(char** new_pos, char* p) {
-#if 0
-
   if ((unsigned char)*p < 128) {
     *new_pos = p + 1;
     return *p;
@@ -9533,57 +9596,6 @@ static uint32_t decode_utf8(char** new_pos, char* p) {
 
   *new_pos = p + len;
   return c;
-
-#else
-  // From http://bjoern.hoehrmann.de/utf-8/decoder/dfa/#variations
-
-  // This is maybe only a tiny amout faster (under /Ox /GL), likely because most
-  // code is ASCII so we hit the < 128 early out in the plain code.
-
-#define UTF8_ACCEPT 0
-#define UTF8_REJECT 12
-
-  // clang-format off
-  static const uint8_t utf8d[] = {
-    // The first part of the table maps bytes to character classes that
-    // to reduce the size of the transition table and create bitmasks.
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,  9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,9,
-    7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,  7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,7,
-    8,8,2,2,2,2,2,2,2,2,2,2,2,2,2,2,  2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,
-    10,3,3,3,3,3,3,3,3,3,3,3,3,4,3,3, 11,6,6,6,5,8,8,8,8,8,8,8,8,8,8,8,
-
-    // The second part is a transition table that maps a combination
-    // of a state of the automaton and a character class to a state.
-    0,12,24,36,60,96,84,12,12,12,48,72, 12,12,12,12,12,12,12,12,12,12,12,12,
-    12, 0,12,12,12,12,12, 0,12, 0,12,12, 12,24,12,12,12,12,12,24,12,24,12,12,
-    12,12,12,12,12,12,12,24,12,12,12,12, 12,24,12,12,12,12,12,12,12,24,12,12,
-    12,12,12,12,12,12,12,36,12,36,12,12, 12,36,12,12,12,12,12,36,12,36,12,12,
-    12,36,12,12,12,12,12,12,12,12,12,12,
-  };
-  // clang-format on
-
-  uint32_t state = 0;
-  uint32_t codep = 0;
-  char* start = p;
-
-  while (*p) {
-    uint8_t byte = *p++;
-    uint32_t type = utf8d[byte];
-    codep = (state != UTF8_ACCEPT) ? (byte & 0x3fu) | (codep << 6) : (0xff >> type) & (byte);
-    state = utf8d[256 + state + type];
-    if (!state)
-      break;
-  }
-  if (!*p && state != UTF8_ACCEPT) {
-    error_at(start, "invalid UTF-8 sequence");
-  }
-  *new_pos = p;
-  return codep;
-#endif
 }
 
 static bool in_range(uint32_t* range, uint32_t c) {

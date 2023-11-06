@@ -1,6 +1,6 @@
 //
 // Amalgamated (single file) build of https://github.com/sgraham/dyibicc.
-// Revision: ffeffe8b83233d02cbae10fa1a9b1dec9d1633bd
+// Revision: 433890aaa6d91861ba3bd805503b077e53e5c4b0
 //
 // This file should not be edited or modified, patches should be to the
 // non-amalgamated files in src/. The user-facing API is in libdyibicc.h
@@ -97,6 +97,8 @@ typedef struct Hideset Hideset;
 typedef struct Token Token;
 typedef struct HashMap HashMap;
 typedef struct UserContext UserContext;
+typedef struct DbpContext DbpContext;
+typedef struct DbpFunctionSymbol DbpFunctionSymbol;
 
 //
 // alloc.c
@@ -131,6 +133,8 @@ static void free_executable_memory(void* p, size_t size);
 // util.c
 //
 
+typedef struct File File;
+
 typedef struct {
   char** data;
   int capacity;
@@ -148,22 +152,29 @@ typedef struct StringIntArray {
   int len;
 } StringIntArray;
 
-typedef struct ByteArray {
-  char* data;
+typedef struct FilePtrArray {
+  File** data;
   int capacity;
   int len;
-} ByteArray;
+} FilePtrArray;
 
-typedef struct IntInt {
+typedef struct TokenPtrArray {
+  Token** data;
+  int capacity;
+  int len;
+} TokenPtrArray;
+
+typedef struct IntIntInt {
   int a;
   int b;
-} IntInt;
+  int c;
+} IntIntInt;
 
-typedef struct IntIntArray {
-  IntInt* data;
+typedef struct IntIntIntArray {
+  IntIntInt* data;
   int capacity;
   int len;
-} IntIntArray;
+} IntIntIntArray;
 
 static char* bumpstrndup(const char* s, size_t n, AllocLifetime lifetime);
 static char* bumpstrdup(const char* s, AllocLifetime lifetime);
@@ -173,6 +184,11 @@ static int64_t align_to_s(int64_t n, int64_t align);
 static unsigned int get_page_size(void);
 static void strarray_push(StringArray* arr, char* s, AllocLifetime lifetime);
 static void strintarray_push(StringIntArray* arr, StringInt item, AllocLifetime lifetime);
+static void fileptrarray_push(FilePtrArray* arr, File* item, AllocLifetime lifetime);
+static void tokenptrarray_push(TokenPtrArray* arr, Token* item, AllocLifetime lifetime);
+#if X64WIN
+static void intintintarray_push(IntIntIntArray* arr, IntIntInt item, AllocLifetime lifetime);
+#endif
 static char* format(AllocLifetime lifetime, char* fmt, ...)
     __attribute__((format(printf, 2, 3)));
 static char* read_file_wrap_user(char* path, AllocLifetime lifetime);
@@ -186,6 +202,7 @@ static void warn_tok(Token* tok, char* fmt, ...) __attribute__((format(printf, 2
 #if X64WIN
 static void register_function_table_data(UserContext* ctx, int func_count, char* base_addr);
 static void unregister_and_free_function_table_data(UserContext* ctx);
+static char* get_temp_pdb_filename(AllocLifetime lifetime);
 #endif
 
 //
@@ -203,14 +220,15 @@ typedef enum {
   TK_EOF,      // End-of-file markers
 } TokenKind;
 
-typedef struct {
+struct File {
   char* name;
   char* contents;
+  int file_no;  // Index into tokenize__all_tokenized_files.
 
   // For #line directive
   char* display_name;
   int line_delta;
-} File;
+};
 
 // Token type
 typedef struct Token Token;
@@ -256,6 +274,7 @@ static void init_macros(void);
 static void define_macro(char* name, char* buf);
 static void undef_macro(char* name);
 static Token* preprocess(Token* tok);
+static Token* add_container_instantiations(Token* tok);
 
 //
 // parse.c
@@ -285,6 +304,9 @@ struct Obj {
   int dasm_return_label;
   int dasm_end_of_function_label;
   int dasm_unwind_info_label;
+#if X64WIN
+  IntIntIntArray file_line_label_data;
+#endif
 
   // Global variable
   bool is_tentative;
@@ -441,7 +463,7 @@ struct Node {
   int64_t val;
   long double fval;
 
-  uintptr_t rty;
+  uintptr_t reflect_ty;
 };
 
 static Node* new_cast(Node* expr, Type* ty);
@@ -508,6 +530,7 @@ struct Type {
   Member* members;
   bool is_flexible;
   bool is_packed;
+  Token* methodcall_prefix;
 
   // Function type
   Type* return_ty;
@@ -655,6 +678,7 @@ struct UserContext {
   DyibiccFunctionLookupFn get_function_address;
   DyibiccOutputFn output_function;
   bool use_ansi_codes;
+  bool generate_debug_symbols;
 
   size_t num_include_paths;
   char** include_paths;
@@ -674,6 +698,7 @@ struct UserContext {
 
 #if X64WIN
   char* function_table_data;
+  DbpContext* dbp_ctx;
 #endif
 };
 
@@ -685,11 +710,16 @@ typedef struct CompilerState {
   bool tokenize__at_bol;         // True if the current position is at the beginning of a line
   bool tokenize__has_space;      // True if the current position follows a space character
   HashMap tokenize__keyword_map;
+  FilePtrArray tokenize__all_tokenized_files;
 
   // preprocess.c
   HashMap preprocess__macros;
   CondIncl* preprocess__cond_incl;
   HashMap preprocess__pragma_once;
+  HashMap preprocess__container_included;
+  TokenPtrArray preprocess__container_tokens;
+  HashMap preprocess__builtin_includes_map;
+
   int preprocess__include_next_idx;
   HashMap preprocess__include_path_cache;
   HashMap preprocess__include_guards;
@@ -720,7 +750,6 @@ typedef struct CompilerState {
   Obj* codegen__current_fn;
   int codegen__numlabels;
   StringIntArray codegen__fixups;
-  IntIntArray codegen__pending_code_pclabels;
 
   // main.c
   char* main__base_file;
@@ -839,685 +868,5876 @@ extern _ReflectType* _ReflectTypeOf(...);
 #undef L
 #undef VOID
 //
-// START OF ../../src/khash.h
+// START OF compincl.h
 //
-/* The MIT License
-
-   Copyright (c) 2008, 2009, 2011 by Attractive Chaos <attractor@live.co.uk>
-
-   Permission is hereby granted, free of charge, to any person obtaining
-   a copy of this software and associated documentation files (the
-   "Software"), to deal in the Software without restriction, including
-   without limitation the rights to use, copy, modify, merge, publish,
-   distribute, sublicense, and/or sell copies of the Software, and to
-   permit persons to whom the Software is furnished to do so, subject to
-   the following conditions:
-
-   The above copyright notice and this permission notice shall be
-   included in all copies or substantial portions of the Software.
-
-   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
-   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
-   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-   NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
-   BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
-   ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
-   CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-   SOFTWARE.
-*/
-
-/*
-  An example:
-
-KHASH_MAP_INIT_INT(32, char)
-int main() {
-        int ret, is_missing;
-        khiter_t k;
-        khash_t(32) *h = kh_init(32);
-        k = kh_put(32, h, 5, &ret);
-        kh_value(h, k) = 10;
-        k = kh_get(32, h, 10);
-        is_missing = (k == kh_end(h));
-        k = kh_get(32, h, 5);
-        kh_del(32, h, k);
-        for (k = kh_begin(h); k != kh_end(h); ++k)
-                if (kh_exist(h, k)) kh_value(h, k) = 1;
-        kh_destroy(32, h);
-        return 0;
-}
-*/
-
-/*
-  2013-05-02 (0.2.8):
-
-        * Use quadratic probing. When the capacity is power of 2, stepping function
-          i*(i+1)/2 guarantees to traverse each bucket. It is better than double
-          hashing on cache performance and is more robust than linear probing.
-
-          In theory, double hashing should be more robust than quadratic probing.
-          However, my implementation is probably not for large hash tables, because
-          the second hash function is closely tied to the first hash function,
-          which reduce the effectiveness of double hashing.
-
-        Reference: http://research.cs.vt.edu/AVresearch/hashing/quadratic.php
-
-  2011-12-29 (0.2.7):
-
-    * Minor code clean up; no actual effect.
-
-  2011-09-16 (0.2.6):
-
-        * The capacity is a power of 2. This seems to dramatically improve the
-          speed for simple keys. Thank Zilong Tan for the suggestion. Reference:
-
-           - http://code.google.com/p/ulib/
-           - http://nothings.org/computer/judy/
-
-        * Allow to optionally use linear probing which usually has better
-          performance for random input. Double hashing is still the default as it
-          is more robust to certain non-random input.
-
-        * Added Wang's integer hash function (not used by default). This hash
-          function is more robust to certain non-random input.
-
-  2011-02-14 (0.2.5):
-
-    * Allow to declare global functions.
-
-  2009-09-26 (0.2.4):
-
-    * Improve portability
-
-  2008-09-19 (0.2.3):
-
-        * Corrected the example
-        * Improved interfaces
-
-  2008-09-11 (0.2.2):
-
-        * Improved speed a little in kh_put()
-
-  2008-09-10 (0.2.1):
-
-        * Added kh_clear()
-        * Fixed a compiling error
-
-  2008-09-02 (0.2.0):
-
-        * Changed to token concatenation which increases flexibility.
-
-  2008-08-31 (0.1.2):
-
-        * Fixed a bug in kh_get(), which has not been tested previously.
-
-  2008-08-31 (0.1.1):
-
-        * Added destructor
-*/
-
-#ifndef __AC_KHASH_H
-#define __AC_KHASH_H
-
-/*!
-  @header
-
-  Generic hash table library.
- */
-
-#define AC_VERSION_KHASH_H "0.2.8"
-
-#include <limits.h>
-#include <stdlib.h>
-#include <string.h>
-
-/* compiler specific configuration */
-
-#if UINT_MAX == 0xffffffffu
-typedef unsigned int khint32_t;
-#elif ULONG_MAX == 0xffffffffu
-typedef unsigned long khint32_t;
-#endif
-
-#if ULONG_MAX == ULLONG_MAX
-typedef unsigned long khint64_t;
-#else
-typedef unsigned long long khint64_t;
-#endif
-
-#ifndef kh_inline
-#ifdef _MSC_VER
-#define kh_inline __inline
-#else
-#define kh_inline inline
-#endif
-#endif /* kh_inline */
-
-#ifndef klib_unused
-#if (defined __clang__ && __clang_major__ >= 3) || (defined __GNUC__ && __GNUC__ >= 3)
-#define klib_unused __attribute__((__unused__))
-#else
-#define klib_unused
-#endif
-#endif /* klib_unused */
-
-typedef khint32_t khint_t;
-typedef khint_t khiter_t;
-
-#define __ac_isempty(flag, i) ((flag[i >> 4] >> ((i & 0xfU) << 1)) & 2)
-#define __ac_isdel(flag, i) ((flag[i >> 4] >> ((i & 0xfU) << 1)) & 1)
-#define __ac_iseither(flag, i) ((flag[i >> 4] >> ((i & 0xfU) << 1)) & 3)
-#define __ac_set_isdel_false(flag, i) (flag[i >> 4] &= ~(1ul << ((i & 0xfU) << 1)))
-#define __ac_set_isempty_false(flag, i) (flag[i >> 4] &= ~(2ul << ((i & 0xfU) << 1)))
-#define __ac_set_isboth_false(flag, i) (flag[i >> 4] &= ~(3ul << ((i & 0xfU) << 1)))
-#define __ac_set_isdel_true(flag, i) (flag[i >> 4] |= 1ul << ((i & 0xfU) << 1))
-
-#define __ac_fsize(m) ((m) < 16 ? 1 : (m) >> 4)
-
-#ifndef kroundup32
-#define kroundup32(x)                                                                           \
-  (--(x), (x) |= (x) >> 1, (x) |= (x) >> 2, (x) |= (x) >> 4, (x) |= (x) >> 8, (x) |= (x) >> 16, \
-   ++(x))
-#endif
-
-#ifndef kcalloc
-#define kcalloc(N, Z) calloc(N, Z)
-#endif
-#ifndef kmalloc
-#define kmalloc(Z) malloc(Z)
-#endif
-#ifndef krealloc
-#define krealloc(P, Z) realloc(P, Z)
-#endif
-#ifndef kfree
-#define kfree(P) free(P)
-#endif
-
-static const double __ac_HASH_UPPER = 0.77;
-
-#define __KHASH_TYPE(name, khkey_t, khval_t)          \
-  typedef struct kh_##name##_s {                      \
-    khint_t n_buckets, size, n_occupied, upper_bound; \
-    khint32_t* flags;                                 \
-    khkey_t* keys;                                    \
-    khval_t* vals;                                    \
-  } kh_##name##_t;
-
-#define __KHASH_PROTOTYPES(name, khkey_t, khval_t)                       \
-  extern kh_##name##_t* kh_init_##name(void);                            \
-  extern void kh_destroy_##name(kh_##name##_t* h);                       \
-  extern void kh_clear_##name(kh_##name##_t* h);                         \
-  extern khint_t kh_get_##name(const kh_##name##_t* h, khkey_t key);     \
-  extern int kh_resize_##name(kh_##name##_t* h, khint_t new_n_buckets);  \
-  extern khint_t kh_put_##name(kh_##name##_t* h, khkey_t key, int* ret); \
-  extern void kh_del_##name(kh_##name##_t* h, khint_t x);
-
-#define __KHASH_IMPL(name, SCOPE, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal)          \
-  SCOPE kh_##name##_t* kh_init_##name(void) {                                                      \
-    return (kh_##name##_t*)kcalloc(1, sizeof(kh_##name##_t));                                      \
-  }                                                                                                \
-  SCOPE void kh_destroy_##name(kh_##name##_t* h) {                                                 \
-    if (h) {                                                                                       \
-      kfree((void*)h->keys);                                                                       \
-      kfree(h->flags);                                                                             \
-      kfree((void*)h->vals);                                                                       \
-      kfree(h);                                                                                    \
-    }                                                                                              \
-  }                                                                                                \
-  SCOPE void kh_clear_##name(kh_##name##_t* h) {                                                   \
-    if (h && h->flags) {                                                                           \
-      memset(h->flags, 0xaa, __ac_fsize(h->n_buckets) * sizeof(khint32_t));                        \
-      h->size = h->n_occupied = 0;                                                                 \
-    }                                                                                              \
-  }                                                                                                \
-  SCOPE khint_t kh_get_##name(const kh_##name##_t* h, khkey_t key) {                               \
-    if (h->n_buckets) {                                                                            \
-      khint_t k, i, last, mask, step = 0;                                                          \
-      mask = h->n_buckets - 1;                                                                     \
-      k = __hash_func(key);                                                                        \
-      i = k & mask;                                                                                \
-      last = i;                                                                                    \
-      while (!__ac_isempty(h->flags, i) &&                                                         \
-             (__ac_isdel(h->flags, i) || !__hash_equal(h->keys[i], key))) {                        \
-        i = (i + (++step)) & mask;                                                                 \
-        if (i == last)                                                                             \
-          return h->n_buckets;                                                                     \
-      }                                                                                            \
-      return __ac_iseither(h->flags, i) ? h->n_buckets : i;                                        \
-    } else                                                                                         \
-      return 0;                                                                                    \
-  }                                                                                                \
-  SCOPE int kh_resize_##name(                                                                      \
-      kh_##name##_t* h,                                                                            \
-      khint_t new_n_buckets) { /* This function uses 0.25*n_buckets bytes of working space instead \
-                                  of [sizeof(key_t+val_t)+.25]*n_buckets. */                       \
-    khint32_t* new_flags = 0;                                                                      \
-    khint_t j = 1;                                                                                 \
-    {                                                                                              \
-      kroundup32(new_n_buckets);                                                                   \
-      if (new_n_buckets < 4)                                                                       \
-        new_n_buckets = 4;                                                                         \
-      if (h->size >= (khint_t)(new_n_buckets * __ac_HASH_UPPER + 0.5))                             \
-        j = 0; /* requested size is too small */                                                   \
-      else {   /* hash table size to be changed (shrink or expand); rehash */                      \
-        new_flags = (khint32_t*)kmalloc(__ac_fsize(new_n_buckets) * sizeof(khint32_t));            \
-        if (!new_flags)                                                                            \
-          return -1;                                                                               \
-        memset(new_flags, 0xaa, __ac_fsize(new_n_buckets) * sizeof(khint32_t));                    \
-        if (h->n_buckets < new_n_buckets) { /* expand */                                           \
-          khkey_t* new_keys = (khkey_t*)krealloc((void*)h->keys, new_n_buckets * sizeof(khkey_t)); \
-          if (!new_keys) {                                                                         \
-            kfree(new_flags);                                                                      \
-            return -1;                                                                             \
-          }                                                                                        \
-          h->keys = new_keys;                                                                      \
-          if (kh_is_map) {                                                                         \
-            khval_t* new_vals =                                                                    \
-                (khval_t*)krealloc((void*)h->vals, new_n_buckets * sizeof(khval_t));               \
-            if (!new_vals) {                                                                       \
-              kfree(new_flags);                                                                    \
-              return -1;                                                                           \
-            }                                                                                      \
-            h->vals = new_vals;                                                                    \
-          }                                                                                        \
-        } /* otherwise shrink */                                                                   \
-      }                                                                                            \
-    }                                                                                              \
-    if (j) { /* rehashing is needed */                                                             \
-      for (j = 0; j != h->n_buckets; ++j) {                                                        \
-        if (__ac_iseither(h->flags, j) == 0) {                                                     \
-          khkey_t key = h->keys[j];                                                                \
-          khval_t val;                                                                             \
-          khint_t new_mask;                                                                        \
-          new_mask = new_n_buckets - 1;                                                            \
-          if (kh_is_map)                                                                           \
-            val = h->vals[j];                                                                      \
-          __ac_set_isdel_true(h->flags, j);                                                        \
-          while (1) { /* kick-out process; sort of like in Cuckoo hashing */                       \
-            khint_t k, i, step = 0;                                                                \
-            k = __hash_func(key);                                                                  \
-            i = k & new_mask;                                                                      \
-            while (!__ac_isempty(new_flags, i))                                                    \
-              i = (i + (++step)) & new_mask;                                                       \
-            __ac_set_isempty_false(new_flags, i);                                                  \
-            if (i < h->n_buckets &&                                                                \
-                __ac_iseither(h->flags, i) == 0) { /* kick out the existing element */             \
-              {                                                                                    \
-                khkey_t tmp = h->keys[i];                                                          \
-                h->keys[i] = key;                                                                  \
-                key = tmp;                                                                         \
-              }                                                                                    \
-              if (kh_is_map) {                                                                     \
-                khval_t tmp = h->vals[i];                                                          \
-                h->vals[i] = val;                                                                  \
-                val = tmp;                                                                         \
-              }                                                                                    \
-              __ac_set_isdel_true(h->flags, i); /* mark it as deleted in the old hash table */     \
-            } else {                            /* write the element and jump out of the loop */   \
-              h->keys[i] = key;                                                                    \
-              if (kh_is_map)                                                                       \
-                h->vals[i] = val;                                                                  \
-              break;                                                                               \
-            }                                                                                      \
-          }                                                                                        \
-        }                                                                                          \
-      }                                                                                            \
-      if (h->n_buckets > new_n_buckets) { /* shrink the hash table */                              \
-        h->keys = (khkey_t*)krealloc((void*)h->keys, new_n_buckets * sizeof(khkey_t));             \
-        if (kh_is_map)                                                                             \
-          h->vals = (khval_t*)krealloc((void*)h->vals, new_n_buckets * sizeof(khval_t));           \
-      }                                                                                            \
-      kfree(h->flags); /* free the working space */                                                \
-      h->flags = new_flags;                                                                        \
-      h->n_buckets = new_n_buckets;                                                                \
-      h->n_occupied = h->size;                                                                     \
-      h->upper_bound = (khint_t)(h->n_buckets * __ac_HASH_UPPER + 0.5);                            \
-    }                                                                                              \
-    return 0;                                                                                      \
-  }                                                                                                \
-  SCOPE khint_t kh_put_##name(kh_##name##_t* h, khkey_t key, int* ret) {                           \
-    khint_t x;                                                                                     \
-    if (h->n_occupied >= h->upper_bound) { /* update the hash table */                             \
-      if (h->n_buckets > (h->size << 1)) {                                                         \
-        if (kh_resize_##name(h, h->n_buckets - 1) < 0) { /* clear "deleted" elements */            \
-          *ret = -1;                                                                               \
-          return h->n_buckets;                                                                     \
-        }                                                                                          \
-      } else if (kh_resize_##name(h, h->n_buckets + 1) < 0) { /* expand the hash table */          \
-        *ret = -1;                                                                                 \
-        return h->n_buckets;                                                                       \
-      }                                                                                            \
-    } /* TODO: to implement automatically shrinking; resize() already support shrinking */         \
-    {                                                                                              \
-      khint_t k, i, site, last, mask = h->n_buckets - 1, step = 0;                                 \
-      x = site = h->n_buckets;                                                                     \
-      k = __hash_func(key);                                                                        \
-      i = k & mask;                                                                                \
-      if (__ac_isempty(h->flags, i))                                                               \
-        x = i; /* for speed up */                                                                  \
-      else {                                                                                       \
-        last = i;                                                                                  \
-        while (!__ac_isempty(h->flags, i) &&                                                       \
-               (__ac_isdel(h->flags, i) || !__hash_equal(h->keys[i], key))) {                      \
-          if (__ac_isdel(h->flags, i))                                                             \
-            site = i;                                                                              \
-          i = (i + (++step)) & mask;                                                               \
-          if (i == last) {                                                                         \
-            x = site;                                                                              \
-            break;                                                                                 \
-          }                                                                                        \
-        }                                                                                          \
-        if (x == h->n_buckets) {                                                                   \
-          if (__ac_isempty(h->flags, i) && site != h->n_buckets)                                   \
-            x = site;                                                                              \
-          else                                                                                     \
-            x = i;                                                                                 \
-        }                                                                                          \
-      }                                                                                            \
-    }                                                                                              \
-    if (__ac_isempty(h->flags, x)) { /* not present at all */                                      \
-      h->keys[x] = key;                                                                            \
-      __ac_set_isboth_false(h->flags, x);                                                          \
-      ++h->size;                                                                                   \
-      ++h->n_occupied;                                                                             \
-      *ret = 1;                                                                                    \
-    } else if (__ac_isdel(h->flags, x)) { /* deleted */                                            \
-      h->keys[x] = key;                                                                            \
-      __ac_set_isboth_false(h->flags, x);                                                          \
-      ++h->size;                                                                                   \
-      *ret = 2;                                                                                    \
-    } else                                                                                         \
-      *ret = 0; /* Don't touch h->keys[x] if present and not deleted */                            \
-    return x;                                                                                      \
-  }                                                                                                \
-  SCOPE void kh_del_##name(kh_##name##_t* h, khint_t x) {                                          \
-    if (x != h->n_buckets && !__ac_iseither(h->flags, x)) {                                        \
-      __ac_set_isdel_true(h->flags, x);                                                            \
-      --h->size;                                                                                   \
-    }                                                                                              \
-  }
-
-#define KHASH_DECLARE(name, khkey_t, khval_t) \
-  __KHASH_TYPE(name, khkey_t, khval_t)        \
-  __KHASH_PROTOTYPES(name, khkey_t, khval_t)
-
-#define KHASH_INIT2(name, SCOPE, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal) \
-  __KHASH_TYPE(name, khkey_t, khval_t)                                                   \
-  __KHASH_IMPL(name, SCOPE, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal)
-
-#define KHASH_INIT(name, khkey_t, khval_t, kh_is_map, __hash_func, __hash_equal)            \
-  KHASH_INIT2(name, static kh_inline klib_unused, khkey_t, khval_t, kh_is_map, __hash_func, \
-              __hash_equal)
-
-/* --- BEGIN OF HASH FUNCTIONS --- */
-
-/*! @function
-  @abstract     Integer hash function
-  @param  key   The integer [khint32_t]
-  @return       The hash value [khint_t]
- */
-#define kh_int_hash_func(key) (khint32_t)(key)
-/*! @function
-  @abstract     Integer comparison function
- */
-#define kh_int_hash_equal(a, b) ((a) == (b))
-/*! @function
-  @abstract     64-bit integer hash function
-  @param  key   The integer [khint64_t]
-  @return       The hash value [khint_t]
- */
-#define kh_int64_hash_func(key) (khint32_t)((key) >> 33 ^ (key) ^ (key) << 11)
-/*! @function
-  @abstract     64-bit integer comparison function
- */
-#define kh_int64_hash_equal(a, b) ((a) == (b))
-/*! @function
-  @abstract     const char* hash function
-  @param  s     Pointer to a null terminated string
-  @return       The hash value
- */
-static kh_inline khint_t __ac_X31_hash_string(const char* s) {
-  khint_t h = (khint_t)*s;
-  if (h)
-    for (++s; *s; ++s)
-      h = (h << 5) - h + (khint_t)*s;
-  return h;
-}
-/*! @function
-  @abstract     Another interface to const char* hash function
-  @param  key   Pointer to a null terminated string [const char*]
-  @return       The hash value [khint_t]
- */
-#define kh_str_hash_func(key) __ac_X31_hash_string(key)
-/*! @function
-  @abstract     Const char* comparison function
- */
-#define kh_str_hash_equal(a, b) (strcmp(a, b) == 0)
-
-static kh_inline khint_t __ac_Wang_hash(khint_t key) {
-  key += ~(key << 15);
-  key ^= (key >> 10);
-  key += (key << 3);
-  key ^= (key >> 6);
-  key += ~(key << 11);
-  key ^= (key >> 16);
-  return key;
-}
-#define kh_int_hash_func2(key) __ac_Wang_hash((khint_t)key)
-
-/* --- END OF HASH FUNCTIONS --- */
-
-/* Other convenient macros... */
-
-/*!
-  @abstract Type of the hash table.
-  @param  name  Name of the hash table [symbol]
- */
-#define khash_t(name) kh_##name##_t
-
-/*! @function
-  @abstract     Initiate a hash table.
-  @param  name  Name of the hash table [symbol]
-  @return       Pointer to the hash table [khash_t(name)*]
- */
-#define kh_init(name) kh_init_##name()
-
-/*! @function
-  @abstract     Destroy a hash table.
-  @param  name  Name of the hash table [symbol]
-  @param  h     Pointer to the hash table [khash_t(name)*]
- */
-#define kh_destroy(name, h) kh_destroy_##name(h)
-
-/*! @function
-  @abstract     Reset a hash table without deallocating memory.
-  @param  name  Name of the hash table [symbol]
-  @param  h     Pointer to the hash table [khash_t(name)*]
- */
-#define kh_clear(name, h) kh_clear_##name(h)
-
-/*! @function
-  @abstract     Resize a hash table.
-  @param  name  Name of the hash table [symbol]
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @param  s     New size [khint_t]
- */
-#define kh_resize(name, h, s) kh_resize_##name(h, s)
-
-/*! @function
-  @abstract     Insert a key to the hash table.
-  @param  name  Name of the hash table [symbol]
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @param  k     Key [type of keys]
-  @param  r     Extra return code: -1 if the operation failed;
-                0 if the key is present in the hash table;
-                1 if the bucket is empty (never used); 2 if the element in
-                                the bucket has been deleted [int*]
-  @return       Iterator to the inserted element [khint_t]
- */
-#define kh_put(name, h, k, r) kh_put_##name(h, k, r)
-
-/*! @function
-  @abstract     Retrieve a key from the hash table.
-  @param  name  Name of the hash table [symbol]
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @param  k     Key [type of keys]
-  @return       Iterator to the found element, or kh_end(h) if the element is absent [khint_t]
- */
-#define kh_get(name, h, k) kh_get_##name(h, k)
-
-/*! @function
-  @abstract     Remove a key from the hash table.
-  @param  name  Name of the hash table [symbol]
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @param  k     Iterator to the element to be deleted [khint_t]
- */
-#define kh_del(name, h, k) kh_del_##name(h, k)
-
-/*! @function
-  @abstract     Test whether a bucket contains data.
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @param  x     Iterator to the bucket [khint_t]
-  @return       1 if containing data; 0 otherwise [int]
- */
-#define kh_exist(h, x) (!__ac_iseither((h)->flags, (x)))
-
-/*! @function
-  @abstract     Get key given an iterator
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @param  x     Iterator to the bucket [khint_t]
-  @return       Key [type of keys]
- */
-#define kh_key(h, x) ((h)->keys[x])
-
-/*! @function
-  @abstract     Get value given an iterator
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @param  x     Iterator to the bucket [khint_t]
-  @return       Value [type of values]
-  @discussion   For hash sets, calling this results in segfault.
- */
-#define kh_val(h, x) ((h)->vals[x])
-
-/*! @function
-  @abstract     Alias of kh_val()
- */
-#define kh_value(h, x) ((h)->vals[x])
-
-/*! @function
-  @abstract     Get the start iterator
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @return       The start iterator [khint_t]
- */
-#define kh_begin(h) (khint_t)(0)
-
-/*! @function
-  @abstract     Get the end iterator
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @return       The end iterator [khint_t]
- */
-#define kh_end(h) ((h)->n_buckets)
-
-/*! @function
-  @abstract     Get the number of elements in the hash table
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @return       Number of elements in the hash table [khint_t]
- */
-#define kh_size(h) ((h)->size)
-
-/*! @function
-  @abstract     Get the number of buckets in the hash table
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @return       Number of buckets in the hash table [khint_t]
- */
-#define kh_n_buckets(h) ((h)->n_buckets)
-
-/*! @function
-  @abstract     Iterate over the entries in the hash table
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @param  kvar  Variable to which key will be assigned
-  @param  vvar  Variable to which value will be assigned
-  @param  code  Block of code to execute
- */
-#define kh_foreach(h, kvar, vvar, code)                \
-  {                                                    \
-    khint_t __i;                                       \
-    for (__i = kh_begin(h); __i != kh_end(h); ++__i) { \
-      if (!kh_exist(h, __i))                           \
-        continue;                                      \
-      (kvar) = kh_key(h, __i);                         \
-      (vvar) = kh_val(h, __i);                         \
-      code;                                            \
-    }                                                  \
-  }
-
-/*! @function
-  @abstract     Iterate over the values in the hash table
-  @param  h     Pointer to the hash table [khash_t(name)*]
-  @param  vvar  Variable to which value will be assigned
-  @param  code  Block of code to execute
- */
-#define kh_foreach_value(h, vvar, code)                \
-  {                                                    \
-    khint_t __i;                                       \
-    for (__i = kh_begin(h); __i != kh_end(h); ++__i) { \
-      if (!kh_exist(h, __i))                           \
-        continue;                                      \
-      (vvar) = kh_val(h, __i);                         \
-      code;                                            \
-    }                                                  \
-  }
-
-/* More convenient interfaces */
-
-/*! @function
-  @abstract     Instantiate a hash set containing integer keys
-  @param  name  Name of the hash table [symbol]
- */
-#define KHASH_SET_INIT_INT(name) \
-  KHASH_INIT(name, khint32_t, char, 0, kh_int_hash_func, kh_int_hash_equal)
-
-/*! @function
-  @abstract     Instantiate a hash map containing integer keys
-  @param  name  Name of the hash table [symbol]
-  @param  khval_t  Type of values [type]
- */
-#define KHASH_MAP_INIT_INT(name, khval_t) \
-  KHASH_INIT(name, khint32_t, khval_t, 1, kh_int_hash_func, kh_int_hash_equal)
-
-/*! @function
-  @abstract     Instantiate a hash set containing 64-bit integer keys
-  @param  name  Name of the hash table [symbol]
- */
-#define KHASH_SET_INIT_INT64(name) \
-  KHASH_INIT(name, khint64_t, char, 0, kh_int64_hash_func, kh_int64_hash_equal)
-
-/*! @function
-  @abstract     Instantiate a hash map containing 64-bit integer keys
-  @param  name  Name of the hash table [symbol]
-  @param  khval_t  Type of values [type]
- */
-#define KHASH_MAP_INIT_INT64(name, khval_t) \
-  KHASH_INIT(name, khint64_t, khval_t, 1, kh_int64_hash_func, kh_int64_hash_equal)
-
-typedef const char* kh_cstr_t;
-/*! @function
-  @abstract     Instantiate a hash map containing const char* keys
-  @param  name  Name of the hash table [symbol]
- */
-#define KHASH_SET_INIT_STR(name) \
-  KHASH_INIT(name, kh_cstr_t, char, 0, kh_str_hash_func, kh_str_hash_equal)
-
-/*! @function
-  @abstract     Instantiate a hash map containing const char* keys
-  @param  name  Name of the hash table [symbol]
-  @param  khval_t  Type of values [type]
- */
-#define KHASH_MAP_INIT_STR(name, khval_t) \
-  KHASH_INIT(name, kh_cstr_t, khval_t, 1, kh_str_hash_func, kh_str_hash_equal)
-
-#endif /* __AC_KHASH_H */
+typedef struct CompilerInclude {
+    char* path;
+    int offset;
+} CompilerInclude;
+
+static CompilerInclude compiler_includes[12] = {
+    { "__include__/all/reflect.h", 0 },
+    { "__include__/all/stdalign.h", 2262 },
+    { "__include__/all/stdatomic.h", 2426 },
+    { "__include__/all/stdnoreturn.h", 6305 },
+    { "__include__/all/_map.h", 6390 },
+    { "__include__/all/_vec.h", 48381 },
+    { "__include__/linux/float.h", 87492 },
+    { "__include__/linux/stdarg.h", 88534 },
+    { "__include__/linux/stdbool.h", 90166 },
+    { "__include__/linux/stddef.h", 90306 },
+    { "__include__/linux/stdnoreturn.h", 90555 },
+    { "__include__/win/stddef.h", 90640 },
+};
+static unsigned char compiler_include_blob[90777] = {
+35, 112, 114, 97, 103, 109, 97, 32, 111, 110, 99, 101, 10, 10, 35,
+105, 110, 99, 108, 117, 100, 101, 32, 60, 115, 116, 100, 100, 101,
+102, 46, 104, 62, 10, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60,
+115, 116, 100, 105, 110, 116, 46, 104, 62, 10, 10, 116, 121, 112, 101,
+100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 95, 82, 101, 102,
+108, 101, 99, 116, 84, 121, 112, 101, 32, 95, 82, 101, 102, 108, 101,
+99, 116, 84, 121, 112, 101, 59, 10, 116, 121, 112, 101, 100, 101, 102,
+32, 115, 116, 114, 117, 99, 116, 32, 95, 82, 101, 102, 108, 101, 99,
+116, 84, 121, 112, 101, 77, 101, 109, 98, 101, 114, 32, 95, 82, 101,
+102, 108, 101, 99, 116, 84, 121, 112, 101, 77, 101, 109, 98, 101, 114,
+59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99,
+116, 32, 95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112, 101, 69,
+110, 117, 109, 101, 114, 97, 110, 116, 32, 95, 82, 101, 102, 108, 101,
+99, 116, 84, 121, 112, 101, 69, 110, 117, 109, 101, 114, 97, 110, 116,
+59, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 82, 69, 70, 76,
+69, 67, 84, 95, 75, 73, 78, 68, 95, 86, 79, 73, 68, 32, 48, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 95, 82, 69, 70, 76, 69, 67, 84, 95,
+75, 73, 78, 68, 95, 66, 79, 79, 76, 32, 49, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 82, 69, 70, 76, 69, 67, 84, 95, 75, 73, 78, 68,
+95, 67, 72, 65, 82, 32, 50, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+95, 82, 69, 70, 76, 69, 67, 84, 95, 75, 73, 78, 68, 95, 83, 72, 79,
+82, 84, 32, 51, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 82, 69,
+70, 76, 69, 67, 84, 95, 75, 73, 78, 68, 95, 73, 78, 84, 32, 52, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 95, 82, 69, 70, 76, 69, 67, 84,
+95, 75, 73, 78, 68, 95, 76, 79, 78, 71, 32, 53, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 82, 69, 70, 76, 69, 67, 84, 95, 75, 73, 78, 68,
+95, 70, 76, 79, 65, 84, 32, 54, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 95, 82, 69, 70, 76, 69, 67, 84, 95, 75, 73, 78, 68, 95, 68, 79,
+85, 66, 76, 69, 32, 55, 10, 47, 47, 32, 84, 79, 68, 79, 58, 32, 76,
+68, 79, 85, 66, 76, 69, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+82, 69, 70, 76, 69, 67, 84, 95, 75, 73, 78, 68, 95, 69, 78, 85, 77,
+32, 57, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 82, 69, 70, 76,
+69, 67, 84, 95, 75, 73, 78, 68, 95, 80, 84, 82, 32, 49, 48, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 95, 82, 69, 70, 76, 69, 67, 84, 95,
+75, 73, 78, 68, 95, 70, 85, 78, 67, 32, 49, 49, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 82, 69, 70, 76, 69, 67, 84, 95, 75, 73, 78, 68,
+95, 65, 82, 82, 65, 89, 32, 49, 50, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 95, 82, 69, 70, 76, 69, 67, 84, 95, 75, 73, 78, 68, 95, 86,
+76, 65, 32, 49, 51, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 82,
+69, 70, 76, 69, 67, 84, 95, 75, 73, 78, 68, 95, 83, 84, 82, 85, 67,
+84, 32, 49, 52, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 82, 69,
+70, 76, 69, 67, 84, 95, 75, 73, 78, 68, 95, 85, 78, 73, 79, 78, 32,
+49, 53, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 82, 69, 70,
+76, 69, 67, 84, 95, 84, 89, 80, 69, 70, 76, 65, 71, 95, 85, 78, 83,
+73, 71, 78, 69, 68, 32, 48, 120, 48, 48, 48, 49, 32, 32, 47, 47, 32,
+73, 110, 116, 101, 103, 101, 114, 32, 116, 121, 112, 101, 115, 32,
+111, 110, 108, 121, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 82,
+69, 70, 76, 69, 67, 84, 95, 84, 89, 80, 69, 70, 76, 65, 71, 95, 65,
+84, 79, 77, 73, 67, 32, 48, 120, 48, 48, 48, 50, 32, 32, 32, 32, 47,
+47, 32, 73, 110, 116, 101, 103, 101, 114, 32, 116, 121, 112, 101, 115,
+32, 111, 110, 108, 121, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+82, 69, 70, 76, 69, 67, 84, 95, 84, 89, 80, 69, 70, 76, 65, 71, 95,
+70, 76, 69, 88, 73, 66, 76, 69, 32, 48, 120, 48, 48, 48, 52, 32, 32,
+47, 47, 32, 65, 114, 114, 97, 121, 115, 32, 97, 116, 32, 101, 110,
+100, 32, 111, 102, 32, 115, 116, 114, 117, 99, 116, 115, 32, 111, 110,
+108, 121, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 82, 69, 70,
+76, 69, 67, 84, 95, 84, 89, 80, 69, 70, 76, 65, 71, 95, 80, 65, 67,
+75, 69, 68, 32, 48, 120, 48, 48, 48, 56, 32, 32, 32, 32, 47, 47, 32,
+83, 116, 114, 117, 99, 116, 115, 32, 97, 110, 100, 32, 117, 110, 105,
+111, 110, 115, 32, 111, 110, 108, 121, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 95, 82, 69, 70, 76, 69, 67, 84, 95, 84, 89, 80, 69, 70,
+76, 65, 71, 95, 86, 65, 82, 73, 65, 68, 73, 67, 32, 48, 120, 48, 48,
+49, 48, 32, 32, 47, 47, 32, 70, 117, 110, 99, 116, 105, 111, 110, 115,
+32, 111, 110, 108, 121, 10, 10, 35, 105, 102, 100, 101, 102, 32, 95,
+77, 83, 67, 95, 86, 69, 82, 10, 35, 112, 114, 97, 103, 109, 97, 32,
+119, 97, 114, 110, 105, 110, 103, 40, 112, 117, 115, 104, 41, 10, 35,
+112, 114, 97, 103, 109, 97, 32, 119, 97, 114, 110, 105, 110, 103, 40,
+100, 105, 115, 97, 98, 108, 101, 32, 58, 32, 52, 50, 48, 48, 41, 32,
+32, 47, 47, 32, 90, 101, 114, 111, 45, 115, 105, 122, 101, 100, 32,
+97, 114, 114, 97, 121, 46, 10, 35, 112, 114, 97, 103, 109, 97, 32,
+119, 97, 114, 110, 105, 110, 103, 40, 100, 105, 115, 97, 98, 108, 101,
+32, 58, 32, 52, 50, 48, 49, 41, 32, 32, 47, 47, 32, 85, 110, 110, 97,
+109, 101, 100, 32, 117, 110, 105, 111, 110, 46, 10, 35, 101, 110, 100,
+105, 102, 10, 10, 115, 116, 114, 117, 99, 116, 32, 95, 82, 101, 102,
+108, 101, 99, 116, 84, 121, 112, 101, 77, 101, 109, 98, 101, 114, 32,
+123, 10, 32, 32, 95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112,
+101, 42, 32, 116, 121, 112, 101, 59, 10, 32, 32, 99, 104, 97, 114, 42,
+32, 110, 97, 109, 101, 59, 10, 32, 32, 105, 110, 116, 51, 50, 95, 116,
+32, 97, 108, 105, 103, 110, 59, 10, 32, 32, 105, 110, 116, 51, 50, 95,
+116, 32, 111, 102, 102, 115, 101, 116, 59, 10, 32, 32, 105, 110, 116,
+51, 50, 95, 116, 32, 98, 105, 116, 95, 119, 105, 100, 116, 104, 59,
+32, 32, 32, 47, 47, 32, 45, 49, 32, 105, 102, 32, 110, 111, 116, 32,
+98, 105, 116, 102, 105, 101, 108, 100, 10, 32, 32, 105, 110, 116, 51,
+50, 95, 116, 32, 98, 105, 116, 95, 111, 102, 102, 115, 101, 116, 59,
+32, 32, 47, 47, 32, 45, 49, 32, 105, 102, 32, 110, 111, 116, 32, 98,
+105, 116, 102, 105, 101, 108, 100, 10, 125, 59, 10, 10, 115, 116, 114,
+117, 99, 116, 32, 95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112,
+101, 69, 110, 117, 109, 101, 114, 97, 110, 116, 32, 123, 10, 32, 32,
+95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112, 101, 69, 110, 117,
+109, 101, 114, 97, 110, 116, 42, 32, 110, 101, 120, 116, 59, 10, 32,
+32, 99, 104, 97, 114, 42, 32, 110, 97, 109, 101, 59, 10, 32, 32, 105,
+110, 116, 51, 50, 95, 116, 32, 118, 97, 108, 117, 101, 59, 10, 125,
+59, 10, 10, 115, 116, 114, 117, 99, 116, 32, 95, 82, 101, 102, 108,
+101, 99, 116, 84, 121, 112, 101, 32, 123, 10, 32, 32, 99, 104, 97,
+114, 42, 32, 110, 97, 109, 101, 59, 32, 32, 47, 47, 32, 69, 105, 116,
+104, 101, 114, 32, 116, 104, 101, 32, 98, 117, 105, 108, 116, 45, 105,
+110, 32, 116, 121, 112, 101, 110, 97, 109, 101, 44, 32, 111, 114, 32,
+116, 104, 101, 32, 117, 115, 101, 114, 32, 100, 101, 99, 108, 97, 114,
+101, 100, 32, 111, 110, 101, 46, 10, 32, 32, 105, 110, 116, 51, 50,
+95, 116, 32, 115, 105, 122, 101, 59, 10, 32, 32, 105, 110, 116, 51,
+50, 95, 116, 32, 97, 108, 105, 103, 110, 59, 10, 32, 32, 105, 110,
+116, 51, 50, 95, 116, 32, 107, 105, 110, 100, 59, 32, 32, 32, 47, 47,
+32, 79, 110, 101, 32, 111, 102, 32, 95, 82, 69, 70, 76, 69, 67, 84,
+95, 75, 73, 78, 68, 95, 42, 46, 10, 32, 32, 105, 110, 116, 51, 50, 95,
+116, 32, 102, 108, 97, 103, 115, 59, 32, 32, 47, 47, 32, 67, 111, 109,
+98, 105, 110, 97, 116, 105, 111, 110, 32, 111, 102, 32, 95, 82, 69,
+70, 76, 69, 67, 84, 95, 84, 89, 80, 69, 70, 76, 65, 71, 95, 42, 46,
+10, 10, 32, 32, 117, 110, 105, 111, 110, 32, 123, 10, 32, 32, 32, 32,
+115, 116, 114, 117, 99, 116, 32, 123, 10, 32, 32, 32, 32, 32, 32, 95,
+82, 101, 102, 108, 101, 99, 116, 84, 121, 112, 101, 42, 32, 98, 97,
+115, 101, 59, 10, 32, 32, 32, 32, 32, 32, 105, 110, 116, 51, 50, 95,
+116, 32, 108, 101, 110, 59, 10, 32, 32, 32, 32, 125, 32, 97, 114, 114,
+59, 10, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32, 123, 10, 32,
+32, 32, 32, 32, 32, 95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112,
+101, 42, 32, 98, 97, 115, 101, 59, 10, 32, 32, 32, 32, 125, 32, 112,
+116, 114, 59, 10, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32,
+123, 10, 32, 32, 32, 32, 32, 32, 115, 105, 122, 101, 95, 116, 32, 110,
+117, 109, 95, 109, 101, 109, 98, 101, 114, 115, 59, 10, 32, 32, 32,
+32, 32, 32, 95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112, 101,
+77, 101, 109, 98, 101, 114, 32, 109, 101, 109, 98, 101, 114, 115, 91,
+93, 59, 10, 32, 32, 32, 32, 125, 32, 115, 117, 59, 10, 32, 32, 32, 32,
+115, 116, 114, 117, 99, 116, 32, 123, 10, 32, 32, 32, 32, 32, 32, 95,
+82, 101, 102, 108, 101, 99, 116, 84, 121, 112, 101, 42, 32, 114, 101,
+116, 117, 114, 110, 95, 116, 121, 59, 10, 32, 32, 32, 32, 32, 32, 115,
+105, 122, 101, 95, 116, 32, 110, 117, 109, 95, 112, 97, 114, 97, 109,
+115, 59, 10, 32, 32, 32, 32, 32, 32, 95, 82, 101, 102, 108, 101, 99,
+116, 84, 121, 112, 101, 42, 32, 112, 97, 114, 97, 109, 115, 91, 93,
+59, 10, 32, 32, 32, 32, 125, 32, 102, 117, 110, 99, 59, 10, 32, 32,
+32, 32, 115, 116, 114, 117, 99, 116, 32, 123, 10, 32, 32, 32, 32, 32,
+32, 95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112, 101, 69, 110,
+117, 109, 101, 114, 97, 110, 116, 42, 32, 101, 110, 117, 109, 115, 59,
+10, 32, 32, 32, 32, 125, 32, 101, 110, 117, 109, 101, 114, 59, 10, 32,
+32, 32, 32, 115, 116, 114, 117, 99, 116, 32, 123, 10, 32, 32, 32, 32,
+32, 32, 95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112, 101, 42,
+32, 118, 108, 97, 95, 115, 105, 122, 101, 59, 10, 32, 32, 32, 32, 32,
+32, 47, 47, 32, 108, 101, 110, 63, 10, 32, 32, 32, 32, 125, 32, 118,
+108, 97, 59, 10, 32, 32, 125, 59, 10, 125, 59, 10, 35, 105, 102, 100,
+101, 102, 32, 95, 77, 83, 67, 95, 86, 69, 82, 10, 35, 112, 114, 97,
+103, 109, 97, 32, 119, 97, 114, 110, 105, 110, 103, 40, 112, 111, 112,
+41, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105, 102, 32, 95, 95,
+100, 121, 105, 98, 105, 99, 99, 95, 95, 10, 101, 120, 116, 101, 114,
+110, 32, 95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112, 101, 42,
+32, 95, 82, 101, 102, 108, 101, 99, 116, 84, 121, 112, 101, 79, 102,
+40, 46, 46, 46, 41, 59, 10, 35, 101, 110, 100, 105, 102, 10, 0, 35,
+105, 102, 110, 100, 101, 102, 32, 95, 95, 83, 84, 68, 65, 76, 73, 71,
+78, 95, 72, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 95, 83, 84,
+68, 65, 76, 73, 71, 78, 95, 72, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 97, 108, 105, 103, 110, 97, 115, 32, 95, 65, 108, 105, 103,
+110, 97, 115, 10, 35, 100, 101, 102, 105, 110, 101, 32, 97, 108, 105,
+103, 110, 111, 102, 32, 95, 65, 108, 105, 103, 110, 111, 102, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 95, 95, 97, 108, 105, 103, 110, 97,
+115, 95, 105, 115, 95, 100, 101, 102, 105, 110, 101, 100, 32, 49, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 95, 95, 97, 108, 105, 103, 110,
+111, 102, 95, 105, 115, 95, 100, 101, 102, 105, 110, 101, 100, 32, 49,
+10, 10, 35, 101, 110, 100, 105, 102, 10, 0, 35, 105, 102, 110, 100,
+101, 102, 32, 95, 95, 83, 84, 68, 65, 84, 79, 77, 73, 67, 95, 72, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 95, 95, 83, 84, 68, 65, 84, 79,
+77, 73, 67, 95, 72, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 65,
+84, 79, 77, 73, 67, 95, 66, 79, 79, 76, 95, 76, 79, 67, 75, 95, 70,
+82, 69, 69, 32, 49, 10, 35, 100, 101, 102, 105, 110, 101, 32, 65, 84,
+79, 77, 73, 67, 95, 67, 72, 65, 82, 95, 76, 79, 67, 75, 95, 70, 82,
+69, 69, 32, 49, 10, 35, 100, 101, 102, 105, 110, 101, 32, 65, 84, 79,
+77, 73, 67, 95, 67, 72, 65, 82, 49, 54, 95, 84, 95, 76, 79, 67, 75,
+95, 70, 82, 69, 69, 32, 49, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+65, 84, 79, 77, 73, 67, 95, 67, 72, 65, 82, 51, 50, 95, 84, 95, 76,
+79, 67, 75, 95, 70, 82, 69, 69, 32, 49, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 65, 84, 79, 77, 73, 67, 95, 87, 67, 72, 65, 82, 95, 84,
+95, 76, 79, 67, 75, 95, 70, 82, 69, 69, 32, 49, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 65, 84, 79, 77, 73, 67, 95, 83, 72, 79, 82, 84, 95,
+76, 79, 67, 75, 95, 70, 82, 69, 69, 32, 49, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 65, 84, 79, 77, 73, 67, 95, 73, 78, 84, 95, 76, 79,
+67, 75, 95, 70, 82, 69, 69, 32, 49, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 65, 84, 79, 77, 73, 67, 95, 76, 79, 78, 71, 95, 76, 79, 67,
+75, 95, 70, 82, 69, 69, 32, 49, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 65, 84, 79, 77, 73, 67, 95, 76, 76, 79, 78, 71, 95, 76, 79, 67,
+75, 95, 70, 82, 69, 69, 32, 49, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 65, 84, 79, 77, 73, 67, 95, 80, 79, 73, 78, 84, 69, 82, 95, 76,
+79, 67, 75, 95, 70, 82, 69, 69, 32, 49, 10, 10, 116, 121, 112, 101,
+100, 101, 102, 32, 101, 110, 117, 109, 32, 123, 10, 32, 32, 109, 101,
+109, 111, 114, 121, 95, 111, 114, 100, 101, 114, 95, 114, 101, 108,
+97, 120, 101, 100, 44, 10, 32, 32, 109, 101, 109, 111, 114, 121, 95,
+111, 114, 100, 101, 114, 95, 99, 111, 110, 115, 117, 109, 101, 44, 10,
+32, 32, 109, 101, 109, 111, 114, 121, 95, 111, 114, 100, 101, 114, 95,
+97, 99, 113, 117, 105, 114, 101, 44, 10, 32, 32, 109, 101, 109, 111,
+114, 121, 95, 111, 114, 100, 101, 114, 95, 114, 101, 108, 101, 97,
+115, 101, 44, 10, 32, 32, 109, 101, 109, 111, 114, 121, 95, 111, 114,
+100, 101, 114, 95, 97, 99, 113, 95, 114, 101, 108, 44, 10, 32, 32,
+109, 101, 109, 111, 114, 121, 95, 111, 114, 100, 101, 114, 95, 115,
+101, 113, 95, 99, 115, 116, 44, 10, 125, 32, 109, 101, 109, 111, 114,
+121, 95, 111, 114, 100, 101, 114, 59, 10, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 65, 84, 79, 77, 73, 67, 95, 70, 76, 65, 71, 95, 73, 78,
+73, 84, 40, 120, 41, 32, 40, 120, 41, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 97, 116, 111, 109, 105, 99, 95, 105, 110, 105, 116, 40, 97,
+100, 100, 114, 44, 32, 118, 97, 108, 41, 32, 40, 42, 40, 97, 100, 100,
+114, 41, 32, 61, 32, 40, 118, 97, 108, 41, 41, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 107, 105, 108, 108, 95, 100, 101, 112, 101, 110,
+100, 101, 110, 99, 121, 40, 120, 41, 32, 40, 120, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 116, 104,
+114, 101, 97, 100, 95, 102, 101, 110, 99, 101, 40, 111, 114, 100, 101,
+114, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 97, 116, 111, 109,
+105, 99, 95, 115, 105, 103, 110, 97, 108, 95, 102, 101, 110, 99, 101,
+40, 111, 114, 100, 101, 114, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 97, 116, 111, 109, 105, 99, 95, 105, 115, 95, 108, 111, 99, 107,
+95, 102, 114, 101, 101, 40, 120, 41, 32, 49, 10, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 108, 111, 97,
+100, 40, 97, 100, 100, 114, 41, 32, 40, 42, 40, 97, 100, 100, 114, 41,
+41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105,
+99, 95, 115, 116, 111, 114, 101, 40, 97, 100, 100, 114, 44, 32, 118,
+97, 108, 41, 32, 40, 42, 40, 97, 100, 100, 114, 41, 32, 61, 32, 40,
+118, 97, 108, 41, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+97, 116, 111, 109, 105, 99, 95, 108, 111, 97, 100, 95, 101, 120, 112,
+108, 105, 99, 105, 116, 40, 97, 100, 100, 114, 44, 32, 111, 114, 100,
+101, 114, 41, 32, 40, 42, 40, 97, 100, 100, 114, 41, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 115, 116,
+111, 114, 101, 95, 101, 120, 112, 108, 105, 99, 105, 116, 40, 97, 100,
+100, 114, 44, 32, 118, 97, 108, 44, 32, 111, 114, 100, 101, 114, 41,
+32, 40, 42, 40, 97, 100, 100, 114, 41, 32, 61, 32, 40, 118, 97, 108,
+41, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 97, 116, 111,
+109, 105, 99, 95, 102, 101, 116, 99, 104, 95, 97, 100, 100, 40, 111,
+98, 106, 44, 32, 118, 97, 108, 41, 32, 40, 42, 40, 111, 98, 106, 41,
+32, 43, 61, 32, 40, 118, 97, 108, 41, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 102, 101, 116, 99, 104,
+95, 115, 117, 98, 40, 111, 98, 106, 44, 32, 118, 97, 108, 41, 32, 40,
+42, 40, 111, 98, 106, 41, 32, 45, 61, 32, 40, 118, 97, 108, 41, 41,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99,
+95, 102, 101, 116, 99, 104, 95, 111, 114, 40, 111, 98, 106, 44, 32,
+118, 97, 108, 41, 32, 40, 42, 40, 111, 98, 106, 41, 32, 124, 61, 32,
+40, 118, 97, 108, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+97, 116, 111, 109, 105, 99, 95, 102, 101, 116, 99, 104, 95, 120, 111,
+114, 40, 111, 98, 106, 44, 32, 118, 97, 108, 41, 32, 40, 42, 40, 111,
+98, 106, 41, 32, 94, 61, 32, 40, 118, 97, 108, 41, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 102, 101,
+116, 99, 104, 95, 97, 110, 100, 40, 111, 98, 106, 44, 32, 118, 97,
+108, 41, 32, 40, 42, 40, 111, 98, 106, 41, 32, 38, 61, 32, 40, 118,
+97, 108, 41, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 97,
+116, 111, 109, 105, 99, 95, 102, 101, 116, 99, 104, 95, 97, 100, 100,
+95, 101, 120, 112, 108, 105, 99, 105, 116, 40, 111, 98, 106, 44, 32,
+118, 97, 108, 44, 32, 111, 114, 100, 101, 114, 41, 32, 40, 42, 40,
+111, 98, 106, 41, 32, 43, 61, 32, 40, 118, 97, 108, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 102,
+101, 116, 99, 104, 95, 115, 117, 98, 95, 101, 120, 112, 108, 105, 99,
+105, 116, 40, 111, 98, 106, 44, 32, 118, 97, 108, 44, 32, 111, 114,
+100, 101, 114, 41, 32, 40, 42, 40, 111, 98, 106, 41, 32, 45, 61, 32,
+40, 118, 97, 108, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+97, 116, 111, 109, 105, 99, 95, 102, 101, 116, 99, 104, 95, 111, 114,
+95, 101, 120, 112, 108, 105, 99, 105, 116, 40, 111, 98, 106, 44, 32,
+118, 97, 108, 44, 32, 111, 114, 100, 101, 114, 41, 32, 40, 42, 40,
+111, 98, 106, 41, 32, 124, 61, 32, 40, 118, 97, 108, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 102,
+101, 116, 99, 104, 95, 120, 111, 114, 95, 101, 120, 112, 108, 105, 99,
+105, 116, 40, 111, 98, 106, 44, 32, 118, 97, 108, 44, 32, 111, 114,
+100, 101, 114, 41, 32, 40, 42, 40, 111, 98, 106, 41, 32, 94, 61, 32,
+40, 118, 97, 108, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+97, 116, 111, 109, 105, 99, 95, 102, 101, 116, 99, 104, 95, 97, 110,
+100, 95, 101, 120, 112, 108, 105, 99, 105, 116, 40, 111, 98, 106, 44,
+32, 118, 97, 108, 44, 32, 111, 114, 100, 101, 114, 41, 32, 40, 42, 40,
+111, 98, 106, 41, 32, 38, 61, 32, 40, 118, 97, 108, 41, 41, 10, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95,
+99, 111, 109, 112, 97, 114, 101, 95, 101, 120, 99, 104, 97, 110, 103,
+101, 95, 119, 101, 97, 107, 40, 112, 44, 32, 111, 108, 100, 44, 32,
+110, 101, 119, 41, 32, 95, 95, 98, 117, 105, 108, 116, 105, 110, 95,
+99, 111, 109, 112, 97, 114, 101, 95, 97, 110, 100, 95, 115, 119, 97,
+112, 40, 40, 112, 41, 44, 32, 40, 111, 108, 100, 41, 44, 32, 40, 110,
+101, 119, 41, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 97,
+116, 111, 109, 105, 99, 95, 99, 111, 109, 112, 97, 114, 101, 95, 101,
+120, 99, 104, 97, 110, 103, 101, 95, 115, 116, 114, 111, 110, 103, 40,
+112, 44, 32, 111, 108, 100, 44, 32, 110, 101, 119, 41, 32, 95, 95, 98,
+117, 105, 108, 116, 105, 110, 95, 99, 111, 109, 112, 97, 114, 101, 95,
+97, 110, 100, 95, 115, 119, 97, 112, 40, 40, 112, 41, 44, 32, 40, 111,
+108, 100, 41, 44, 32, 40, 110, 101, 119, 41, 41, 10, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 101, 120, 99,
+104, 97, 110, 103, 101, 40, 111, 98, 106, 44, 32, 118, 97, 108, 41,
+32, 95, 95, 98, 117, 105, 108, 116, 105, 110, 95, 97, 116, 111, 109,
+105, 99, 95, 101, 120, 99, 104, 97, 110, 103, 101, 40, 40, 111, 98,
+106, 41, 44, 32, 40, 118, 97, 108, 41, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 101, 120, 99, 104, 97,
+110, 103, 101, 95, 101, 120, 112, 108, 105, 99, 105, 116, 40, 111, 98,
+106, 44, 32, 118, 97, 108, 44, 32, 111, 114, 100, 101, 114, 41, 32,
+95, 95, 98, 117, 105, 108, 116, 105, 110, 95, 97, 116, 111, 109, 105,
+99, 95, 101, 120, 99, 104, 97, 110, 103, 101, 40, 40, 111, 98, 106,
+41, 44, 32, 40, 118, 97, 108, 41, 41, 10, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 102, 108, 97, 103, 95,
+116, 101, 115, 116, 95, 97, 110, 100, 95, 115, 101, 116, 40, 111, 98,
+106, 41, 32, 97, 116, 111, 109, 105, 99, 95, 101, 120, 99, 104, 97,
+110, 103, 101, 40, 40, 111, 98, 106, 41, 44, 32, 49, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 102, 108,
+97, 103, 95, 116, 101, 115, 116, 95, 97, 110, 100, 95, 115, 101, 116,
+95, 101, 120, 112, 108, 105, 99, 105, 116, 40, 111, 98, 106, 44, 32,
+111, 114, 100, 101, 114, 41, 32, 97, 116, 111, 109, 105, 99, 95, 101,
+120, 99, 104, 97, 110, 103, 101, 40, 40, 111, 98, 106, 41, 44, 32, 49,
+41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105,
+99, 95, 102, 108, 97, 103, 95, 99, 108, 101, 97, 114, 40, 111, 98,
+106, 41, 32, 40, 42, 40, 111, 98, 106, 41, 32, 61, 32, 48, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 97, 116, 111, 109, 105, 99, 95, 102,
+108, 97, 103, 95, 99, 108, 101, 97, 114, 95, 101, 120, 112, 108, 105,
+99, 105, 116, 40, 111, 98, 106, 44, 32, 111, 114, 100, 101, 114, 41,
+32, 40, 42, 40, 111, 98, 106, 41, 32, 61, 32, 48, 41, 10, 10, 116,
+121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32,
+95, 66, 111, 111, 108, 32, 97, 116, 111, 109, 105, 99, 95, 102, 108,
+97, 103, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 65, 116,
+111, 109, 105, 99, 32, 95, 66, 111, 111, 108, 32, 97, 116, 111, 109,
+105, 99, 95, 98, 111, 111, 108, 59, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 99, 104, 97, 114, 32, 97,
+116, 111, 109, 105, 99, 95, 99, 104, 97, 114, 59, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 115, 105,
+103, 110, 101, 100, 32, 99, 104, 97, 114, 32, 97, 116, 111, 109, 105,
+99, 95, 115, 99, 104, 97, 114, 59, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 117, 110, 115, 105, 103,
+110, 101, 100, 32, 99, 104, 97, 114, 32, 97, 116, 111, 109, 105, 99,
+95, 117, 99, 104, 97, 114, 59, 10, 116, 121, 112, 101, 100, 101, 102,
+32, 95, 65, 116, 111, 109, 105, 99, 32, 115, 104, 111, 114, 116, 32,
+97, 116, 111, 109, 105, 99, 95, 115, 104, 111, 114, 116, 59, 10, 116,
+121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32,
+117, 110, 115, 105, 103, 110, 101, 100, 32, 115, 104, 111, 114, 116,
+32, 97, 116, 111, 109, 105, 99, 95, 117, 115, 104, 111, 114, 116, 59,
+10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105,
+99, 32, 105, 110, 116, 32, 97, 116, 111, 109, 105, 99, 95, 105, 110,
+116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111,
+109, 105, 99, 32, 117, 110, 115, 105, 103, 110, 101, 100, 32, 105,
+110, 116, 32, 97, 116, 111, 109, 105, 99, 95, 117, 105, 110, 116, 59,
+10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105,
+99, 32, 108, 111, 110, 103, 32, 97, 116, 111, 109, 105, 99, 95, 108,
+111, 110, 103, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 65,
+116, 111, 109, 105, 99, 32, 117, 110, 115, 105, 103, 110, 101, 100,
+32, 108, 111, 110, 103, 32, 97, 116, 111, 109, 105, 99, 95, 117, 108,
+111, 110, 103, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 65,
+116, 111, 109, 105, 99, 32, 108, 111, 110, 103, 32, 108, 111, 110,
+103, 32, 97, 116, 111, 109, 105, 99, 95, 108, 108, 111, 110, 103, 59,
+10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105,
+99, 32, 117, 110, 115, 105, 103, 110, 101, 100, 32, 108, 111, 110,
+103, 32, 108, 111, 110, 103, 32, 97, 116, 111, 109, 105, 99, 95, 117,
+108, 108, 111, 110, 103, 59, 10, 116, 121, 112, 101, 100, 101, 102,
+32, 95, 65, 116, 111, 109, 105, 99, 32, 117, 110, 115, 105, 103, 110,
+101, 100, 32, 115, 104, 111, 114, 116, 32, 97, 116, 111, 109, 105, 99,
+95, 99, 104, 97, 114, 49, 54, 95, 116, 59, 10, 116, 121, 112, 101,
+100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 117, 110, 115,
+105, 103, 110, 101, 100, 32, 97, 116, 111, 109, 105, 99, 95, 99, 104,
+97, 114, 51, 50, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102,
+32, 95, 65, 116, 111, 109, 105, 99, 32, 117, 110, 115, 105, 103, 110,
+101, 100, 32, 97, 116, 111, 109, 105, 99, 95, 119, 99, 104, 97, 114,
+95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 65, 116,
+111, 109, 105, 99, 32, 115, 105, 103, 110, 101, 100, 32, 99, 104, 97,
+114, 32, 97, 116, 111, 109, 105, 99, 95, 105, 110, 116, 95, 108, 101,
+97, 115, 116, 56, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102,
+32, 95, 65, 116, 111, 109, 105, 99, 32, 117, 110, 115, 105, 103, 110,
+101, 100, 32, 99, 104, 97, 114, 32, 97, 116, 111, 109, 105, 99, 95,
+117, 105, 110, 116, 95, 108, 101, 97, 115, 116, 56, 95, 116, 59, 10,
+116, 121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99,
+32, 115, 104, 111, 114, 116, 32, 97, 116, 111, 109, 105, 99, 95, 105,
+110, 116, 95, 108, 101, 97, 115, 116, 49, 54, 95, 116, 59, 10, 116,
+121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32,
+117, 110, 115, 105, 103, 110, 101, 100, 32, 115, 104, 111, 114, 116,
+32, 97, 116, 111, 109, 105, 99, 95, 117, 105, 110, 116, 95, 108, 101,
+97, 115, 116, 49, 54, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 105, 110, 116, 32, 97,
+116, 111, 109, 105, 99, 95, 105, 110, 116, 95, 108, 101, 97, 115, 116,
+51, 50, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95,
+65, 116, 111, 109, 105, 99, 32, 117, 110, 115, 105, 103, 110, 101,
+100, 32, 105, 110, 116, 32, 97, 116, 111, 109, 105, 99, 95, 117, 105,
+110, 116, 95, 108, 101, 97, 115, 116, 51, 50, 95, 116, 59, 10, 116,
+121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32,
+108, 111, 110, 103, 32, 97, 116, 111, 109, 105, 99, 95, 105, 110, 116,
+95, 108, 101, 97, 115, 116, 54, 52, 95, 116, 59, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 117, 110,
+115, 105, 103, 110, 101, 100, 32, 108, 111, 110, 103, 32, 97, 116,
+111, 109, 105, 99, 95, 117, 105, 110, 116, 95, 108, 101, 97, 115, 116,
+54, 52, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95,
+65, 116, 111, 109, 105, 99, 32, 115, 105, 103, 110, 101, 100, 32, 99,
+104, 97, 114, 32, 97, 116, 111, 109, 105, 99, 95, 105, 110, 116, 95,
+102, 97, 115, 116, 56, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 117, 110, 115, 105, 103,
+110, 101, 100, 32, 99, 104, 97, 114, 32, 97, 116, 111, 109, 105, 99,
+95, 117, 105, 110, 116, 95, 102, 97, 115, 116, 56, 95, 116, 59, 10,
+116, 121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99,
+32, 115, 104, 111, 114, 116, 32, 97, 116, 111, 109, 105, 99, 95, 105,
+110, 116, 95, 102, 97, 115, 116, 49, 54, 95, 116, 59, 10, 116, 121,
+112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 117,
+110, 115, 105, 103, 110, 101, 100, 32, 115, 104, 111, 114, 116, 32,
+97, 116, 111, 109, 105, 99, 95, 117, 105, 110, 116, 95, 102, 97, 115,
+116, 49, 54, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32,
+95, 65, 116, 111, 109, 105, 99, 32, 105, 110, 116, 32, 97, 116, 111,
+109, 105, 99, 95, 105, 110, 116, 95, 102, 97, 115, 116, 51, 50, 95,
+116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111,
+109, 105, 99, 32, 117, 110, 115, 105, 103, 110, 101, 100, 32, 105,
+110, 116, 32, 97, 116, 111, 109, 105, 99, 95, 117, 105, 110, 116, 95,
+102, 97, 115, 116, 51, 50, 95, 116, 59, 10, 116, 121, 112, 101, 100,
+101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 108, 111, 110, 103,
+32, 97, 116, 111, 109, 105, 99, 95, 105, 110, 116, 95, 102, 97, 115,
+116, 54, 52, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32,
+95, 65, 116, 111, 109, 105, 99, 32, 117, 110, 115, 105, 103, 110, 101,
+100, 32, 108, 111, 110, 103, 32, 97, 116, 111, 109, 105, 99, 95, 117,
+105, 110, 116, 95, 102, 97, 115, 116, 54, 52, 95, 116, 59, 10, 116,
+121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32,
+108, 111, 110, 103, 32, 97, 116, 111, 109, 105, 99, 95, 105, 110, 116,
+112, 116, 114, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32,
+95, 65, 116, 111, 109, 105, 99, 32, 117, 110, 115, 105, 103, 110, 101,
+100, 32, 108, 111, 110, 103, 32, 97, 116, 111, 109, 105, 99, 95, 117,
+105, 110, 116, 112, 116, 114, 95, 116, 59, 10, 116, 121, 112, 101,
+100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 117, 110, 115,
+105, 103, 110, 101, 100, 32, 108, 111, 110, 103, 32, 97, 116, 111,
+109, 105, 99, 95, 115, 105, 122, 101, 95, 116, 59, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32, 108, 111,
+110, 103, 32, 97, 116, 111, 109, 105, 99, 95, 112, 116, 114, 100, 105,
+102, 102, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95,
+65, 116, 111, 109, 105, 99, 32, 108, 111, 110, 103, 32, 97, 116, 111,
+109, 105, 99, 95, 105, 110, 116, 109, 97, 120, 95, 116, 59, 10, 116,
+121, 112, 101, 100, 101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 32,
+117, 110, 115, 105, 103, 110, 101, 100, 32, 108, 111, 110, 103, 32,
+97, 116, 111, 109, 105, 99, 95, 117, 105, 110, 116, 109, 97, 120, 95,
+116, 59, 10, 10, 35, 101, 110, 100, 105, 102, 10, 0, 35, 105, 102,
+110, 100, 101, 102, 32, 95, 95, 83, 84, 68, 78, 79, 82, 69, 84, 85,
+82, 78, 95, 72, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 95, 83,
+84, 68, 78, 79, 82, 69, 84, 85, 82, 78, 95, 72, 10, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 110, 111, 114, 101, 116, 117, 114, 110, 32,
+95, 78, 111, 114, 101, 116, 117, 114, 110, 10, 10, 35, 101, 110, 100,
+105, 102, 10, 0, 47, 47, 32, 66, 69, 71, 73, 78, 32, 114, 101, 103,
+101, 110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101,
+97, 100, 101, 114, 115, 46, 112, 121, 10, 35, 105, 102, 110, 100, 101,
+102, 32, 95, 95, 100, 121, 105, 98, 105, 99, 99, 95, 105, 110, 116,
+101, 114, 110, 97, 108, 95, 105, 110, 99, 108, 117, 100, 101, 95, 95,
+10, 35, 101, 114, 114, 111, 114, 32, 67, 97, 110, 32, 111, 110, 108,
+121, 32, 98, 101, 32, 105, 110, 99, 108, 117, 100, 101, 100, 32, 98,
+121, 32, 116, 104, 101, 32, 99, 111, 109, 112, 105, 108, 101, 114, 44,
+32, 111, 114, 32, 99, 111, 110, 102, 117, 115, 105, 110, 103, 32, 101,
+114, 114, 111, 114, 115, 32, 119, 105, 108, 108, 32, 114, 101, 115,
+117, 108, 116, 33, 10, 35, 101, 110, 100, 105, 102, 10, 35, 117, 110,
+100, 101, 102, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117, 116, 101,
+95, 95, 10, 116, 121, 112, 101, 100, 101, 102, 32, 117, 110, 115, 105,
+103, 110, 101, 100, 32, 99, 104, 97, 114, 32, 117, 105, 110, 116, 56,
+95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 117, 110, 115,
+105, 103, 110, 101, 100, 32, 108, 111, 110, 103, 32, 108, 111, 110,
+103, 32, 117, 105, 110, 116, 54, 52, 95, 116, 59, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 117, 110, 115, 105, 103, 110, 101, 100, 32,
+108, 111, 110, 103, 32, 108, 111, 110, 103, 32, 115, 105, 122, 101,
+95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 108, 111, 110,
+103, 32, 108, 111, 110, 103, 32, 105, 110, 116, 54, 52, 95, 116, 59,
+10, 116, 121, 112, 101, 100, 101, 102, 32, 108, 111, 110, 103, 32,
+108, 111, 110, 103, 32, 105, 110, 116, 112, 116, 114, 95, 116, 59, 10,
+116, 121, 112, 101, 100, 101, 102, 32, 117, 110, 115, 105, 103, 110,
+101, 100, 32, 105, 110, 116, 32, 117, 105, 110, 116, 51, 50, 95, 116,
+59, 10, 118, 111, 105, 100, 42, 32, 109, 101, 109, 115, 101, 116, 40,
+118, 111, 105, 100, 42, 32, 100, 101, 115, 116, 44, 32, 105, 110, 116,
+32, 99, 104, 44, 32, 115, 105, 122, 101, 95, 116, 32, 99, 111, 117,
+110, 116, 41, 59, 10, 118, 111, 105, 100, 42, 32, 109, 101, 109, 99,
+112, 121, 40, 118, 111, 105, 100, 42, 32, 100, 101, 115, 116, 44, 32,
+99, 111, 110, 115, 116, 32, 118, 111, 105, 100, 42, 32, 115, 114, 99,
+44, 32, 115, 105, 122, 101, 95, 116, 32, 99, 111, 117, 110, 116, 41,
+59, 10, 105, 110, 116, 32, 109, 101, 109, 99, 109, 112, 40, 99, 111,
+110, 115, 116, 32, 118, 111, 105, 100, 42, 32, 108, 104, 115, 44, 32,
+99, 111, 110, 115, 116, 32, 118, 111, 105, 100, 42, 32, 114, 104, 115,
+44, 32, 115, 105, 122, 101, 95, 116, 32, 99, 111, 117, 110, 116, 41,
+59, 10, 118, 111, 105, 100, 42, 32, 109, 101, 109, 109, 111, 118, 101,
+40, 118, 111, 105, 100, 42, 32, 100, 101, 115, 116, 44, 32, 99, 111,
+110, 115, 116, 32, 118, 111, 105, 100, 42, 32, 115, 114, 99, 44, 32,
+115, 105, 122, 101, 95, 116, 32, 99, 111, 117, 110, 116, 41, 59, 10,
+115, 105, 122, 101, 95, 116, 32, 115, 116, 114, 108, 101, 110, 40, 99,
+111, 110, 115, 116, 32, 99, 104, 97, 114, 42, 32, 115, 116, 114, 41,
+59, 10, 118, 111, 105, 100, 32, 102, 114, 101, 101, 40, 118, 111, 105,
+100, 42, 32, 112, 116, 114, 41, 59, 10, 118, 111, 105, 100, 32, 42,
+109, 97, 108, 108, 111, 99, 40, 115, 105, 122, 101, 95, 116, 32, 115,
+105, 122, 101, 41, 59, 10, 118, 111, 105, 100, 32, 42, 99, 97, 108,
+108, 111, 99, 40, 115, 105, 122, 101, 95, 116, 32, 110, 117, 109, 44,
+32, 115, 105, 122, 101, 95, 116, 32, 115, 105, 122, 101, 41, 59, 10,
+118, 111, 105, 100, 42, 32, 114, 101, 97, 108, 108, 111, 99, 40, 118,
+111, 105, 100, 42, 32, 112, 116, 114, 44, 32, 115, 105, 122, 101, 95,
+116, 32, 110, 101, 119, 95, 115, 105, 122, 101, 41, 59, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 78, 85, 76, 76, 32, 40, 40, 118, 111,
+105, 100, 42, 41, 48, 41, 32, 47, 42, 32, 116, 111, 100, 111, 33, 32,
+42, 47, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78, 68, 32, 114, 101, 103,
+101, 110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101,
+97, 100, 101, 114, 115, 46, 112, 121, 10, 47, 47, 32, 35, 35, 35, 32,
+66, 69, 71, 73, 78, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68,
+69, 58, 32, 99, 109, 97, 112, 46, 104, 10, 10, 47, 47, 32, 85, 110,
+111, 114, 100, 101, 114, 101, 100, 32, 115, 101, 116, 47, 109, 97,
+112, 32, 45, 32, 105, 109, 112, 108, 101, 109, 101, 110, 116, 101,
+100, 32, 97, 115, 32, 99, 108, 111, 115, 101, 100, 32, 104, 97, 115,
+104, 105, 110, 103, 32, 119, 105, 116, 104, 32, 108, 105, 110, 101,
+97, 114, 32, 112, 114, 111, 98, 105, 110, 103, 32, 97, 110, 100, 32,
+110, 111, 32, 116, 111, 109, 98, 115, 116, 111, 110, 101, 115, 46, 10,
+47, 47, 32, 35, 35, 35, 32, 66, 69, 71, 73, 78, 95, 70, 73, 76, 69,
+95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 108, 105, 110, 107, 97, 103,
+101, 46, 104, 10, 35, 117, 110, 100, 101, 102, 32, 83, 84, 67, 95, 65,
+80, 73, 10, 35, 117, 110, 100, 101, 102, 32, 83, 84, 67, 95, 68, 69,
+70, 10, 10, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100,
+32, 105, 95, 115, 116, 97, 116, 105, 99, 32, 32, 38, 38, 32, 33, 100,
+101, 102, 105, 110, 101, 100, 32, 83, 84, 67, 95, 83, 84, 65, 84, 73,
+67, 32, 32, 38, 38, 32, 40, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 104, 101, 97, 100, 101, 114, 32, 124, 124, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 83, 84, 67, 95, 72, 69, 65, 68, 69, 82, 32,
+32, 124, 124, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105,
+95, 105, 109, 112, 108, 101, 109, 101, 110, 116, 32, 124, 124, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67, 95, 73, 77, 80, 76,
+69, 77, 69, 78, 84, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 83, 84, 67, 95, 65, 80, 73, 32, 101, 120, 116, 101, 114, 110, 10,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 68, 69,
+70, 10, 35, 101, 108, 115, 101, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 115, 116, 97, 116, 105, 99, 10, 32, 32, 35,
+105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 71, 78,
+85, 67, 95, 95, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100,
+32, 95, 95, 99, 108, 97, 110, 103, 95, 95, 10, 32, 32, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 65, 80, 73, 32, 115,
+116, 97, 116, 105, 99, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117,
+116, 101, 95, 95, 40, 40, 117, 110, 117, 115, 101, 100, 41, 41, 10,
+32, 32, 35, 101, 108, 115, 101, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 83, 84, 67, 95, 65, 80, 73, 32, 115, 116, 97, 116,
+105, 99, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 68, 69, 70, 32, 115, 116,
+97, 116, 105, 99, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102,
+32, 100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67, 95, 73, 77, 80,
+76, 69, 77, 69, 78, 84, 32, 124, 124, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 105, 109, 112, 111, 114, 116, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 105, 109, 112, 108, 101,
+109, 101, 110, 116, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67, 95, 65,
+76, 76, 79, 67, 65, 84, 79, 82, 32, 38, 38, 32, 33, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111,
+114, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 97,
+108, 108, 111, 99, 97, 116, 111, 114, 32, 83, 84, 67, 95, 65, 76, 76,
+79, 67, 65, 84, 79, 82, 10, 35, 101, 108, 105, 102, 32, 33, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 97, 108, 108, 111, 99, 97, 116,
+111, 114, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+97, 108, 108, 111, 99, 97, 116, 111, 114, 32, 99, 10, 35, 101, 110,
+100, 105, 102, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 109,
+97, 108, 108, 111, 99, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 109, 97, 108, 108, 111, 99, 32, 99, 95, 74, 79, 73, 78,
+40, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111, 114, 44, 32, 95,
+109, 97, 108, 108, 111, 99, 41, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 99, 97, 108, 108, 111, 99, 32, 99, 95, 74, 79,
+73, 78, 40, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111, 114, 44, 32,
+95, 99, 97, 108, 108, 111, 99, 41, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 114, 101, 97, 108, 108, 111, 99, 32, 99, 95,
+74, 79, 73, 78, 40, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111, 114,
+44, 32, 95, 114, 101, 97, 108, 108, 111, 99, 41, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 102, 114, 101, 101, 32, 99, 95,
+74, 79, 73, 78, 40, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111, 114,
+44, 32, 95, 102, 114, 101, 101, 41, 10, 35, 101, 110, 100, 105, 102,
+10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95,
+95, 99, 108, 97, 110, 103, 95, 95, 32, 38, 38, 32, 33, 100, 101, 102,
+105, 110, 101, 100, 32, 95, 95, 99, 112, 108, 117, 115, 112, 108, 117,
+115, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110,
+103, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 112, 117,
+115, 104, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97,
+110, 103, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119,
+97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 97, 108, 108, 34, 10, 32,
+32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110, 103, 32,
+100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110,
+105, 110, 103, 32, 34, 45, 87, 101, 120, 116, 114, 97, 34, 10, 32, 32,
+35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110, 103, 32, 100,
+105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110, 105,
+110, 103, 32, 34, 45, 87, 112, 101, 100, 97, 110, 116, 105, 99, 34,
+10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110, 103,
+32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114,
+110, 105, 110, 103, 32, 34, 45, 87, 99, 111, 110, 118, 101, 114, 115,
+105, 111, 110, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99,
+108, 97, 110, 103, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99,
+32, 119, 97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 100, 111, 117,
+98, 108, 101, 45, 112, 114, 111, 109, 111, 116, 105, 111, 110, 34, 10,
+32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110, 103, 32,
+100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110,
+105, 110, 103, 32, 34, 45, 87, 119, 114, 105, 116, 101, 45, 115, 116,
+114, 105, 110, 103, 115, 34, 10, 32, 32, 47, 47, 32, 105, 103, 110,
+111, 114, 101, 100, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32,
+99, 108, 97, 110, 103, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105,
+99, 32, 105, 103, 110, 111, 114, 101, 100, 32, 34, 45, 87, 109, 105,
+115, 115, 105, 110, 103, 45, 102, 105, 101, 108, 100, 45, 105, 110,
+105, 116, 105, 97, 108, 105, 122, 101, 114, 115, 34, 10, 35, 101, 108,
+105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 71, 78,
+85, 67, 95, 95, 32, 38, 38, 32, 33, 100, 101, 102, 105, 110, 101, 100,
+32, 95, 95, 99, 112, 108, 117, 115, 112, 108, 117, 115, 10, 32, 32,
+35, 112, 114, 97, 103, 109, 97, 32, 71, 67, 67, 32, 100, 105, 97, 103,
+110, 111, 115, 116, 105, 99, 32, 112, 117, 115, 104, 10, 32, 32, 35,
+112, 114, 97, 103, 109, 97, 32, 71, 67, 67, 32, 100, 105, 97, 103,
+110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110, 105, 110, 103, 32,
+34, 45, 87, 97, 108, 108, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109,
+97, 32, 71, 67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105,
+99, 32, 119, 97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 101, 120,
+116, 114, 97, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 71,
+67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119,
+97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 112, 101, 100, 97, 110,
+116, 105, 99, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 71,
+67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119,
+97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 99, 111, 110, 118, 101,
+114, 115, 105, 111, 110, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109,
+97, 32, 71, 67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105,
+99, 32, 119, 97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 100, 111,
+117, 98, 108, 101, 45, 112, 114, 111, 109, 111, 116, 105, 111, 110,
+34, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 71, 67, 67, 32,
+100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110,
+105, 110, 103, 32, 34, 45, 87, 119, 114, 105, 116, 101, 45, 115, 116,
+114, 105, 110, 103, 115, 34, 10, 32, 32, 47, 47, 32, 105, 103, 110,
+111, 114, 101, 100, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32,
+71, 67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32,
+105, 103, 110, 111, 114, 101, 100, 32, 34, 45, 87, 109, 105, 115, 115,
+105, 110, 103, 45, 102, 105, 101, 108, 100, 45, 105, 110, 105, 116,
+105, 97, 108, 105, 122, 101, 114, 115, 34, 10, 35, 101, 110, 100, 105,
+102, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78, 68, 95, 70, 73, 76, 69,
+95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 108, 105, 110, 107, 97, 103,
+101, 46, 104, 10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 67, 77,
+65, 80, 95, 72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 47, 47, 32,
+35, 35, 35, 32, 66, 69, 71, 73, 78, 95, 70, 73, 76, 69, 95, 73, 78,
+67, 76, 85, 68, 69, 58, 32, 99, 99, 111, 109, 109, 111, 110, 46, 104,
+10, 35, 105, 102, 110, 100, 101, 102, 32, 67, 67, 79, 77, 77, 79, 78,
+95, 72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 67, 67, 79, 77, 77, 79, 78, 95, 72, 95, 73, 78, 67,
+76, 85, 68, 69, 68, 10, 10, 35, 105, 102, 100, 101, 102, 32, 95, 77,
+83, 67, 95, 86, 69, 82, 10, 32, 32, 32, 32, 35, 112, 114, 97, 103,
+109, 97, 32, 119, 97, 114, 110, 105, 110, 103, 40, 100, 105, 115, 97,
+98, 108, 101, 58, 32, 52, 49, 49, 54, 32, 52, 57, 57, 54, 41, 32, 47,
+47, 32, 117, 110, 110, 97, 109, 101, 100, 32, 116, 121, 112, 101, 32,
+100, 101, 102, 105, 110, 105, 116, 105, 111, 110, 32, 105, 110, 32,
+112, 97, 114, 101, 110, 116, 104, 101, 115, 101, 115, 10, 35, 101,
+110, 100, 105, 102, 10, 47, 47, 32, 69, 88, 67, 76, 85, 68, 69, 68,
+32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99, 111, 110, 116, 97,
+105, 110, 101, 114, 95, 104, 101, 97, 100, 101, 114, 115, 46, 112,
+121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60, 105, 110, 116,
+116, 121, 112, 101, 115, 46, 104, 62, 10, 47, 47, 32, 69, 88, 67, 76,
+85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99, 111,
+110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100, 101, 114,
+115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60,
+115, 116, 100, 100, 101, 102, 46, 104, 62, 10, 47, 47, 32, 69, 88, 67,
+76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99,
+111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100, 101,
+114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32,
+60, 115, 116, 100, 98, 111, 111, 108, 46, 104, 62, 10, 47, 47, 32, 69,
+88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110,
+95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100,
+101, 114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101,
+32, 60, 115, 116, 114, 105, 110, 103, 46, 104, 62, 10, 47, 47, 32, 69,
+88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110,
+95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100,
+101, 114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101,
+32, 60, 97, 115, 115, 101, 114, 116, 46, 104, 62, 10, 10, 116, 121,
+112, 101, 100, 101, 102, 32, 108, 111, 110, 103, 32, 108, 111, 110,
+103, 32, 95, 108, 108, 111, 110, 103, 59, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 78, 80, 79, 83, 32, 73, 78, 84, 80, 84, 82, 95,
+77, 65, 88, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 90, 73,
+32, 80, 82, 73, 105, 80, 84, 82, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 90, 85, 32, 80, 82, 73, 117, 80, 84, 82, 10, 10, 35, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 71, 78, 85,
+67, 95, 95, 32, 47, 47, 32, 105, 110, 99, 108, 117, 100, 101, 115, 32,
+95, 95, 99, 108, 97, 110, 103, 95, 95, 10, 32, 32, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69,
+32, 115, 116, 97, 116, 105, 99, 32, 105, 110, 108, 105, 110, 101, 32,
+95, 95, 97, 116, 116, 114, 105, 98, 117, 116, 101, 40, 40, 117, 110,
+117, 115, 101, 100, 41, 41, 10, 35, 101, 108, 115, 101, 10, 32, 32,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 73, 78,
+76, 73, 78, 69, 32, 115, 116, 97, 116, 105, 99, 32, 105, 110, 108,
+105, 110, 101, 10, 35, 101, 110, 100, 105, 102, 10, 10, 47, 42, 32,
+77, 97, 99, 114, 111, 32, 111, 118, 101, 114, 108, 111, 97, 100, 105,
+110, 103, 32, 102, 101, 97, 116, 117, 114, 101, 32, 115, 117, 112,
+112, 111, 114, 116, 32, 98, 97, 115, 101, 100, 32, 111, 110, 58, 32,
+104, 116, 116, 112, 115, 58, 47, 47, 114, 101, 120, 116, 101, 115,
+116, 101, 114, 46, 99, 111, 109, 47, 79, 78, 80, 56, 48, 49, 48, 55,
+32, 42, 47, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 77, 65,
+67, 82, 79, 95, 79, 86, 69, 82, 76, 79, 65, 68, 40, 110, 97, 109, 101,
+44, 32, 46, 46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 99, 95, 74, 79,
+73, 78, 40, 99, 95, 74, 79, 73, 78, 48, 40, 110, 97, 109, 101, 44, 95,
+41, 44, 99, 95, 78, 85, 77, 65, 82, 71, 83, 40, 95, 95, 86, 65, 95,
+65, 82, 71, 83, 95, 95, 41, 41, 40, 95, 95, 86, 65, 95, 65, 82, 71,
+83, 95, 95, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 74,
+79, 73, 78, 48, 40, 97, 44, 32, 98, 41, 32, 97, 32, 35, 35, 32, 98,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 74, 79, 73, 78, 40,
+97, 44, 32, 98, 41, 32, 99, 95, 74, 79, 73, 78, 48, 40, 97, 44, 32,
+98, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 69, 88, 80,
+65, 78, 68, 40, 46, 46, 46, 41, 32, 95, 95, 86, 65, 95, 65, 82, 71,
+83, 95, 95, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 78, 85,
+77, 65, 82, 71, 83, 40, 46, 46, 46, 41, 32, 95, 99, 95, 65, 80, 80,
+76, 89, 95, 65, 82, 71, 95, 78, 40, 40, 95, 95, 86, 65, 95, 65, 82,
+71, 83, 95, 95, 44, 32, 95, 99, 95, 82, 83, 69, 81, 95, 78, 41, 41,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 99, 95, 65, 80, 80, 76,
+89, 95, 65, 82, 71, 95, 78, 40, 97, 114, 103, 115, 41, 32, 99, 95, 69,
+88, 80, 65, 78, 68, 40, 95, 99, 95, 65, 82, 71, 95, 78, 32, 97, 114,
+103, 115, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 99, 95,
+82, 83, 69, 81, 95, 78, 32, 49, 54, 44, 32, 49, 53, 44, 32, 49, 52,
+44, 32, 49, 51, 44, 32, 49, 50, 44, 32, 49, 49, 44, 32, 49, 48, 44,
+32, 57, 44, 32, 56, 44, 32, 55, 44, 32, 54, 44, 32, 53, 44, 32, 52,
+44, 32, 51, 44, 32, 50, 44, 32, 49, 44, 32, 48, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 99, 95, 65, 82, 71, 95, 78, 40, 95, 49, 44, 32,
+95, 50, 44, 32, 95, 51, 44, 32, 95, 52, 44, 32, 95, 53, 44, 32, 95,
+54, 44, 32, 95, 55, 44, 32, 95, 56, 44, 32, 95, 57, 44, 32, 95, 49,
+48, 44, 32, 95, 49, 49, 44, 32, 95, 49, 50, 44, 32, 95, 49, 51, 44,
+32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 95, 49, 52, 44, 32, 95, 49, 53, 44, 32, 95, 49, 54, 44,
+32, 78, 44, 32, 46, 46, 46, 41, 32, 78, 10, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 95, 95, 99, 112, 108, 117, 115, 112, 108, 117, 115,
+32, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105,
+95, 97, 108, 108, 111, 99, 40, 84, 41, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 40, 40, 84, 42, 41, 105, 95, 109, 97, 108, 108, 111, 99, 40, 99,
+95, 115, 105, 122, 101, 111, 102, 40, 84, 41, 41, 41, 10, 32, 32, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105, 95, 110, 101, 119,
+40, 84, 44, 32, 46, 46, 46, 41, 32, 32, 32, 32, 32, 32, 40, 40, 84,
+42, 41, 109, 101, 109, 99, 112, 121, 40, 95, 105, 95, 97, 108, 108,
+111, 99, 40, 84, 41, 44, 32, 40, 40, 84, 91, 93, 41, 123, 95, 95, 86,
+65, 95, 65, 82, 71, 83, 95, 95, 125, 41, 44, 32, 115, 105, 122, 101,
+111, 102, 40, 84, 41, 41, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 110, 101, 119, 40, 84, 44, 32, 46, 46, 46,
+41, 32, 32, 32, 32, 32, 32, 32, 40, 40, 84, 42, 41, 109, 101, 109, 99,
+112, 121, 40, 109, 97, 108, 108, 111, 99, 40, 115, 105, 122, 101, 111,
+102, 40, 84, 41, 41, 44, 32, 40, 40, 84, 91, 93, 41, 123, 95, 95, 86,
+65, 95, 65, 82, 71, 83, 95, 95, 125, 41, 44, 32, 115, 105, 122, 101,
+111, 102, 40, 84, 41, 41, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 76, 73, 84, 69, 82, 65, 76, 40, 84, 41, 32,
+32, 32, 32, 32, 32, 32, 32, 40, 84, 41, 10, 35, 101, 108, 115, 101,
+10, 47, 47, 32, 69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114,
+101, 103, 101, 110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95,
+104, 101, 97, 100, 101, 114, 115, 46, 112, 121, 32, 32, 32, 32, 32,
+35, 105, 110, 99, 108, 117, 100, 101, 32, 60, 110, 101, 119, 62, 10,
+32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105, 95, 97,
+108, 108, 111, 99, 40, 84, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+115, 116, 97, 116, 105, 99, 95, 99, 97, 115, 116, 60, 84, 42, 62, 40,
+105, 95, 109, 97, 108, 108, 111, 99, 40, 99, 95, 115, 105, 122, 101,
+111, 102, 40, 84, 41, 41, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 105, 95, 110, 101, 119, 40, 84, 44, 32, 46, 46,
+46, 41, 32, 32, 32, 32, 32, 32, 110, 101, 119, 32, 40, 95, 105, 95,
+97, 108, 108, 111, 99, 40, 84, 41, 41, 32, 84, 40, 95, 95, 86, 65, 95,
+65, 82, 71, 83, 95, 95, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 110, 101, 119, 40, 84, 44, 32, 46, 46, 46,
+41, 32, 32, 32, 32, 32, 32, 32, 110, 101, 119, 32, 40, 109, 97, 108,
+108, 111, 99, 40, 115, 105, 122, 101, 111, 102, 40, 84, 41, 41, 41,
+32, 84, 40, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10, 32,
+32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 76, 73, 84,
+69, 82, 65, 76, 40, 84, 41, 32, 32, 32, 32, 32, 32, 32, 32, 84, 10,
+35, 101, 110, 100, 105, 102, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 110, 101, 119, 95, 110, 40, 84, 44, 32, 110, 41, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 40, 40, 84, 42, 41, 109, 97, 108, 108,
+111, 99, 40, 115, 105, 122, 101, 111, 102, 40, 84, 41, 42, 99, 95,
+105, 50, 117, 95, 115, 105, 122, 101, 40, 110, 41, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 109, 97, 108, 108, 111, 99,
+40, 115, 122, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 109,
+97, 108, 108, 111, 99, 40, 99, 95, 105, 50, 117, 95, 115, 105, 122,
+101, 40, 115, 122, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 99, 97, 108, 108, 111, 99, 40, 110, 44, 32, 115, 122, 41, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 99, 97, 108, 108, 111, 99, 40, 99, 95,
+105, 50, 117, 95, 115, 105, 122, 101, 40, 110, 41, 44, 32, 99, 95,
+105, 50, 117, 95, 115, 105, 122, 101, 40, 115, 122, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 114, 101, 97, 108, 108, 111,
+99, 40, 112, 44, 32, 111, 108, 100, 95, 115, 122, 44, 32, 115, 122,
+41, 32, 114, 101, 97, 108, 108, 111, 99, 40, 112, 44, 32, 99, 95, 105,
+50, 117, 95, 115, 105, 122, 101, 40, 49, 32, 63, 32, 40, 115, 122, 41,
+32, 58, 32, 40, 111, 108, 100, 95, 115, 122, 41, 41, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 102, 114, 101, 101, 40, 112, 44,
+32, 115, 122, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 100,
+111, 32, 123, 32, 40, 118, 111, 105, 100, 41, 40, 115, 122, 41, 59,
+32, 102, 114, 101, 101, 40, 112, 41, 59, 32, 125, 32, 119, 104, 105,
+108, 101, 40, 48, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99,
+95, 100, 101, 108, 101, 116, 101, 40, 84, 44, 32, 112, 116, 114, 41,
+32, 32, 32, 32, 32, 32, 32, 32, 100, 111, 32, 123, 32, 84, 32, 42, 95,
+116, 112, 32, 61, 32, 112, 116, 114, 59, 32, 84, 35, 35, 95, 100, 114,
+111, 112, 40, 95, 116, 112, 41, 59, 32, 102, 114, 101, 101, 40, 95,
+116, 112, 41, 59, 32, 125, 32, 119, 104, 105, 108, 101, 32, 40, 48,
+41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 116,
+97, 116, 105, 99, 95, 97, 115, 115, 101, 114, 116, 40, 101, 120, 112,
+114, 41, 32, 32, 32, 40, 49, 32, 63, 32, 48, 32, 58, 32, 40, 105, 110,
+116, 41, 115, 105, 122, 101, 111, 102, 40, 105, 110, 116, 91, 40, 101,
+120, 112, 114, 41, 32, 63, 32, 49, 32, 58, 32, 45, 49, 93, 41, 41, 10,
+35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67,
+95, 78, 68, 69, 66, 85, 71, 32, 124, 124, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 78, 68, 69, 66, 85, 71, 10, 32, 32, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 97, 115, 115, 101, 114, 116, 40,
+101, 120, 112, 114, 41, 32, 32, 32, 32, 32, 32, 40, 40, 118, 111, 105,
+100, 41, 48, 41, 10, 35, 101, 108, 115, 101, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 83, 84, 67, 95, 65, 83, 83, 69, 82, 84, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 65, 83, 83, 69, 82,
+84, 40, 101, 120, 112, 114, 41, 10, 35, 101, 110, 100, 105, 102, 10,
+32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 97, 115,
+115, 101, 114, 116, 40, 101, 120, 112, 114, 41, 32, 32, 32, 32, 32,
+32, 83, 84, 67, 95, 65, 83, 83, 69, 82, 84, 40, 101, 120, 112, 114,
+41, 10, 35, 101, 110, 100, 105, 102, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 111,
+102, 40, 112, 44, 32, 67, 44, 32, 109, 41, 32, 40, 40, 67, 42, 41, 40,
+40, 99, 104, 97, 114, 42, 41, 40, 49, 32, 63, 32, 40, 112, 41, 32, 58,
+32, 38, 40, 40, 67, 42, 41, 48, 41, 45, 62, 109, 41, 32, 45, 32, 111,
+102, 102, 115, 101, 116, 111, 102, 40, 67, 44, 32, 109, 41, 41, 41,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 99, 111, 110, 115,
+116, 95, 99, 97, 115, 116, 40, 84, 112, 44, 32, 112, 41, 32, 32, 32,
+32, 32, 40, 40, 84, 112, 41, 40, 49, 32, 63, 32, 40, 112, 41, 32, 58,
+32, 40, 84, 112, 41, 48, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 115, 97, 102, 101, 95, 99, 97, 115, 116, 40, 84, 44, 32,
+70, 44, 32, 120, 41, 32, 32, 32, 32, 40, 40, 84, 41, 40, 49, 32, 63,
+32, 40, 120, 41, 32, 58, 32, 40, 70, 41, 123, 48, 125, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 119, 97, 112, 40, 84,
+44, 32, 120, 112, 44, 32, 121, 112, 41, 32, 32, 32, 32, 32, 32, 32,
+100, 111, 32, 123, 32, 84, 32, 42, 95, 120, 112, 32, 61, 32, 120, 112,
+44, 32, 42, 95, 121, 112, 32, 61, 32, 121, 112, 44, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 95, 116, 118, 32, 61, 32, 42, 95, 120, 112, 59, 32, 42, 95, 120,
+112, 32, 61, 32, 42, 95, 121, 112, 59, 32, 42, 95, 121, 112, 32, 61,
+32, 95, 116, 118, 59, 32, 125, 32, 119, 104, 105, 108, 101, 32, 40,
+48, 41, 10, 47, 47, 32, 117, 115, 101, 32, 119, 105, 116, 104, 32,
+103, 99, 99, 32, 45, 87, 99, 111, 110, 118, 101, 114, 115, 105, 111,
+110, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 105, 122,
+101, 111, 102, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 40, 105, 110, 116, 112, 116, 114, 95, 116, 41, 115, 105, 122,
+101, 111, 102, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115,
+116, 114, 108, 101, 110, 40, 115, 41, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 40, 105, 110, 116, 112, 116, 114, 95, 116, 41,
+115, 116, 114, 108, 101, 110, 40, 115, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 115, 116, 114, 110, 99, 109, 112, 40, 97, 44,
+32, 98, 44, 32, 105, 108, 101, 110, 41, 32, 32, 32, 115, 116, 114,
+110, 99, 109, 112, 40, 97, 44, 32, 98, 44, 32, 99, 95, 105, 50, 117,
+95, 115, 105, 122, 101, 40, 105, 108, 101, 110, 41, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 109, 101, 109, 99, 112, 121, 40,
+100, 44, 32, 115, 44, 32, 105, 108, 101, 110, 41, 32, 32, 32, 32, 109,
+101, 109, 99, 112, 121, 40, 100, 44, 32, 115, 44, 32, 99, 95, 105, 50,
+117, 95, 115, 105, 122, 101, 40, 105, 108, 101, 110, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 109, 101, 109, 109, 111,
+118, 101, 40, 100, 44, 32, 115, 44, 32, 105, 108, 101, 110, 41, 32,
+32, 32, 109, 101, 109, 109, 111, 118, 101, 40, 100, 44, 32, 115, 44,
+32, 99, 95, 105, 50, 117, 95, 115, 105, 122, 101, 40, 105, 108, 101,
+110, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 109,
+101, 109, 115, 101, 116, 40, 100, 44, 32, 118, 97, 108, 44, 32, 105,
+108, 101, 110, 41, 32, 32, 109, 101, 109, 115, 101, 116, 40, 100, 44,
+32, 118, 97, 108, 44, 32, 99, 95, 105, 50, 117, 95, 115, 105, 122,
+101, 40, 105, 108, 101, 110, 41, 41, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 109, 101, 109, 99, 109, 112, 40, 97, 44, 32, 98, 44,
+32, 105, 108, 101, 110, 41, 32, 32, 32, 32, 109, 101, 109, 99, 109,
+112, 40, 97, 44, 32, 98, 44, 32, 99, 95, 105, 50, 117, 95, 115, 105,
+122, 101, 40, 105, 108, 101, 110, 41, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 117, 50, 105, 95, 115, 105, 122, 101, 40, 117,
+41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 105, 110, 116,
+112, 116, 114, 95, 116, 41, 40, 49, 32, 63, 32, 40, 117, 41, 32, 58,
+32, 40, 115, 105, 122, 101, 95, 116, 41, 49, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 105, 50, 117, 95, 115, 105, 122, 101,
+40, 105, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 115, 105,
+122, 101, 95, 116, 41, 40, 49, 32, 63, 32, 40, 105, 41, 32, 58, 32,
+45, 49, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 108,
+101, 115, 115, 95, 117, 110, 115, 105, 103, 110, 101, 100, 40, 97, 44,
+32, 98, 41, 32, 32, 32, 40, 40, 115, 105, 122, 101, 95, 116, 41, 40,
+97, 41, 32, 60, 32, 40, 115, 105, 122, 101, 95, 116, 41, 40, 98, 41,
+41, 10, 10, 47, 47, 32, 120, 32, 97, 110, 100, 32, 121, 32, 97, 114,
+101, 32, 105, 95, 107, 101, 121, 114, 97, 119, 42, 32, 116, 121, 112,
+101, 44, 32, 100, 101, 102, 97, 117, 108, 116, 115, 32, 116, 111, 32,
+105, 95, 107, 101, 121, 42, 58, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 99, 109, 112, 40,
+120, 44, 32, 121, 41, 32, 32, 32, 32, 32, 40, 99, 95, 100, 101, 102,
+97, 117, 108, 116, 95, 108, 101, 115, 115, 40, 121, 44, 32, 120, 41,
+32, 45, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 108, 101,
+115, 115, 40, 120, 44, 32, 121, 41, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 108, 101,
+115, 115, 40, 120, 44, 32, 121, 41, 32, 32, 32, 32, 40, 42, 40, 120,
+41, 32, 60, 32, 42, 40, 121, 41, 41, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 101, 113, 40,
+120, 44, 32, 121, 41, 32, 32, 32, 32, 32, 32, 40, 42, 40, 120, 41, 32,
+61, 61, 32, 42, 40, 121, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 109, 101, 109, 99, 109, 112, 95, 101, 113, 40, 120, 44,
+32, 121, 41, 32, 32, 32, 32, 32, 32, 32, 40, 109, 101, 109, 99, 109,
+112, 40, 120, 44, 32, 121, 44, 32, 115, 105, 122, 101, 111, 102, 32,
+42, 40, 120, 41, 41, 32, 61, 61, 32, 48, 41, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 104,
+97, 115, 104, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 115, 116, 99,
+95, 104, 97, 115, 104, 95, 49, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 99, 108, 111,
+110, 101, 40, 118, 41, 32, 32, 32, 32, 32, 32, 40, 118, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 100, 101, 102, 97, 117, 108,
+116, 95, 116, 111, 114, 97, 119, 40, 118, 112, 41, 32, 32, 32, 32, 32,
+40, 42, 40, 118, 112, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 100, 114, 111, 112,
+40, 118, 112, 41, 32, 32, 32, 32, 32, 32, 40, 40, 118, 111, 105, 100,
+41, 32, 40, 118, 112, 41, 41, 10, 10, 47, 42, 32, 70, 117, 110, 99,
+116, 105, 111, 110, 32, 109, 97, 99, 114, 111, 115, 32, 97, 110, 100,
+32, 111, 116, 104, 101, 114, 115, 32, 42, 47, 10, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 108, 105, 116, 115, 116, 114, 108,
+101, 110, 40, 108, 105, 116, 101, 114, 97, 108, 41, 32, 40, 99, 95,
+115, 105, 122, 101, 111, 102, 40, 34, 34, 32, 108, 105, 116, 101, 114,
+97, 108, 41, 32, 45, 32, 49, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 97, 114, 114, 97, 121, 108, 101, 110, 40, 97, 41, 32, 40,
+105, 110, 116, 112, 116, 114, 95, 116, 41, 40, 115, 105, 122, 101,
+111, 102, 40, 97, 41, 47, 115, 105, 122, 101, 111, 102, 32, 48, 91,
+97, 93, 41, 10, 10, 47, 47, 32, 78, 111, 110, 45, 111, 119, 110, 105,
+110, 103, 32, 99, 45, 115, 116, 114, 105, 110, 103, 32, 34, 99, 108,
+97, 115, 115, 34, 10, 116, 121, 112, 101, 100, 101, 102, 32, 99, 111,
+110, 115, 116, 32, 99, 104, 97, 114, 42, 32, 99, 99, 104, 97, 114,
+112, 116, 114, 59, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 99,
+104, 97, 114, 112, 116, 114, 95, 99, 109, 112, 40, 120, 112, 44, 32,
+121, 112, 41, 32, 115, 116, 114, 99, 109, 112, 40, 42, 40, 120, 112,
+41, 44, 32, 42, 40, 121, 112, 41, 41, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 99, 104, 97, 114, 112, 116, 114, 95, 104, 97, 115, 104,
+40, 112, 41, 32, 115, 116, 99, 95, 115, 116, 114, 104, 97, 115, 104,
+40, 42, 40, 112, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99,
+99, 104, 97, 114, 112, 116, 114, 95, 99, 108, 111, 110, 101, 40, 115,
+41, 32, 40, 115, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 99,
+104, 97, 114, 112, 116, 114, 95, 100, 114, 111, 112, 40, 112, 41, 32,
+40, 40, 118, 111, 105, 100, 41, 112, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 115, 118, 40, 46, 46, 46, 41, 32, 99, 95,
+77, 65, 67, 82, 79, 95, 79, 86, 69, 82, 76, 79, 65, 68, 40, 99, 95,
+115, 118, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 118, 95, 49, 40,
+108, 105, 116, 101, 114, 97, 108, 41, 32, 99, 95, 115, 118, 95, 50,
+40, 108, 105, 116, 101, 114, 97, 108, 44, 32, 99, 95, 108, 105, 116,
+115, 116, 114, 108, 101, 110, 40, 108, 105, 116, 101, 114, 97, 108,
+41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 118,
+95, 50, 40, 115, 116, 114, 44, 32, 110, 41, 32, 40, 99, 95, 76, 73,
+84, 69, 82, 65, 76, 40, 99, 115, 118, 105, 101, 119, 41, 123, 115,
+116, 114, 44, 32, 110, 125, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 83, 86, 40, 115, 118, 41, 32, 40, 105, 110, 116, 41, 40,
+115, 118, 41, 46, 115, 105, 122, 101, 44, 32, 40, 115, 118, 41, 46,
+98, 117, 102, 32, 47, 47, 32, 112, 114, 105, 110, 116, 102, 40, 34,
+37, 46, 42, 115, 92, 110, 34, 44, 32, 99, 95, 83, 86, 40, 115, 118,
+41, 41, 59, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 114,
+115, 40, 108, 105, 116, 101, 114, 97, 108, 41, 32, 99, 95, 114, 115,
+95, 50, 40, 108, 105, 116, 101, 114, 97, 108, 44, 32, 99, 95, 108,
+105, 116, 115, 116, 114, 108, 101, 110, 40, 108, 105, 116, 101, 114,
+97, 108, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95,
+114, 115, 95, 50, 40, 115, 116, 114, 44, 32, 110, 41, 32, 40, 99, 95,
+76, 73, 84, 69, 82, 65, 76, 40, 99, 114, 97, 119, 115, 116, 114, 41,
+123, 115, 116, 114, 44, 32, 110, 125, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 82, 79, 84, 76, 40, 120, 44, 32, 107, 41,
+32, 40, 120, 32, 60, 60, 32, 40, 107, 41, 32, 124, 32, 120, 32, 62,
+62, 32, 40, 56, 42, 115, 105, 122, 101, 111, 102, 40, 120, 41, 32, 45,
+32, 40, 107, 41, 41, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+115, 116, 99, 95, 104, 97, 115, 104, 40, 46, 46, 46, 41, 32, 99, 95,
+77, 65, 67, 82, 79, 95, 79, 86, 69, 82, 76, 79, 65, 68, 40, 115, 116,
+99, 95, 104, 97, 115, 104, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83,
+95, 95, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 115, 116, 99,
+95, 104, 97, 115, 104, 95, 49, 40, 120, 41, 32, 115, 116, 99, 95, 104,
+97, 115, 104, 95, 50, 40, 120, 44, 32, 99, 95, 115, 105, 122, 101,
+111, 102, 40, 42, 40, 120, 41, 41, 41, 10, 10, 83, 84, 67, 95, 73, 78,
+76, 73, 78, 69, 32, 117, 105, 110, 116, 54, 52, 95, 116, 32, 115, 116,
+99, 95, 104, 97, 115, 104, 95, 50, 40, 99, 111, 110, 115, 116, 32,
+118, 111, 105, 100, 42, 32, 107, 101, 121, 44, 32, 105, 110, 116, 112,
+116, 114, 95, 116, 32, 108, 101, 110, 41, 32, 123, 10, 32, 32, 32, 32,
+117, 105, 110, 116, 51, 50, 95, 116, 32, 117, 52, 59, 32, 117, 105,
+110, 116, 54, 52, 95, 116, 32, 117, 56, 59, 10, 32, 32, 32, 32, 115,
+119, 105, 116, 99, 104, 32, 40, 108, 101, 110, 41, 32, 123, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 99, 97, 115, 101, 32, 56, 58, 32, 109,
+101, 109, 99, 112, 121, 40, 38, 117, 56, 44, 32, 107, 101, 121, 44,
+32, 56, 41, 59, 32, 114, 101, 116, 117, 114, 110, 32, 117, 56, 42, 48,
+120, 99, 54, 97, 52, 97, 55, 57, 51, 53, 98, 100, 49, 101, 57, 57,
+100, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 99, 97, 115, 101, 32, 52,
+58, 32, 109, 101, 109, 99, 112, 121, 40, 38, 117, 52, 44, 32, 107,
+101, 121, 44, 32, 52, 41, 59, 32, 114, 101, 116, 117, 114, 110, 32,
+117, 52, 42, 48, 120, 99, 54, 97, 52, 97, 55, 57, 51, 53, 98, 100, 49,
+101, 57, 57, 100, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 99, 97, 115,
+101, 32, 48, 58, 32, 114, 101, 116, 117, 114, 110, 32, 49, 59, 10, 32,
+32, 32, 32, 125, 10, 32, 32, 32, 32, 99, 111, 110, 115, 116, 32, 117,
+105, 110, 116, 56, 95, 116, 32, 42, 120, 32, 61, 32, 40, 99, 111, 110,
+115, 116, 32, 117, 105, 110, 116, 56, 95, 116, 42, 41, 107, 101, 121,
+59, 10, 32, 32, 32, 32, 117, 105, 110, 116, 54, 52, 95, 116, 32, 104,
+32, 61, 32, 40, 117, 105, 110, 116, 54, 52, 95, 116, 41, 42, 120, 32,
+60, 60, 32, 55, 44, 32, 110, 32, 61, 32, 40, 117, 105, 110, 116, 54,
+52, 95, 116, 41, 108, 101, 110, 32, 62, 62, 32, 51, 59, 10, 32, 32,
+32, 32, 108, 101, 110, 32, 38, 61, 32, 55, 59, 10, 32, 32, 32, 32,
+119, 104, 105, 108, 101, 32, 40, 110, 45, 45, 41, 32, 123, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 109, 101, 109, 99, 112, 121, 40, 38, 117, 56,
+44, 32, 120, 44, 32, 56, 41, 44, 32, 120, 32, 43, 61, 32, 56, 59, 10,
+32, 32, 32, 32, 32, 32, 32, 32, 104, 32, 61, 32, 40, 104, 32, 94, 32,
+117, 56, 41, 42, 48, 120, 99, 54, 97, 52, 97, 55, 57, 51, 53, 98, 100,
+49, 101, 57, 57, 100, 59, 10, 32, 32, 32, 32, 125, 10, 32, 32, 32, 32,
+119, 104, 105, 108, 101, 32, 40, 108, 101, 110, 45, 45, 41, 32, 104,
+32, 61, 32, 40, 104, 32, 94, 32, 42, 120, 43, 43, 41, 42, 48, 120, 49,
+48, 48, 48, 48, 48, 48, 48, 49, 98, 51, 59, 10, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 104, 32, 94, 32, 99, 95, 82, 79, 84, 76,
+40, 104, 44, 32, 50, 54, 41, 59, 10, 125, 10, 10, 83, 84, 67, 95, 73,
+78, 76, 73, 78, 69, 32, 117, 105, 110, 116, 54, 52, 95, 116, 32, 115,
+116, 99, 95, 115, 116, 114, 104, 97, 115, 104, 40, 99, 111, 110, 115,
+116, 32, 99, 104, 97, 114, 32, 42, 115, 116, 114, 41, 10, 32, 32, 32,
+32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 115, 116, 99, 95, 104,
+97, 115, 104, 95, 50, 40, 115, 116, 114, 44, 32, 99, 95, 115, 116,
+114, 108, 101, 110, 40, 115, 116, 114, 41, 41, 59, 32, 125, 10, 10,
+83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 117, 105, 110, 116, 54,
+52, 95, 116, 32, 95, 115, 116, 99, 95, 104, 97, 115, 104, 95, 109,
+105, 120, 40, 117, 105, 110, 116, 54, 52, 95, 116, 32, 104, 91, 93,
+44, 32, 105, 110, 116, 32, 110, 41, 32, 123, 32, 47, 47, 32, 110, 32,
+62, 32, 48, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 105, 110, 116,
+32, 105, 32, 61, 32, 49, 59, 32, 105, 32, 60, 32, 110, 59, 32, 43, 43,
+105, 41, 32, 104, 91, 48, 93, 32, 94, 61, 32, 104, 91, 48, 93, 32, 43,
+32, 104, 91, 105, 93, 59, 32, 47, 47, 32, 110, 111, 110, 45, 99, 111,
+109, 109, 117, 116, 97, 116, 105, 118, 101, 33, 10, 32, 32, 32, 32,
+114, 101, 116, 117, 114, 110, 32, 104, 91, 48, 93, 59, 10, 125, 10,
+10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 99, 104, 97, 114, 42,
+32, 115, 116, 99, 95, 115, 116, 114, 110, 115, 116, 114, 110, 40, 99,
+111, 110, 115, 116, 32, 99, 104, 97, 114, 32, 42, 115, 116, 114, 44,
+32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 115, 108, 101, 110, 44,
+32, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 99, 111,
+110, 115, 116, 32, 99, 104, 97, 114, 32, 42, 110, 101, 101, 100, 108,
+101, 44, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 110, 108, 101,
+110, 41, 32, 123, 10, 32, 32, 32, 32, 105, 102, 32, 40, 33, 110, 108,
+101, 110, 41, 32, 114, 101, 116, 117, 114, 110, 32, 40, 99, 104, 97,
+114, 32, 42, 41, 115, 116, 114, 59, 10, 32, 32, 32, 32, 105, 102, 32,
+40, 110, 108, 101, 110, 32, 62, 32, 115, 108, 101, 110, 41, 32, 114,
+101, 116, 117, 114, 110, 32, 78, 85, 76, 76, 59, 10, 32, 32, 32, 32,
+115, 108, 101, 110, 32, 45, 61, 32, 110, 108, 101, 110, 59, 10, 32,
+32, 32, 32, 100, 111, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+105, 102, 32, 40, 42, 115, 116, 114, 32, 61, 61, 32, 42, 110, 101,
+101, 100, 108, 101, 32, 38, 38, 32, 33, 99, 95, 109, 101, 109, 99,
+109, 112, 40, 115, 116, 114, 44, 32, 110, 101, 101, 100, 108, 101, 44,
+32, 110, 108, 101, 110, 41, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 40, 99, 104, 97,
+114, 32, 42, 41, 115, 116, 114, 59, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 43, 43, 115, 116, 114, 59, 10, 32, 32, 32, 32, 125, 32, 119, 104,
+105, 108, 101, 32, 40, 115, 108, 101, 110, 45, 45, 41, 59, 10, 32, 32,
+32, 32, 114, 101, 116, 117, 114, 110, 32, 78, 85, 76, 76, 59, 10, 125,
+10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 105, 110, 116,
+112, 116, 114, 95, 116, 32, 115, 116, 99, 95, 110, 101, 120, 116, 112,
+111, 119, 50, 40, 105, 110, 116, 112, 116, 114, 95, 116, 32, 110, 41,
+32, 123, 10, 32, 32, 32, 32, 110, 45, 45, 59, 10, 32, 32, 32, 32, 110,
+32, 124, 61, 32, 110, 32, 62, 62, 32, 49, 44, 32, 110, 32, 124, 61,
+32, 110, 32, 62, 62, 32, 50, 59, 10, 32, 32, 32, 32, 110, 32, 124, 61,
+32, 110, 32, 62, 62, 32, 52, 44, 32, 110, 32, 124, 61, 32, 110, 32,
+62, 62, 32, 56, 59, 10, 32, 32, 32, 32, 110, 32, 124, 61, 32, 110, 32,
+62, 62, 32, 49, 54, 59, 10, 32, 32, 32, 32, 35, 105, 102, 32, 73, 78,
+84, 80, 84, 82, 95, 77, 65, 88, 32, 61, 61, 32, 73, 78, 84, 54, 52,
+95, 77, 65, 88, 10, 32, 32, 32, 32, 110, 32, 124, 61, 32, 110, 32, 62,
+62, 32, 51, 50, 59, 10, 32, 32, 32, 32, 35, 101, 110, 100, 105, 102,
+10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 110, 32, 43, 32,
+49, 59, 10, 125, 10, 47, 42, 32, 67, 111, 110, 116, 114, 111, 108, 32,
+98, 108, 111, 99, 107, 32, 109, 97, 99, 114, 111, 115, 32, 42, 47, 10,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102, 111, 114, 101,
+97, 99, 104, 40, 46, 46, 46, 41, 32, 99, 95, 77, 65, 67, 82, 79, 95,
+79, 86, 69, 82, 76, 79, 65, 68, 40, 99, 95, 102, 111, 114, 101, 97,
+99, 104, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102, 111, 114, 101, 97,
+99, 104, 95, 51, 40, 105, 116, 44, 32, 67, 44, 32, 99, 110, 116, 41,
+32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 67, 35, 35, 95,
+105, 116, 101, 114, 32, 105, 116, 32, 61, 32, 67, 35, 35, 95, 98, 101,
+103, 105, 110, 40, 38, 99, 110, 116, 41, 59, 32, 105, 116, 46, 114,
+101, 102, 59, 32, 67, 35, 35, 95, 110, 101, 120, 116, 40, 38, 105,
+116, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102,
+111, 114, 101, 97, 99, 104, 95, 52, 40, 105, 116, 44, 32, 67, 44, 32,
+115, 116, 97, 114, 116, 44, 32, 102, 105, 110, 105, 115, 104, 41, 32,
+92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 67, 35, 35, 95, 105,
+116, 101, 114, 32, 105, 116, 32, 61, 32, 40, 115, 116, 97, 114, 116,
+41, 44, 32, 42, 95, 101, 110, 100, 114, 101, 102, 32, 61, 32, 99, 95,
+115, 97, 102, 101, 95, 99, 97, 115, 116, 40, 67, 35, 35, 95, 105, 116,
+101, 114, 42, 44, 32, 67, 35, 35, 95, 118, 97, 108, 117, 101, 42, 44,
+32, 40, 102, 105, 110, 105, 115, 104, 41, 46, 114, 101, 102, 41, 32,
+92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 105, 116, 46, 114,
+101, 102, 32, 33, 61, 32, 40, 67, 35, 35, 95, 118, 97, 108, 117, 101,
+42, 41, 95, 101, 110, 100, 114, 101, 102, 59, 32, 67, 35, 35, 95, 110,
+101, 120, 116, 40, 38, 105, 116, 41, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 112, 97, 105, 114, 40, 107,
+101, 121, 44, 32, 118, 97, 108, 44, 32, 67, 44, 32, 99, 110, 116, 41,
+32, 47, 42, 32, 115, 116, 114, 117, 99, 116, 117, 114, 101, 100, 32,
+98, 105, 110, 100, 105, 110, 103, 32, 42, 47, 32, 92, 10, 32, 32, 32,
+32, 102, 111, 114, 32, 40, 115, 116, 114, 117, 99, 116, 32, 123, 67,
+35, 35, 95, 105, 116, 101, 114, 32, 105, 116, 101, 114, 59, 32, 99,
+111, 110, 115, 116, 32, 67, 35, 35, 95, 107, 101, 121, 42, 32, 107,
+101, 121, 59, 32, 67, 35, 35, 95, 109, 97, 112, 112, 101, 100, 42, 32,
+118, 97, 108, 59, 125, 32, 95, 32, 61, 32, 123, 46, 105, 116, 101,
+114, 61, 67, 35, 35, 95, 98, 101, 103, 105, 110, 40, 38, 99, 110, 116,
+41, 125, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 95,
+46, 105, 116, 101, 114, 46, 114, 101, 102, 32, 38, 38, 32, 40, 95, 46,
+107, 101, 121, 32, 61, 32, 38, 95, 46, 105, 116, 101, 114, 46, 114,
+101, 102, 45, 62, 102, 105, 114, 115, 116, 44, 32, 95, 46, 118, 97,
+108, 32, 61, 32, 38, 95, 46, 105, 116, 101, 114, 46, 114, 101, 102,
+45, 62, 115, 101, 99, 111, 110, 100, 41, 32, 92, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 59, 32, 67, 35, 35, 95, 110, 101, 120, 116, 40,
+38, 95, 46, 105, 116, 101, 114, 41, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 105, 110, 100, 101, 120,
+101, 100, 40, 105, 116, 44, 32, 67, 44, 32, 99, 110, 116, 41, 32, 92,
+10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 115, 116, 114, 117, 99,
+116, 32, 123, 67, 35, 35, 95, 105, 116, 101, 114, 32, 105, 116, 101,
+114, 59, 32, 67, 35, 35, 95, 118, 97, 108, 117, 101, 42, 32, 114, 101,
+102, 59, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105, 110, 100,
+101, 120, 59, 125, 32, 105, 116, 32, 61, 32, 123, 46, 105, 116, 101,
+114, 61, 67, 35, 35, 95, 98, 101, 103, 105, 110, 40, 38, 99, 110, 116,
+41, 125, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 40,
+105, 116, 46, 114, 101, 102, 32, 61, 32, 105, 116, 46, 105, 116, 101,
+114, 46, 114, 101, 102, 41, 32, 59, 32, 67, 35, 35, 95, 110, 101, 120,
+116, 40, 38, 105, 116, 46, 105, 116, 101, 114, 41, 44, 32, 43, 43,
+105, 116, 46, 105, 110, 100, 101, 120, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 105, 116, 101, 114, 40, 101,
+120, 105, 115, 116, 105, 110, 103, 95, 105, 116, 101, 114, 44, 32, 67,
+44, 32, 99, 110, 116, 41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114,
+32, 40, 101, 120, 105, 115, 116, 105, 110, 103, 95, 105, 116, 101,
+114, 32, 61, 32, 67, 35, 35, 95, 98, 101, 103, 105, 110, 40, 38, 99,
+110, 116, 41, 59, 32, 40, 101, 120, 105, 115, 116, 105, 110, 103, 95,
+105, 116, 101, 114, 41, 46, 114, 101, 102, 59, 32, 67, 35, 35, 95,
+110, 101, 120, 116, 40, 38, 101, 120, 105, 115, 116, 105, 110, 103,
+95, 105, 116, 101, 114, 41, 41, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 40, 46, 46,
+46, 41, 32, 99, 95, 77, 65, 67, 82, 79, 95, 79, 86, 69, 82, 76, 79,
+65, 68, 40, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 44, 32, 95,
+95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 95,
+49, 40, 115, 116, 111, 112, 41, 32, 99, 95, 102, 111, 114, 114, 97,
+110, 103, 101, 95, 51, 40, 95, 105, 44, 32, 48, 44, 32, 115, 116, 111,
+112, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102, 111,
+114, 114, 97, 110, 103, 101, 95, 50, 40, 105, 44, 32, 115, 116, 111,
+112, 41, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 95, 51,
+40, 105, 44, 32, 48, 44, 32, 115, 116, 111, 112, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101,
+95, 51, 40, 105, 44, 32, 115, 116, 97, 114, 116, 44, 32, 115, 116,
+111, 112, 41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 95,
+108, 108, 111, 110, 103, 32, 105, 61, 115, 116, 97, 114, 116, 44, 32,
+95, 101, 110, 100, 61, 115, 116, 111, 112, 59, 32, 105, 32, 60, 32,
+95, 101, 110, 100, 59, 32, 43, 43, 105, 41, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 95,
+52, 40, 105, 44, 32, 115, 116, 97, 114, 116, 44, 32, 115, 116, 111,
+112, 44, 32, 115, 116, 101, 112, 41, 32, 92, 10, 32, 32, 32, 32, 102,
+111, 114, 32, 40, 95, 108, 108, 111, 110, 103, 32, 105, 61, 115, 116,
+97, 114, 116, 44, 32, 95, 105, 110, 99, 61, 115, 116, 101, 112, 44,
+32, 95, 101, 110, 100, 61, 40, 95, 108, 108, 111, 110, 103, 41, 40,
+115, 116, 111, 112, 41, 32, 45, 32, 40, 95, 105, 110, 99, 32, 62, 32,
+48, 41, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 40,
+95, 105, 110, 99, 32, 62, 32, 48, 41, 32, 94, 32, 40, 105, 32, 62, 32,
+95, 101, 110, 100, 41, 59, 32, 105, 32, 43, 61, 32, 95, 105, 110, 99,
+41, 10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 95, 95, 99, 112,
+108, 117, 115, 112, 108, 117, 115, 10, 32, 32, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 105, 110, 105, 116, 40, 67, 44, 32,
+46, 46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 67, 35,
+35, 95, 102, 114, 111, 109, 95, 110, 40, 40, 67, 35, 35, 95, 114, 97,
+119, 91, 93, 41, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 44, 32,
+99, 95, 115, 105, 122, 101, 111, 102, 40, 40, 67, 35, 35, 95, 114, 97,
+119, 91, 93, 41, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 47,
+99, 95, 115, 105, 122, 101, 111, 102, 40, 67, 35, 35, 95, 114, 97,
+119, 41, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 102, 111, 114, 108, 105, 115, 116, 40, 105, 116, 44, 32, 84,
+44, 32, 46, 46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+102, 111, 114, 32, 40, 115, 116, 114, 117, 99, 116, 32, 123, 84, 42,
+32, 114, 101, 102, 59, 32, 105, 110, 116, 32, 115, 105, 122, 101, 44,
+32, 105, 110, 100, 101, 120, 59, 125, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 105, 116, 32, 61, 32, 123, 46, 114,
+101, 102, 61, 40, 84, 91, 93, 41, 95, 95, 86, 65, 95, 65, 82, 71, 83,
+95, 95, 44, 32, 46, 115, 105, 122, 101, 61, 40, 105, 110, 116, 41, 40,
+115, 105, 122, 101, 111, 102, 40, 40, 84, 91, 93, 41, 95, 95, 86, 65,
+95, 65, 82, 71, 83, 95, 95, 41, 47, 115, 105, 122, 101, 111, 102, 40,
+84, 41, 41, 125, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 59, 32, 105, 116, 46, 105, 110, 100, 101, 120, 32, 60, 32,
+105, 116, 46, 115, 105, 122, 101, 59, 32, 43, 43, 105, 116, 46, 114,
+101, 102, 44, 32, 43, 43, 105, 116, 46, 105, 110, 100, 101, 120, 41,
+10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 115, 116,
+99, 95, 104, 97, 115, 104, 95, 109, 105, 120, 40, 46, 46, 46, 41, 32,
+92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 115, 116, 99, 95, 104, 97,
+115, 104, 95, 109, 105, 120, 40, 40, 117, 105, 110, 116, 54, 52, 95,
+116, 91, 93, 41, 123, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 125,
+44, 32, 99, 95, 78, 85, 77, 65, 82, 71, 83, 40, 95, 95, 86, 65, 95,
+65, 82, 71, 83, 95, 95, 41, 41, 10, 35, 101, 108, 115, 101, 10, 47,
+47, 32, 69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103,
+101, 110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101,
+97, 100, 101, 114, 115, 46, 112, 121, 32, 32, 32, 32, 32, 35, 105,
+110, 99, 108, 117, 100, 101, 32, 60, 105, 110, 105, 116, 105, 97, 108,
+105, 122, 101, 114, 95, 108, 105, 115, 116, 62, 10, 47, 47, 32, 69,
+88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110,
+95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100,
+101, 114, 115, 46, 112, 121, 32, 32, 32, 32, 32, 35, 105, 110, 99,
+108, 117, 100, 101, 32, 60, 97, 114, 114, 97, 121, 62, 10, 32, 32, 32,
+32, 116, 101, 109, 112, 108, 97, 116, 101, 32, 60, 99, 108, 97, 115,
+115, 32, 67, 44, 32, 99, 108, 97, 115, 115, 32, 84, 62, 10, 32, 32,
+32, 32, 105, 110, 108, 105, 110, 101, 32, 67, 32, 95, 102, 114, 111,
+109, 95, 110, 40, 67, 32, 40, 42, 102, 117, 110, 99, 41, 40, 99, 111,
+110, 115, 116, 32, 84, 91, 93, 44, 32, 105, 110, 116, 112, 116, 114,
+95, 116, 41, 44, 32, 115, 116, 100, 58, 58, 105, 110, 105, 116, 105,
+97, 108, 105, 122, 101, 114, 95, 108, 105, 115, 116, 60, 84, 62, 32,
+105, 108, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 123, 32, 114, 101,
+116, 117, 114, 110, 32, 102, 117, 110, 99, 40, 38, 42, 105, 108, 46,
+98, 101, 103, 105, 110, 40, 41, 44, 32, 105, 108, 46, 115, 105, 122,
+101, 40, 41, 41, 59, 32, 125, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 105, 110, 105, 116, 40, 67, 44, 32, 46, 46,
+46, 41, 32, 95, 102, 114, 111, 109, 95, 110, 60, 67, 44, 67, 35, 35,
+95, 114, 97, 119, 62, 40, 67, 35, 35, 95, 102, 114, 111, 109, 95, 110,
+44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10, 32, 32,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102, 111, 114,
+108, 105, 115, 116, 40, 105, 116, 44, 32, 84, 44, 32, 46, 46, 46, 41,
+32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 102, 111, 114, 32, 40,
+115, 116, 114, 117, 99, 116, 32, 123, 115, 116, 100, 58, 58, 105, 110,
+105, 116, 105, 97, 108, 105, 122, 101, 114, 95, 108, 105, 115, 116,
+60, 84, 62, 32, 95, 105, 108, 59, 32, 115, 116, 100, 58, 58, 105, 110,
+105, 116, 105, 97, 108, 105, 122, 101, 114, 95, 108, 105, 115, 116,
+60, 84, 62, 58, 58, 105, 116, 101, 114, 97, 116, 111, 114, 32, 114,
+101, 102, 59, 32, 115, 105, 122, 101, 95, 116, 32, 115, 105, 122, 101,
+44, 32, 105, 110, 100, 101, 120, 59, 125, 32, 92, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 105, 116, 32, 61, 32, 123, 46, 95,
+105, 108, 61, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 44, 32, 46,
+114, 101, 102, 61, 105, 116, 46, 95, 105, 108, 46, 98, 101, 103, 105,
+110, 40, 41, 44, 32, 46, 115, 105, 122, 101, 61, 105, 116, 46, 95,
+105, 108, 46, 115, 105, 122, 101, 40, 41, 125, 32, 92, 10, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 105, 116, 46, 105,
+110, 100, 101, 120, 32, 60, 32, 105, 116, 46, 115, 105, 122, 101, 59,
+32, 43, 43, 105, 116, 46, 114, 101, 102, 44, 32, 43, 43, 105, 116, 46,
+105, 110, 100, 101, 120, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 115, 116, 99, 95, 104, 97, 115, 104, 95, 109, 105,
+120, 40, 46, 46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+95, 115, 116, 99, 95, 104, 97, 115, 104, 95, 109, 105, 120, 40, 115,
+116, 100, 58, 58, 97, 114, 114, 97, 121, 60, 117, 105, 110, 116, 54,
+52, 95, 116, 44, 32, 99, 95, 78, 85, 77, 65, 82, 71, 83, 40, 95, 95,
+86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 62, 123, 95, 95, 86, 65, 95,
+65, 82, 71, 83, 95, 95, 125, 46, 100, 97, 116, 97, 40, 41, 44, 32, 99,
+95, 78, 85, 77, 65, 82, 71, 83, 40, 95, 95, 86, 65, 95, 65, 82, 71,
+83, 95, 95, 41, 41, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 100, 101, 102, 101, 114, 40, 46,
+46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 105,
+110, 116, 32, 95, 105, 32, 61, 32, 49, 59, 32, 95, 105, 59, 32, 95,
+105, 32, 61, 32, 48, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95,
+95, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 119,
+105, 116, 104, 40, 46, 46, 46, 41, 32, 99, 95, 77, 65, 67, 82, 79, 95,
+79, 86, 69, 82, 76, 79, 65, 68, 40, 99, 95, 119, 105, 116, 104, 44,
+32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 119, 105, 116, 104, 95, 50, 40, 100,
+101, 99, 108, 118, 97, 114, 44, 32, 100, 114, 111, 112, 41, 32, 92,
+10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 100, 101, 99, 108, 118, 97,
+114, 44, 32, 42, 95, 105, 44, 32, 42, 42, 95, 105, 112, 32, 61, 32,
+38, 95, 105, 59, 32, 95, 105, 112, 59, 32, 95, 105, 112, 32, 61, 32,
+48, 44, 32, 100, 114, 111, 112, 41, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 119, 105, 116, 104, 95, 51, 40, 100, 101, 99, 108,
+118, 97, 114, 44, 32, 112, 114, 101, 100, 44, 32, 100, 114, 111, 112,
+41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 100, 101, 99,
+108, 118, 97, 114, 44, 32, 42, 95, 105, 44, 32, 42, 42, 95, 105, 112,
+32, 61, 32, 38, 95, 105, 59, 32, 95, 105, 112, 32, 38, 38, 32, 40,
+112, 114, 101, 100, 41, 59, 32, 95, 105, 112, 32, 61, 32, 48, 44, 32,
+100, 114, 111, 112, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 115, 99, 111, 112, 101, 40, 46, 46, 46, 41, 32, 99, 95, 77,
+65, 67, 82, 79, 95, 79, 86, 69, 82, 76, 79, 65, 68, 40, 99, 95, 115,
+99, 111, 112, 101, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95,
+41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 99, 111,
+112, 101, 95, 50, 40, 105, 110, 105, 116, 44, 32, 100, 114, 111, 112,
+41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 105, 110, 116,
+32, 95, 105, 32, 61, 32, 40, 105, 110, 105, 116, 44, 32, 49, 41, 59,
+32, 95, 105, 59, 32, 95, 105, 32, 61, 32, 48, 44, 32, 100, 114, 111,
+112, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 99,
+111, 112, 101, 95, 51, 40, 105, 110, 105, 116, 44, 32, 112, 114, 101,
+100, 44, 32, 100, 114, 111, 112, 41, 32, 92, 10, 32, 32, 32, 32, 102,
+111, 114, 32, 40, 105, 110, 116, 32, 95, 105, 32, 61, 32, 40, 105,
+110, 105, 116, 44, 32, 49, 41, 59, 32, 95, 105, 32, 38, 38, 32, 40,
+112, 114, 101, 100, 41, 59, 32, 95, 105, 32, 61, 32, 48, 44, 32, 100,
+114, 111, 112, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99,
+95, 100, 114, 111, 112, 40, 67, 44, 32, 46, 46, 46, 41, 32, 92, 10,
+32, 32, 32, 32, 100, 111, 32, 123, 32, 99, 95, 102, 111, 114, 108,
+105, 115, 116, 32, 40, 95, 105, 44, 32, 67, 42, 44, 32, 123, 95, 95,
+86, 65, 95, 65, 82, 71, 83, 95, 95, 125, 41, 32, 67, 35, 35, 95, 100,
+114, 111, 112, 40, 42, 95, 105, 46, 114, 101, 102, 41, 59, 32, 125,
+32, 119, 104, 105, 108, 101, 40, 48, 41, 10, 10, 35, 105, 102, 32,
+100, 101, 102, 105, 110, 101, 100, 40, 95, 95, 83, 73, 90, 69, 79, 70,
+95, 73, 78, 84, 49, 50, 56, 95, 95, 41, 10, 32, 32, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 117, 109, 117, 108, 49, 50, 56,
+40, 97, 44, 32, 98, 44, 32, 108, 111, 44, 32, 104, 105, 41, 32, 92,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 100, 111, 32, 123, 32, 95, 95,
+117, 105, 110, 116, 49, 50, 56, 95, 116, 32, 95, 122, 32, 61, 32, 40,
+95, 95, 117, 105, 110, 116, 49, 50, 56, 95, 116, 41, 40, 97, 41, 42,
+40, 98, 41, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 42, 40, 108, 111, 41, 32, 61, 32, 40, 117, 105, 110, 116,
+54, 52, 95, 116, 41, 95, 122, 44, 32, 42, 40, 104, 105, 41, 32, 61,
+32, 40, 117, 105, 110, 116, 54, 52, 95, 116, 41, 40, 95, 122, 32, 62,
+62, 32, 54, 52, 85, 41, 59, 32, 125, 32, 119, 104, 105, 108, 101, 40,
+48, 41, 10, 35, 101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101,
+100, 40, 95, 77, 83, 67, 95, 86, 69, 82, 41, 32, 38, 38, 32, 100, 101,
+102, 105, 110, 101, 100, 40, 95, 87, 73, 78, 54, 52, 41, 10, 47, 47,
+32, 69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103,
+101, 110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101,
+97, 100, 101, 114, 115, 46, 112, 121, 32, 32, 32, 32, 32, 35, 105,
+110, 99, 108, 117, 100, 101, 32, 60, 105, 110, 116, 114, 105, 110, 46,
+104, 62, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 99,
+95, 117, 109, 117, 108, 49, 50, 56, 40, 97, 44, 32, 98, 44, 32, 108,
+111, 44, 32, 104, 105, 41, 32, 40, 40, 118, 111, 105, 100, 41, 40, 42,
+40, 108, 111, 41, 32, 61, 32, 95, 117, 109, 117, 108, 49, 50, 56, 40,
+97, 44, 32, 98, 44, 32, 104, 105, 41, 41, 41, 10, 35, 101, 108, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 40, 95, 95, 120, 56, 54,
+95, 54, 52, 95, 95, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 117, 109, 117, 108, 49, 50, 56, 40, 97, 44, 32,
+98, 44, 32, 108, 111, 44, 32, 104, 105, 41, 32, 92, 10, 32, 32, 32,
+32, 32, 32, 32, 32, 97, 115, 109, 40, 34, 109, 117, 108, 113, 32, 37,
+51, 34, 32, 58, 32, 34, 61, 97, 34, 40, 42, 40, 108, 111, 41, 41, 44,
+32, 34, 61, 100, 34, 40, 42, 40, 104, 105, 41, 41, 32, 58, 32, 34, 97,
+34, 40, 97, 41, 44, 32, 34, 114, 109, 34, 40, 98, 41, 41, 10, 35, 101,
+110, 100, 105, 102, 10, 10, 35, 101, 110, 100, 105, 102, 32, 47, 47,
+32, 67, 67, 79, 77, 77, 79, 78, 95, 72, 95, 73, 78, 67, 76, 85, 68,
+69, 68, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78, 68, 95, 70, 73, 76,
+69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 99, 99, 111, 109, 109,
+111, 110, 46, 104, 10, 47, 47, 32, 35, 35, 35, 32, 66, 69, 71, 73, 78,
+95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 102, 111,
+114, 119, 97, 114, 100, 46, 104, 10, 35, 105, 102, 110, 100, 101, 102,
+32, 83, 84, 67, 95, 70, 79, 82, 87, 65, 82, 68, 95, 72, 95, 73, 78,
+67, 76, 85, 68, 69, 68, 10, 35, 100, 101, 102, 105, 110, 101, 32, 83,
+84, 67, 95, 70, 79, 82, 87, 65, 82, 68, 95, 72, 95, 73, 78, 67, 76,
+85, 68, 69, 68, 10, 10, 47, 47, 32, 69, 88, 67, 76, 85, 68, 69, 68,
+32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99, 111, 110, 116, 97,
+105, 110, 101, 114, 95, 104, 101, 97, 100, 101, 114, 115, 46, 112,
+121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60, 115, 116, 100,
+105, 110, 116, 46, 104, 62, 10, 47, 47, 32, 69, 88, 67, 76, 85, 68,
+69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99, 111, 110,
+116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100, 101, 114, 115, 46,
+112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60, 115, 116,
+100, 100, 101, 102, 46, 104, 62, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 97, 114, 99, 40,
+67, 44, 32, 86, 65, 76, 41, 32, 95, 99, 95, 99, 97, 114, 99, 95, 116,
+121, 112, 101, 115, 40, 67, 44, 32, 86, 65, 76, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 98,
+111, 120, 40, 67, 44, 32, 86, 65, 76, 41, 32, 95, 99, 95, 99, 98, 111,
+120, 95, 116, 121, 112, 101, 115, 40, 67, 44, 32, 86, 65, 76, 41, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114,
+100, 95, 99, 100, 101, 113, 40, 67, 44, 32, 86, 65, 76, 41, 32, 95,
+99, 95, 99, 100, 101, 113, 95, 116, 121, 112, 101, 115, 40, 67, 44,
+32, 86, 65, 76, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102,
+111, 114, 119, 97, 114, 100, 95, 99, 108, 105, 115, 116, 40, 67, 44,
+32, 86, 65, 76, 41, 32, 95, 99, 95, 99, 108, 105, 115, 116, 95, 116,
+121, 112, 101, 115, 40, 67, 44, 32, 86, 65, 76, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 109,
+97, 112, 40, 67, 44, 32, 75, 69, 89, 44, 32, 86, 65, 76, 41, 32, 95,
+99, 95, 99, 104, 97, 115, 104, 95, 116, 121, 112, 101, 115, 40, 67,
+44, 32, 75, 69, 89, 44, 32, 86, 65, 76, 44, 32, 99, 95, 116, 114, 117,
+101, 44, 32, 99, 95, 102, 97, 108, 115, 101, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 115,
+101, 116, 40, 67, 44, 32, 75, 69, 89, 41, 32, 95, 99, 95, 99, 104, 97,
+115, 104, 95, 116, 121, 112, 101, 115, 40, 67, 44, 32, 99, 115, 101,
+116, 44, 32, 75, 69, 89, 44, 32, 75, 69, 89, 44, 32, 99, 95, 102, 97,
+108, 115, 101, 44, 32, 99, 95, 116, 114, 117, 101, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99,
+115, 109, 97, 112, 40, 67, 44, 32, 75, 69, 89, 44, 32, 86, 65, 76, 41,
+32, 95, 99, 95, 97, 97, 116, 114, 101, 101, 95, 116, 121, 112, 101,
+115, 40, 67, 44, 32, 75, 69, 89, 44, 32, 86, 65, 76, 44, 32, 99, 95,
+116, 114, 117, 101, 44, 32, 99, 95, 102, 97, 108, 115, 101, 41, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114,
+100, 95, 99, 115, 115, 101, 116, 40, 67, 44, 32, 75, 69, 89, 41, 32,
+95, 99, 95, 97, 97, 116, 114, 101, 101, 95, 116, 121, 112, 101, 115,
+40, 67, 44, 32, 75, 69, 89, 44, 32, 75, 69, 89, 44, 32, 99, 95, 102,
+97, 108, 115, 101, 44, 32, 99, 95, 116, 114, 117, 101, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100,
+95, 99, 115, 116, 97, 99, 107, 40, 67, 44, 32, 86, 65, 76, 41, 32, 95,
+99, 95, 99, 115, 116, 97, 99, 107, 95, 116, 121, 112, 101, 115, 40,
+67, 44, 32, 86, 65, 76, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+102, 111, 114, 119, 97, 114, 100, 95, 99, 112, 113, 117, 101, 40, 67,
+44, 32, 86, 65, 76, 41, 32, 95, 99, 95, 99, 112, 113, 117, 101, 95,
+116, 121, 112, 101, 115, 40, 67, 44, 32, 86, 65, 76, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99,
+113, 117, 101, 117, 101, 40, 67, 44, 32, 86, 65, 76, 41, 32, 95, 99,
+95, 99, 100, 101, 113, 95, 116, 121, 112, 101, 115, 40, 67, 44, 32,
+86, 65, 76, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 99, 118, 101, 99, 40, 67, 44, 32, 86, 65,
+76, 41, 32, 95, 99, 95, 99, 118, 101, 99, 95, 116, 121, 112, 101, 115,
+40, 67, 44, 32, 86, 65, 76, 41, 10, 47, 47, 32, 97, 108, 116, 101,
+114, 110, 97, 116, 105, 118, 101, 32, 110, 97, 109, 101, 115, 32, 40,
+105, 110, 99, 108, 117, 100, 101, 47, 115, 116, 120, 41, 58, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100,
+95, 97, 114, 99, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 97,
+114, 99, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119,
+97, 114, 100, 95, 98, 111, 120, 32, 102, 111, 114, 119, 97, 114, 100,
+95, 99, 98, 111, 120, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102,
+111, 114, 119, 97, 114, 100, 95, 100, 101, 113, 32, 102, 111, 114,
+119, 97, 114, 100, 95, 99, 100, 101, 113, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 108, 105, 115,
+116, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 108, 105, 115, 116,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114,
+100, 95, 104, 109, 97, 112, 32, 102, 111, 114, 119, 97, 114, 100, 95,
+99, 109, 97, 112, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 104, 115, 101, 116, 32, 102, 111, 114,
+119, 97, 114, 100, 95, 99, 115, 101, 116, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 115, 109, 97, 112,
+32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 115, 109, 97, 112, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114,
+100, 95, 115, 115, 101, 116, 32, 102, 111, 114, 119, 97, 114, 100, 95,
+99, 115, 115, 101, 116, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102,
+111, 114, 119, 97, 114, 100, 95, 115, 116, 97, 99, 107, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 99, 115, 116, 97, 99, 107, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95,
+112, 113, 117, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 112,
+113, 117, 101, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 113, 117, 101, 117, 101, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 99, 113, 117, 101, 117, 101, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95,
+118, 101, 99, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 118, 101,
+99, 10, 10, 47, 47, 32, 99, 115, 118, 105, 101, 119, 32, 58, 32, 110,
+111, 110, 45, 110, 117, 108, 108, 32, 116, 101, 114, 109, 105, 110,
+97, 116, 101, 100, 32, 115, 116, 114, 105, 110, 103, 32, 118, 105,
+101, 119, 10, 116, 121, 112, 101, 100, 101, 102, 32, 99, 111, 110,
+115, 116, 32, 99, 104, 97, 114, 32, 99, 115, 118, 105, 101, 119, 95,
+118, 97, 108, 117, 101, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32,
+115, 116, 114, 117, 99, 116, 32, 99, 115, 118, 105, 101, 119, 32, 123,
+10, 32, 32, 32, 32, 99, 115, 118, 105, 101, 119, 95, 118, 97, 108,
+117, 101, 42, 32, 98, 117, 102, 59, 10, 32, 32, 32, 32, 105, 110, 116,
+112, 116, 114, 95, 116, 32, 115, 105, 122, 101, 59, 10, 125, 32, 99,
+115, 118, 105, 101, 119, 59, 10, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 117, 110, 105, 111, 110, 32, 123, 10, 32, 32, 32, 32, 99,
+115, 118, 105, 101, 119, 95, 118, 97, 108, 117, 101, 42, 32, 114, 101,
+102, 59, 10, 32, 32, 32, 32, 99, 115, 118, 105, 101, 119, 32, 99, 104,
+114, 59, 10, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32,
+99, 115, 118, 105, 101, 119, 32, 99, 104, 114, 59, 32, 99, 115, 118,
+105, 101, 119, 95, 118, 97, 108, 117, 101, 42, 32, 101, 110, 100, 59,
+32, 125, 32, 117, 56, 59, 10, 125, 32, 99, 115, 118, 105, 101, 119,
+95, 105, 116, 101, 114, 59, 10, 10, 10, 47, 47, 32, 99, 114, 97, 119,
+115, 116, 114, 32, 58, 32, 110, 117, 108, 108, 45, 116, 101, 114, 109,
+105, 110, 97, 116, 101, 100, 32, 115, 116, 114, 105, 110, 103, 32,
+118, 105, 101, 119, 10, 116, 121, 112, 101, 100, 101, 102, 32, 99,
+115, 118, 105, 101, 119, 95, 118, 97, 108, 117, 101, 32, 99, 114, 97,
+119, 115, 116, 114, 95, 118, 97, 108, 117, 101, 59, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 99, 114, 97,
+119, 115, 116, 114, 32, 123, 10, 32, 32, 32, 32, 99, 114, 97, 119,
+115, 116, 114, 95, 118, 97, 108, 117, 101, 42, 32, 115, 116, 114, 59,
+10, 32, 32, 32, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 115,
+105, 122, 101, 59, 10, 125, 32, 99, 114, 97, 119, 115, 116, 114, 59,
+10, 10, 116, 121, 112, 101, 100, 101, 102, 32, 117, 110, 105, 111,
+110, 32, 123, 10, 32, 32, 32, 32, 99, 114, 97, 119, 115, 116, 114, 95,
+118, 97, 108, 117, 101, 42, 32, 114, 101, 102, 59, 10, 32, 32, 32, 32,
+99, 115, 118, 105, 101, 119, 32, 99, 104, 114, 59, 10, 125, 32, 99,
+114, 97, 119, 115, 116, 114, 95, 105, 116, 101, 114, 59, 10, 10, 10,
+47, 47, 32, 99, 115, 116, 114, 32, 58, 32, 110, 117, 108, 108, 45,
+116, 101, 114, 109, 105, 110, 97, 116, 101, 100, 32, 111, 119, 110,
+105, 110, 103, 32, 115, 116, 114, 105, 110, 103, 32, 40, 115, 104,
+111, 114, 116, 32, 115, 116, 114, 105, 110, 103, 32, 111, 112, 116,
+105, 109, 105, 122, 101, 100, 32, 45, 32, 115, 115, 111, 41, 10, 116,
+121, 112, 101, 100, 101, 102, 32, 99, 104, 97, 114, 32, 99, 115, 116,
+114, 95, 118, 97, 108, 117, 101, 59, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32, 99, 115, 116, 114,
+95, 118, 97, 108, 117, 101, 42, 32, 100, 97, 116, 97, 59, 32, 105,
+110, 116, 112, 116, 114, 95, 116, 32, 115, 105, 122, 101, 44, 32, 99,
+97, 112, 59, 32, 125, 32, 99, 115, 116, 114, 95, 98, 117, 102, 59, 10,
+116, 121, 112, 101, 100, 101, 102, 32, 117, 110, 105, 111, 110, 32,
+99, 115, 116, 114, 32, 123, 10, 32, 32, 32, 32, 115, 116, 114, 117,
+99, 116, 32, 123, 32, 99, 115, 116, 114, 95, 118, 97, 108, 117, 101,
+32, 100, 97, 116, 97, 91, 32, 115, 105, 122, 101, 111, 102, 40, 99,
+115, 116, 114, 95, 98, 117, 102, 41, 32, 93, 59, 32, 125, 32, 115,
+109, 108, 59, 10, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32,
+123, 32, 99, 115, 116, 114, 95, 118, 97, 108, 117, 101, 42, 32, 100,
+97, 116, 97, 59, 32, 115, 105, 122, 101, 95, 116, 32, 115, 105, 122,
+101, 44, 32, 110, 99, 97, 112, 59, 32, 125, 32, 108, 111, 110, 59, 10,
+125, 32, 99, 115, 116, 114, 59, 10, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 117, 110, 105, 111, 110, 32, 123, 10, 32, 32, 32, 32, 99,
+115, 116, 114, 95, 118, 97, 108, 117, 101, 42, 32, 114, 101, 102, 59,
+10, 32, 32, 32, 32, 99, 115, 118, 105, 101, 119, 32, 99, 104, 114, 59,
+32, 47, 47, 32, 117, 116, 102, 56, 32, 99, 104, 97, 114, 97, 99, 116,
+101, 114, 47, 99, 111, 100, 101, 112, 111, 105, 110, 116, 10, 125, 32,
+99, 115, 116, 114, 95, 105, 116, 101, 114, 59, 10, 10, 10, 35, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 71, 78, 85,
+67, 95, 95, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+95, 95, 99, 108, 97, 110, 103, 95, 95, 32, 124, 124, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 95, 77, 83, 67, 95, 86, 69, 82, 10, 32,
+32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 108, 111, 110, 103,
+32, 99, 97, 116, 111, 109, 105, 99, 95, 108, 111, 110, 103, 59, 10,
+35, 101, 108, 115, 101, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100,
+101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 40, 108, 111, 110, 103,
+41, 32, 99, 97, 116, 111, 109, 105, 99, 95, 108, 111, 110, 103, 59,
+10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 116, 114, 117, 101, 40, 46, 46, 46, 41, 32, 95, 95,
+86, 65, 95, 65, 82, 71, 83, 95, 95, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 102, 97, 108, 115, 101, 40, 46, 46, 46, 41, 10, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 95, 99, 95, 99, 97, 114, 99, 95,
+116, 121, 112, 101, 115, 40, 83, 69, 76, 70, 44, 32, 86, 65, 76, 41,
+32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 86,
+65, 76, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 59,
+32, 92, 10, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117,
+99, 116, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117, 116, 101, 95,
+95, 40, 40, 109, 101, 116, 104, 111, 100, 99, 97, 108, 108, 40, 83,
+69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70, 32, 123, 32,
+92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95,
+118, 97, 108, 117, 101, 42, 32, 103, 101, 116, 59, 32, 92, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 99, 97, 116, 111, 109, 105, 99, 95, 108, 111,
+110, 103, 42, 32, 117, 115, 101, 95, 99, 111, 117, 110, 116, 59, 32,
+92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 95, 99, 95, 99, 98, 111, 120, 95, 116, 121,
+112, 101, 115, 40, 83, 69, 76, 70, 44, 32, 86, 65, 76, 41, 32, 92, 10,
+32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 86, 65, 76, 32,
+83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92, 10,
+116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116,
+32, 95, 95, 97, 116, 116, 114, 105, 98, 117, 116, 101, 95, 95, 40, 40,
+109, 101, 116, 104, 111, 100, 99, 97, 108, 108, 40, 83, 69, 76, 70,
+35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70, 32, 123, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108,
+117, 101, 42, 32, 103, 101, 116, 59, 32, 92, 10, 32, 32, 32, 32, 125,
+32, 83, 69, 76, 70, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+99, 95, 99, 100, 101, 113, 95, 116, 121, 112, 101, 115, 40, 83, 69,
+76, 70, 44, 32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121,
+112, 101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35,
+95, 118, 97, 108, 117, 101, 59, 32, 92, 10, 92, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97,
+116, 116, 114, 105, 98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116,
+104, 111, 100, 99, 97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41,
+41, 41, 32, 83, 69, 76, 70, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32,
+42, 99, 98, 117, 102, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+105, 110, 116, 112, 116, 114, 95, 116, 32, 115, 116, 97, 114, 116, 44,
+32, 101, 110, 100, 44, 32, 99, 97, 112, 109, 97, 115, 107, 59, 32, 92,
+10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 59, 32, 92, 10, 92, 10,
+32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114,
+117, 99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83,
+69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102,
+59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 105, 110, 116, 112,
+116, 114, 95, 116, 32, 112, 111, 115, 59, 32, 92, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 99, 111, 110, 115, 116, 32, 83, 69, 76, 70, 42, 32,
+95, 115, 59, 32, 92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 35,
+35, 95, 105, 116, 101, 114, 10, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 95, 99, 95, 99, 108, 105, 115, 116, 95, 116, 121, 112, 101, 115,
+40, 83, 69, 76, 70, 44, 32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32,
+32, 116, 121, 112, 101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76,
+70, 35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92, 10, 32, 32, 32,
+32, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99,
+116, 32, 83, 69, 76, 70, 35, 35, 95, 110, 111, 100, 101, 32, 83, 69,
+76, 70, 35, 35, 95, 110, 111, 100, 101, 59, 32, 92, 10, 92, 10, 32,
+32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117,
+99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69,
+76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102, 59,
+32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35,
+95, 110, 111, 100, 101, 32, 42, 99, 111, 110, 115, 116, 32, 42, 95,
+108, 97, 115, 116, 44, 32, 42, 112, 114, 101, 118, 59, 32, 92, 10, 32,
+32, 32, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95, 105, 116, 101, 114,
+59, 32, 92, 10, 92, 10, 116, 121, 112, 101, 100, 101, 102, 32, 115,
+116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117,
+116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111, 100, 99, 97, 108,
+108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70,
+32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70,
+35, 35, 95, 110, 111, 100, 101, 32, 42, 108, 97, 115, 116, 59, 32, 92,
+10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 95, 99, 95, 99, 104, 97, 115, 104, 95, 116,
+121, 112, 101, 115, 40, 83, 69, 76, 70, 44, 32, 75, 69, 89, 44, 32,
+86, 65, 76, 44, 32, 77, 65, 80, 95, 79, 78, 76, 89, 44, 32, 83, 69,
+84, 95, 79, 78, 76, 89, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112,
+101, 100, 101, 102, 32, 75, 69, 89, 32, 83, 69, 76, 70, 35, 35, 95,
+107, 101, 121, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101,
+100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35, 95, 109,
+97, 112, 112, 101, 100, 59, 32, 92, 10, 92, 10, 32, 32, 32, 32, 116,
+121, 112, 101, 100, 101, 102, 32, 83, 69, 84, 95, 79, 78, 76, 89, 40,
+32, 83, 69, 76, 70, 35, 35, 95, 107, 101, 121, 32, 41, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 77, 65, 80, 95, 79, 78,
+76, 89, 40, 32, 115, 116, 114, 117, 99, 116, 32, 83, 69, 76, 70, 35,
+35, 95, 118, 97, 108, 117, 101, 32, 41, 32, 92, 10, 32, 32, 32, 32,
+83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92, 10,
+92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 115,
+116, 114, 117, 99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42,
+114, 101, 102, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 66,
+111, 111, 108, 32, 105, 110, 115, 101, 114, 116, 101, 100, 59, 32, 92,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 117, 105, 110, 116, 56, 95, 116,
+32, 104, 97, 115, 104, 120, 59, 32, 92, 10, 32, 32, 32, 32, 125, 32,
+83, 69, 76, 70, 35, 35, 95, 114, 101, 115, 117, 108, 116, 59, 32, 92,
+10, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32,
+115, 116, 114, 117, 99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32,
+42, 114, 101, 102, 44, 32, 42, 95, 101, 110, 100, 59, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32, 99, 104,
+97, 115, 104, 95, 115, 108, 111, 116, 32, 42, 95, 115, 114, 101, 102,
+59, 32, 92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95,
+105, 116, 101, 114, 59, 32, 92, 10, 92, 10, 116, 121, 112, 101, 100,
+101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116,
+114, 105, 98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111,
+100, 99, 97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32,
+83, 69, 76, 70, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 42, 32, 116, 97,
+98, 108, 101, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 115,
+116, 114, 117, 99, 116, 32, 99, 104, 97, 115, 104, 95, 115, 108, 111,
+116, 42, 32, 115, 108, 111, 116, 59, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 115, 105, 122,
+101, 44, 32, 98, 117, 99, 107, 101, 116, 95, 99, 111, 117, 110, 116,
+59, 32, 92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 95, 99, 95, 97, 97, 116, 114, 101,
+101, 95, 116, 121, 112, 101, 115, 40, 83, 69, 76, 70, 44, 32, 75, 69,
+89, 44, 32, 86, 65, 76, 44, 32, 77, 65, 80, 95, 79, 78, 76, 89, 44,
+32, 83, 69, 84, 95, 79, 78, 76, 89, 41, 32, 92, 10, 32, 32, 32, 32,
+116, 121, 112, 101, 100, 101, 102, 32, 75, 69, 89, 32, 83, 69, 76, 70,
+35, 35, 95, 107, 101, 121, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121,
+112, 101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35,
+95, 109, 97, 112, 112, 101, 100, 59, 32, 92, 10, 32, 32, 32, 32, 116,
+121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 83,
+69, 76, 70, 35, 35, 95, 110, 111, 100, 101, 32, 83, 69, 76, 70, 35,
+35, 95, 110, 111, 100, 101, 59, 32, 92, 10, 92, 10, 32, 32, 32, 32,
+116, 121, 112, 101, 100, 101, 102, 32, 83, 69, 84, 95, 79, 78, 76, 89,
+40, 32, 83, 69, 76, 70, 35, 35, 95, 107, 101, 121, 32, 41, 32, 92, 10,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 77, 65, 80, 95, 79,
+78, 76, 89, 40, 32, 115, 116, 114, 117, 99, 116, 32, 83, 69, 76, 70,
+35, 35, 95, 118, 97, 108, 117, 101, 32, 41, 32, 92, 10, 32, 32, 32,
+32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92,
+10, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32,
+115, 116, 114, 117, 99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32,
+42, 114, 101, 102, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95,
+66, 111, 111, 108, 32, 105, 110, 115, 101, 114, 116, 101, 100, 59, 32,
+92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95, 114, 101,
+115, 117, 108, 116, 59, 32, 92, 10, 92, 10, 32, 32, 32, 32, 116, 121,
+112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32,
+92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95,
+118, 97, 108, 117, 101, 32, 42, 114, 101, 102, 59, 32, 92, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 110, 111, 100,
+101, 32, 42, 95, 100, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+105, 110, 116, 32, 95, 116, 111, 112, 59, 32, 92, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 105, 110, 116, 51, 50, 95, 116, 32, 95, 116, 110, 44,
+32, 95, 115, 116, 91, 51, 54, 93, 59, 32, 92, 10, 32, 32, 32, 32, 125,
+32, 83, 69, 76, 70, 35, 35, 95, 105, 116, 101, 114, 59, 32, 92, 10,
+92, 10, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99,
+116, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117, 116, 101, 95, 95,
+40, 40, 109, 101, 116, 104, 111, 100, 99, 97, 108, 108, 40, 83, 69,
+76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70, 32, 123, 32, 92,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 110,
+111, 100, 101, 32, 42, 110, 111, 100, 101, 115, 59, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 105, 110, 116, 51, 50, 95, 116, 32, 114,
+111, 111, 116, 44, 32, 100, 105, 115, 112, 44, 32, 104, 101, 97, 100,
+44, 32, 115, 105, 122, 101, 44, 32, 99, 97, 112, 59, 32, 92, 10, 32,
+32, 32, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 95, 99, 95, 99, 115, 116, 97, 99, 107, 95, 102, 105,
+120, 101, 100, 40, 83, 69, 76, 70, 44, 32, 86, 65, 76, 44, 32, 67, 65,
+80, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102,
+32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117,
+101, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101,
+102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32, 83, 69, 76, 70, 35,
+35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102, 44, 32, 42,
+101, 110, 100, 59, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95, 105, 116,
+101, 114, 59, 32, 92, 10, 116, 121, 112, 101, 100, 101, 102, 32, 115,
+116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117,
+116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111, 100, 99, 97, 108,
+108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70,
+32, 123, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32,
+100, 97, 116, 97, 91, 67, 65, 80, 93, 59, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 95, 108, 101, 110, 59, 32, 125, 32, 83, 69, 76, 70,
+10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 99, 95, 99, 115,
+116, 97, 99, 107, 95, 116, 121, 112, 101, 115, 40, 83, 69, 76, 70, 44,
+32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101,
+100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35, 95, 118,
+97, 108, 117, 101, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101,
+100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32, 83, 69,
+76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102, 44,
+32, 42, 101, 110, 100, 59, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95,
+105, 116, 101, 114, 59, 32, 92, 10, 116, 121, 112, 101, 100, 101, 102,
+32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116, 114, 105,
+98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111, 100, 99,
+97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69,
+76, 70, 32, 123, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117,
+101, 42, 32, 100, 97, 116, 97, 59, 32, 105, 110, 116, 112, 116, 114,
+95, 116, 32, 95, 108, 101, 110, 44, 32, 95, 99, 97, 112, 59, 32, 125,
+32, 83, 69, 76, 70, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+99, 95, 99, 118, 101, 99, 95, 116, 121, 112, 101, 115, 40, 83, 69, 76,
+70, 44, 32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112,
+101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35, 95,
+118, 97, 108, 117, 101, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112,
+101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32, 83,
+69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102,
+44, 32, 42, 101, 110, 100, 59, 32, 125, 32, 83, 69, 76, 70, 35, 35,
+95, 105, 116, 101, 114, 59, 32, 92, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116, 114,
+105, 98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111, 100,
+99, 97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83,
+69, 76, 70, 32, 123, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108,
+117, 101, 32, 42, 100, 97, 116, 97, 59, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 95, 108, 101, 110, 44, 32, 95, 99, 97, 112, 59, 32,
+125, 32, 83, 69, 76, 70, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+95, 99, 95, 99, 112, 113, 117, 101, 95, 116, 121, 112, 101, 115, 40,
+83, 69, 76, 70, 44, 32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32, 32,
+116, 121, 112, 101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70,
+35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97,
+116, 116, 114, 105, 98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116,
+104, 111, 100, 99, 97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41,
+41, 41, 32, 83, 69, 76, 70, 32, 123, 32, 83, 69, 76, 70, 35, 35, 95,
+118, 97, 108, 117, 101, 42, 32, 100, 97, 116, 97, 59, 32, 105, 110,
+116, 112, 116, 114, 95, 116, 32, 95, 108, 101, 110, 44, 32, 95, 99,
+97, 112, 59, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35, 101, 110, 100,
+105, 102, 32, 47, 47, 32, 83, 84, 67, 95, 70, 79, 82, 87, 65, 82, 68,
+95, 72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 47, 47, 32, 35, 35,
+35, 32, 69, 78, 68, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68,
+69, 58, 32, 102, 111, 114, 119, 97, 114, 100, 46, 104, 10, 47, 47, 32,
+69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101,
+110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97,
+100, 101, 114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100,
+101, 32, 60, 115, 116, 100, 108, 105, 98, 46, 104, 62, 10, 47, 47, 32,
+69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101,
+110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97,
+100, 101, 114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100,
+101, 32, 60, 115, 116, 114, 105, 110, 103, 46, 104, 62, 10, 115, 116,
+114, 117, 99, 116, 32, 99, 104, 97, 115, 104, 95, 115, 108, 111, 116,
+32, 123, 32, 117, 105, 110, 116, 56, 95, 116, 32, 104, 97, 115, 104,
+120, 59, 32, 125, 59, 10, 35, 101, 110, 100, 105, 102, 32, 47, 47, 32,
+67, 77, 65, 80, 95, 72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 10,
+35, 105, 102, 110, 100, 101, 102, 32, 95, 105, 95, 112, 114, 101, 102,
+105, 120, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105,
+95, 112, 114, 101, 102, 105, 120, 32, 99, 109, 97, 112, 95, 10, 35,
+101, 110, 100, 105, 102, 10, 35, 105, 102, 110, 100, 101, 102, 32, 95,
+105, 95, 105, 115, 115, 101, 116, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 95, 105, 95, 105, 115, 109, 97, 112, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 95, 105, 95, 77, 65, 80, 95, 79, 78,
+76, 89, 32, 99, 95, 116, 114, 117, 101, 10, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 105, 95, 83, 69, 84, 95, 79, 78, 76, 89, 32,
+99, 95, 102, 97, 108, 115, 101, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 95, 105, 95, 107, 101, 121, 114, 101, 102, 40, 118, 112,
+41, 32, 40, 38, 40, 118, 112, 41, 45, 62, 102, 105, 114, 115, 116, 41,
+10, 35, 101, 108, 115, 101, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 95, 105, 95, 77, 65, 80, 95, 79, 78, 76, 89, 32, 99, 95, 102,
+97, 108, 115, 101, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+95, 105, 95, 83, 69, 84, 95, 79, 78, 76, 89, 32, 99, 95, 116, 114,
+117, 101, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105,
+95, 107, 101, 121, 114, 101, 102, 40, 118, 112, 41, 32, 40, 118, 112,
+41, 10, 35, 101, 110, 100, 105, 102, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 95, 105, 95, 105, 115, 104, 97, 115, 104, 10, 47, 47, 32, 35,
+35, 35, 32, 66, 69, 71, 73, 78, 95, 70, 73, 76, 69, 95, 73, 78, 67,
+76, 85, 68, 69, 58, 32, 116, 101, 109, 112, 108, 97, 116, 101, 46,
+104, 10, 35, 105, 102, 110, 100, 101, 102, 32, 95, 105, 95, 116, 101,
+109, 112, 108, 97, 116, 101, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+95, 105, 95, 116, 101, 109, 112, 108, 97, 116, 101, 10, 10, 35, 105,
+102, 110, 100, 101, 102, 32, 83, 84, 67, 95, 84, 69, 77, 80, 76, 65,
+84, 69, 95, 72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 83, 84, 67, 95, 84, 69, 77, 80, 76, 65, 84,
+69, 95, 72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 95, 99, 95, 77, 69, 77, 66, 40, 110, 97,
+109, 101, 41, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 116, 121, 112,
+101, 44, 32, 110, 97, 109, 101, 41, 10, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 99, 95, 68, 69, 70, 84, 89, 80, 69, 83, 40,
+109, 97, 99, 114, 111, 44, 32, 83, 69, 76, 70, 44, 32, 46, 46, 46, 41,
+32, 99, 95, 69, 88, 80, 65, 78, 68, 40, 109, 97, 99, 114, 111, 40, 83,
+69, 76, 70, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41,
+41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 109, 95,
+118, 97, 108, 117, 101, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 118,
+97, 108, 117, 101, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 95, 109, 95, 107, 101, 121, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 107, 101, 121, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 95, 109, 95, 109, 97, 112, 112, 101, 100, 32, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 109, 97, 112, 112, 101, 100, 41, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 95, 109, 95, 114, 109, 97, 112, 112, 101,
+100, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 109, 97, 112, 112,
+101, 100, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+109, 95, 114, 97, 119, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114,
+97, 119, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+109, 95, 107, 101, 121, 114, 97, 119, 32, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 107, 101, 121, 114, 97, 119, 41, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 95, 109, 95, 105, 116, 101, 114, 32, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 105, 116, 101, 114, 41, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 95, 109, 95, 114, 101, 115, 117,
+108, 116, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 101, 115, 117,
+108, 116, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+109, 95, 110, 111, 100, 101, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+110, 111, 100, 101, 41, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35,
+105, 102, 110, 100, 101, 102, 32, 105, 95, 116, 121, 112, 101, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 116, 121, 112, 101,
+32, 99, 95, 74, 79, 73, 78, 40, 95, 105, 95, 112, 114, 101, 102, 105,
+120, 44, 32, 105, 95, 116, 97, 103, 41, 10, 35, 101, 110, 100, 105,
+102, 10, 10, 35, 105, 102, 100, 101, 102, 32, 105, 95, 107, 101, 121,
+99, 108, 97, 115, 115, 32, 47, 47, 32, 91, 100, 101, 112, 114, 101,
+99, 97, 116, 101, 100, 93, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 107, 101, 121, 95, 99, 108, 97, 115, 115, 32, 105,
+95, 107, 101, 121, 99, 108, 97, 115, 115, 10, 35, 101, 110, 100, 105,
+102, 10, 35, 105, 102, 100, 101, 102, 32, 105, 95, 118, 97, 108, 99,
+108, 97, 115, 115, 32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99,
+97, 116, 101, 100, 93, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 118, 97, 108, 95, 99, 108, 97, 115, 115, 32, 105, 95,
+118, 97, 108, 99, 108, 97, 115, 115, 10, 35, 101, 110, 100, 105, 102,
+10, 35, 105, 102, 100, 101, 102, 32, 105, 95, 114, 97, 119, 99, 108,
+97, 115, 115, 32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97,
+116, 101, 100, 93, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+105, 95, 114, 97, 119, 95, 99, 108, 97, 115, 115, 32, 105, 95, 114,
+97, 119, 99, 108, 97, 115, 115, 10, 35, 101, 110, 100, 105, 102, 10,
+35, 105, 102, 100, 101, 102, 32, 105, 95, 107, 101, 121, 98, 111, 120,
+101, 100, 32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116,
+101, 100, 93, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 95, 97, 114, 99, 98, 111, 120, 32, 105, 95, 107,
+101, 121, 98, 111, 120, 101, 100, 10, 35, 101, 110, 100, 105, 102, 10,
+35, 105, 102, 100, 101, 102, 32, 105, 95, 118, 97, 108, 98, 111, 120,
+101, 100, 32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116,
+101, 100, 93, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 118, 97, 108, 95, 97, 114, 99, 98, 111, 120, 32, 105, 95, 118, 97,
+108, 98, 111, 120, 101, 100, 10, 35, 101, 110, 100, 105, 102, 10, 10,
+35, 105, 102, 32, 33, 40, 100, 101, 102, 105, 110, 101, 100, 32, 105,
+95, 107, 101, 121, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 107, 101, 121, 95, 115, 116, 114, 32, 124, 124, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 95,
+115, 115, 118, 32, 124, 124, 32, 92, 10, 32, 32, 32, 32, 32, 32, 100,
+101, 102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 95, 99, 108,
+97, 115, 115, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 95, 97, 114, 99, 98, 111, 120, 41, 10, 32, 32,
+35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 105, 95,
+105, 115, 109, 97, 112, 10, 32, 32, 32, 32, 35, 101, 114, 114, 111,
+114, 32, 34, 105, 95, 107, 101, 121, 42, 32, 109, 117, 115, 116, 32,
+98, 101, 32, 100, 101, 102, 105, 110, 101, 100, 32, 102, 111, 114, 32,
+109, 97, 112, 115, 34, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10,
+10, 32, 32, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 118, 97, 108, 95, 115, 116, 114, 10, 32, 32, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 95, 115, 116,
+114, 32, 105, 95, 118, 97, 108, 95, 115, 116, 114, 10, 32, 32, 35,
+101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 95, 115, 115, 118, 10,
+32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107,
+101, 121, 95, 115, 115, 118, 32, 105, 95, 118, 97, 108, 95, 115, 115,
+118, 10, 32, 32, 35, 101, 110, 100, 105, 102, 32, 32, 10, 32, 32, 35,
+105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97,
+108, 95, 97, 114, 99, 98, 111, 120, 10, 32, 32, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 95, 97, 114, 99, 98,
+111, 120, 32, 105, 95, 118, 97, 108, 95, 97, 114, 99, 98, 111, 120,
+10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 95, 99,
+108, 97, 115, 115, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 107, 101, 121, 95, 99, 108, 97, 115, 115, 32, 105,
+95, 118, 97, 108, 95, 99, 108, 97, 115, 115, 10, 32, 32, 35, 101, 110,
+100, 105, 102, 10, 32, 32, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 118, 97, 108, 10, 32, 32, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 32, 105, 95, 118, 97,
+108, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108,
+114, 97, 119, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 107, 101, 121, 114, 97, 119, 32, 105, 95, 118, 97, 108,
+114, 97, 119, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35,
+105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97,
+108, 99, 108, 111, 110, 101, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 105, 95, 107, 101, 121, 99, 108, 111, 110, 101, 32,
+105, 95, 118, 97, 108, 99, 108, 111, 110, 101, 10, 32, 32, 35, 101,
+110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 10, 32,
+32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101,
+121, 102, 114, 111, 109, 32, 105, 95, 118, 97, 108, 102, 114, 111,
+109, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108,
+116, 111, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+105, 95, 107, 101, 121, 116, 111, 32, 105, 95, 118, 97, 108, 116, 111,
+10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 100,
+114, 111, 112, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 32, 105, 95, 118, 97,
+108, 100, 114, 111, 112, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10,
+35, 101, 110, 100, 105, 102, 10, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 111, 112, 116, 105, 111, 110, 40, 102, 108, 97, 103, 41,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 40, 105, 95, 111, 112,
+116, 41, 32, 38, 32, 40, 102, 108, 97, 103, 41, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 105, 115, 95, 102, 111, 114, 119, 97,
+114, 100, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 49, 60,
+60, 48, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 110,
+111, 95, 97, 116, 111, 109, 105, 99, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 40, 49, 60, 60, 49, 41, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 110, 111, 95, 99, 108, 111, 110, 101, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 49, 60, 60,
+50, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 110, 111,
+95, 101, 109, 112, 108, 97, 99, 101, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 40, 49, 60, 60, 51, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 110, 111, 95, 104, 97, 115, 104, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 49, 60, 60, 52, 41,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 117, 115, 101, 95,
+99, 109, 112, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 40, 49, 60, 60, 53, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 109, 111, 114, 101, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 40, 49, 60, 60, 54, 41, 10, 10, 35,
+105, 102, 32, 99, 95, 111, 112, 116, 105, 111, 110, 40, 99, 95, 105,
+115, 95, 102, 111, 114, 119, 97, 114, 100, 41, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 105, 115, 95, 102, 111, 114,
+119, 97, 114, 100, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102,
+32, 99, 95, 111, 112, 116, 105, 111, 110, 40, 99, 95, 110, 111, 95,
+104, 97, 115, 104, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 110, 111, 95, 104, 97, 115, 104, 10, 35, 101, 110, 100,
+105, 102, 10, 35, 105, 102, 32, 99, 95, 111, 112, 116, 105, 111, 110,
+40, 99, 95, 110, 111, 95, 101, 109, 112, 108, 97, 99, 101, 41, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 110, 111, 95, 101,
+109, 112, 108, 97, 99, 101, 10, 35, 101, 110, 100, 105, 102, 10, 35,
+105, 102, 32, 99, 95, 111, 112, 116, 105, 111, 110, 40, 99, 95, 117,
+115, 101, 95, 99, 109, 112, 41, 32, 124, 124, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 105, 95, 99, 109, 112, 32, 124, 124, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115, 32, 124,
+124, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 95, 105, 95, 105, 115, 109, 97, 112, 32, 124,
+124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 105, 95, 105, 115,
+115, 101, 116, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100,
+32, 95, 105, 95, 105, 115, 112, 113, 117, 101, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 117, 115, 101, 95, 99, 109, 112,
+10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 32, 99, 95, 111,
+112, 116, 105, 111, 110, 40, 99, 95, 110, 111, 95, 99, 108, 111, 110,
+101, 41, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95,
+105, 95, 99, 97, 114, 99, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 110, 111, 95, 99, 108, 111, 110, 101, 10, 35, 101,
+110, 100, 105, 102, 10, 35, 105, 102, 32, 99, 95, 111, 112, 116, 105,
+111, 110, 40, 99, 95, 109, 111, 114, 101, 41, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 109, 111, 114, 101, 10, 35, 101,
+110, 100, 105, 102, 10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 107, 101, 121, 95, 115, 116, 114, 10, 32, 32,
+35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 95, 99,
+108, 97, 115, 115, 32, 99, 115, 116, 114, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 114, 97, 119, 95, 99, 108, 97, 115,
+115, 32, 99, 99, 104, 97, 114, 112, 116, 114, 10, 32, 32, 35, 105,
+102, 110, 100, 101, 102, 32, 105, 95, 116, 97, 103, 10, 32, 32, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 116, 97, 103, 32,
+115, 116, 114, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 35, 101,
+108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+107, 101, 121, 95, 115, 115, 118, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 107, 101, 121, 95, 99, 108, 97, 115, 115, 32,
+99, 115, 116, 114, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+105, 95, 114, 97, 119, 95, 99, 108, 97, 115, 115, 32, 99, 115, 118,
+105, 101, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 102, 114, 111, 109, 32, 99, 115, 116, 114, 95, 102,
+114, 111, 109, 95, 115, 118, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 107, 101, 121, 116, 111, 32, 99, 115, 116, 114, 95,
+115, 118, 10, 32, 32, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95,
+116, 97, 103, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 116, 97, 103, 32, 115, 115, 118, 10, 32, 32, 35, 101,
+110, 100, 105, 102, 10, 35, 101, 108, 105, 102, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 95, 97, 114, 99, 98,
+111, 120, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+107, 101, 121, 95, 99, 108, 97, 115, 115, 32, 105, 95, 107, 101, 121,
+95, 97, 114, 99, 98, 111, 120, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 114, 97, 119, 95, 99, 108, 97, 115, 115, 32,
+99, 95, 74, 79, 73, 78, 40, 105, 95, 107, 101, 121, 95, 97, 114, 99,
+98, 111, 120, 44, 32, 95, 114, 97, 119, 41, 10, 32, 32, 35, 105, 102,
+32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 117, 115, 101, 95,
+99, 109, 112, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 101, 113, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 107,
+101, 121, 95, 97, 114, 99, 98, 111, 120, 44, 32, 95, 114, 97, 119, 95,
+101, 113, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 35, 101,
+110, 100, 105, 102, 10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 114, 97, 119, 95, 99, 108, 97, 115, 115, 10,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121,
+114, 97, 119, 32, 105, 95, 114, 97, 119, 95, 99, 108, 97, 115, 115,
+10, 35, 101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 95, 99, 108, 97, 115, 115, 32, 38, 38, 32, 33,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 114,
+97, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+114, 97, 119, 95, 99, 108, 97, 115, 115, 32, 105, 95, 107, 101, 121,
+10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105, 102, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 95, 99, 108, 97,
+115, 115, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+107, 101, 121, 32, 105, 95, 107, 101, 121, 95, 99, 108, 97, 115, 115,
+10, 32, 32, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101,
+121, 99, 108, 111, 110, 101, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 105, 95, 107, 101, 121, 99, 108, 111, 110, 101, 32,
+99, 95, 74, 79, 73, 78, 40, 105, 95, 107, 101, 121, 44, 32, 95, 99,
+108, 111, 110, 101, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10,
+32, 32, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121,
+100, 114, 111, 112, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 32, 99, 95, 74,
+79, 73, 78, 40, 105, 95, 107, 101, 121, 44, 32, 95, 100, 114, 111,
+112, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105,
+102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107, 101,
+121, 102, 114, 111, 109, 32, 38, 38, 32, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 107, 101, 121, 114, 97, 119, 10, 32, 32, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 102, 114,
+111, 109, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 107, 101, 121, 44,
+32, 95, 102, 114, 111, 109, 41, 10, 32, 32, 35, 101, 110, 100, 105,
+102, 10, 32, 32, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 107, 101, 121, 116, 111, 32, 38, 38, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 114, 97, 119, 10,
+32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107,
+101, 121, 116, 111, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 107, 101,
+121, 44, 32, 95, 116, 111, 114, 97, 119, 41, 10, 32, 32, 35, 101, 110,
+100, 105, 102, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105, 102,
+32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 114, 97, 119, 95,
+99, 108, 97, 115, 115, 10, 32, 32, 35, 105, 102, 32, 33, 40, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 99, 109, 112, 32, 124, 124, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115,
+41, 32, 38, 38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+117, 115, 101, 95, 99, 109, 112, 10, 32, 32, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 99, 109, 112, 32, 99, 95, 74, 79, 73,
+78, 40, 105, 95, 107, 101, 121, 114, 97, 119, 44, 32, 95, 99, 109,
+112, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105,
+102, 32, 33, 40, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 104,
+97, 115, 104, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 110, 111, 95, 104, 97, 115, 104, 41, 10, 32, 32, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 104, 97, 115, 104, 32, 99,
+95, 74, 79, 73, 78, 40, 105, 95, 107, 101, 121, 114, 97, 119, 44, 32,
+95, 104, 97, 115, 104, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102,
+10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105, 102, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 99, 109, 112, 32, 124, 124, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115,
+32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 117,
+115, 101, 95, 99, 109, 112, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 10, 35, 101,
+110, 100, 105, 102, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 101, 113, 32, 124, 124, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 105, 95, 117, 115, 101, 95, 99, 109, 112, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105, 95, 104, 97, 115,
+95, 101, 113, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 32,
+33, 40, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 104, 97, 115,
+104, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+110, 111, 95, 104, 97, 115, 104, 41, 10, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 105, 95, 104, 97, 115, 104, 32, 99, 95, 100, 101,
+102, 97, 117, 108, 116, 95, 104, 97, 115, 104, 10, 35, 101, 110, 100,
+105, 102, 10, 10, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 107, 101, 121, 10, 32, 32, 35, 101, 114, 114, 111,
+114, 32, 34, 78, 111, 32, 105, 95, 107, 101, 121, 32, 111, 114, 32,
+105, 95, 118, 97, 108, 32, 100, 101, 102, 105, 110, 101, 100, 34, 10,
+35, 101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 114, 97, 119, 32, 94, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 105, 95, 107, 101, 121, 116, 111, 10, 32, 32, 35,
+101, 114, 114, 111, 114, 32, 34, 66, 111, 116, 104, 32, 105, 95, 107,
+101, 121, 114, 97, 119, 47, 105, 95, 118, 97, 108, 114, 97, 119, 32,
+97, 110, 100, 32, 105, 95, 107, 101, 121, 116, 111, 47, 105, 95, 118,
+97, 108, 116, 111, 32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101,
+102, 105, 110, 101, 100, 44, 32, 105, 102, 32, 97, 110, 121, 34, 10,
+35, 101, 108, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 110, 111, 95, 99, 108, 111, 110, 101, 32, 38, 38, 32, 40,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 99,
+108, 111, 110, 101, 32, 94, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 100, 114, 111, 112, 41, 10, 32, 32, 35, 101,
+114, 114, 111, 114, 32, 34, 66, 111, 116, 104, 32, 105, 95, 107, 101,
+121, 99, 108, 111, 110, 101, 47, 105, 95, 118, 97, 108, 99, 108, 111,
+110, 101, 32, 97, 110, 100, 32, 105, 95, 107, 101, 121, 100, 114, 111,
+112, 47, 105, 95, 118, 97, 108, 100, 114, 111, 112, 32, 109, 117, 115,
+116, 32, 98, 101, 32, 100, 101, 102, 105, 110, 101, 100, 44, 32, 105,
+102, 32, 97, 110, 121, 32, 40, 117, 110, 108, 101, 115, 115, 32, 105,
+95, 110, 111, 95, 99, 108, 111, 110, 101, 32, 100, 101, 102, 105, 110,
+101, 100, 41, 46, 34, 10, 35, 101, 108, 105, 102, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 102, 114, 111, 109, 32, 124, 124, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 100, 114, 111, 112,
+10, 32, 32, 35, 101, 114, 114, 111, 114, 32, 34, 105, 95, 102, 114,
+111, 109, 32, 47, 32, 105, 95, 100, 114, 111, 112, 32, 110, 111, 116,
+32, 115, 117, 112, 112, 111, 114, 116, 101, 100, 46, 32, 68, 101, 102,
+105, 110, 101, 32, 105, 95, 107, 101, 121, 102, 114, 111, 109, 47,
+105, 95, 118, 97, 108, 102, 114, 111, 109, 32, 97, 110, 100, 47, 111,
+114, 32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 47, 105, 95, 118,
+97, 108, 100, 114, 111, 112, 32, 105, 110, 115, 116, 101, 97, 100, 34,
+10, 35, 101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 114, 97, 119, 32, 38, 38, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 95, 105, 95, 105, 115, 104, 97, 115, 104, 32,
+38, 38, 32, 33, 40, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+104, 97, 115, 104, 32, 38, 38, 32, 40, 100, 101, 102, 105, 110, 101,
+100, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 32, 124, 124,
+32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 101, 113, 41, 41,
+10, 32, 32, 35, 101, 114, 114, 111, 114, 32, 34, 70, 111, 114, 32, 99,
+109, 97, 112, 47, 99, 115, 101, 116, 44, 32, 98, 111, 116, 104, 32,
+105, 95, 104, 97, 115, 104, 32, 97, 110, 100, 32, 105, 95, 101, 113,
+32, 40, 111, 114, 32, 105, 95, 108, 101, 115, 115, 32, 111, 114, 32,
+105, 95, 99, 109, 112, 41, 32, 109, 117, 115, 116, 32, 98, 101, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 119, 104, 101, 110, 32, 105,
+95, 107, 101, 121, 114, 97, 119, 32, 105, 115, 32, 100, 101, 102, 105,
+110, 101, 100, 46, 34, 10, 35, 101, 108, 105, 102, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 114, 97, 119, 32, 38,
+38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 117, 115, 101,
+95, 99, 109, 112, 32, 38, 38, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 10, 32, 32, 35,
+101, 114, 114, 111, 114, 32, 34, 70, 111, 114, 32, 99, 115, 109, 97,
+112, 47, 99, 115, 115, 101, 116, 47, 99, 112, 113, 117, 101, 44, 32,
+105, 95, 99, 109, 112, 32, 111, 114, 32, 105, 95, 108, 101, 115, 115,
+32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101, 102, 105, 110, 101,
+100, 32, 119, 104, 101, 110, 32, 105, 95, 107, 101, 121, 114, 97, 119,
+32, 105, 115, 32, 100, 101, 102, 105, 110, 101, 100, 46, 34, 10, 35,
+101, 110, 100, 105, 102, 10, 10, 47, 47, 32, 105, 95, 101, 113, 44,
+32, 105, 95, 108, 101, 115, 115, 44, 32, 105, 95, 99, 109, 112, 10,
+35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+101, 113, 32, 38, 38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105,
+95, 99, 109, 112, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+105, 95, 101, 113, 40, 120, 44, 32, 121, 41, 32, 33, 40, 105, 95, 99,
+109, 112, 40, 120, 44, 32, 121, 41, 41, 10, 35, 101, 108, 105, 102,
+32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 101, 113, 32,
+38, 38, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107,
+101, 121, 114, 97, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 101, 113, 40, 120, 44, 32, 121, 41, 32, 42, 120, 32, 61,
+61, 32, 42, 121, 32, 47, 47, 32, 102, 111, 114, 32, 105, 110, 116,
+101, 103, 114, 97, 108, 32, 116, 121, 112, 101, 115, 44, 32, 101, 108,
+115, 101, 32, 100, 101, 102, 105, 110, 101, 32, 105, 95, 101, 113, 32,
+111, 114, 32, 105, 95, 99, 109, 112, 32, 121, 111, 117, 114, 115, 101,
+108, 102, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 32, 33,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115,
+32, 38, 38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 99,
+109, 112, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+108, 101, 115, 115, 40, 120, 44, 32, 121, 41, 32, 40, 105, 95, 99,
+109, 112, 40, 120, 44, 32, 121, 41, 41, 32, 60, 32, 48, 10, 35, 101,
+108, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+108, 101, 115, 115, 32, 38, 38, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 107, 101, 121, 114, 97, 119, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 108, 101, 115, 115, 40, 120, 44,
+32, 121, 41, 32, 42, 120, 32, 60, 32, 42, 121, 32, 47, 47, 32, 102,
+111, 114, 32, 105, 110, 116, 101, 103, 114, 97, 108, 32, 116, 121,
+112, 101, 115, 44, 32, 101, 108, 115, 101, 32, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 108, 101, 115, 115, 32, 111, 114, 32, 105, 95,
+99, 109, 112, 32, 121, 111, 117, 114, 115, 101, 108, 102, 10, 35, 101,
+110, 100, 105, 102, 10, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 99, 109, 112, 32, 38, 38, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 99, 109, 112, 40, 120, 44,
+32, 121, 41, 32, 40, 105, 95, 108, 101, 115, 115, 40, 121, 44, 32,
+120, 41, 41, 32, 45, 32, 40, 105, 95, 108, 101, 115, 115, 40, 120, 44,
+32, 121, 41, 41, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105,
+102, 110, 100, 101, 102, 32, 105, 95, 116, 97, 103, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 116, 97, 103, 32, 105, 95,
+107, 101, 121, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 105, 95, 107, 101, 121, 114, 97, 119, 10, 32, 32,
+35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 114, 97,
+119, 32, 105, 95, 107, 101, 121, 10, 35, 101, 110, 100, 105, 102, 10,
+35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 102,
+114, 111, 109, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 102, 114, 111, 109, 32, 99, 95, 100, 101, 102, 97,
+117, 108, 116, 95, 99, 108, 111, 110, 101, 10, 35, 101, 108, 115, 101,
+10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 104, 97,
+115, 95, 101, 109, 112, 108, 97, 99, 101, 10, 35, 101, 110, 100, 105,
+102, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121,
+116, 111, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+107, 101, 121, 116, 111, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116,
+95, 116, 111, 114, 97, 119, 10, 35, 101, 110, 100, 105, 102, 10, 35,
+105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 99, 108,
+111, 110, 101, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 99, 108, 111, 110, 101, 32, 99, 95, 100, 101, 102,
+97, 117, 108, 116, 95, 99, 108, 111, 110, 101, 10, 35, 101, 110, 100,
+105, 102, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101,
+121, 100, 114, 111, 112, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 32, 99, 95, 100, 101,
+102, 97, 117, 108, 116, 95, 100, 114, 111, 112, 10, 35, 101, 110, 100,
+105, 102, 10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100,
+32, 95, 105, 95, 105, 115, 109, 97, 112, 32, 47, 47, 32, 45, 45, 45,
+45, 32, 112, 114, 111, 99, 101, 115, 115, 32, 99, 109, 97, 112, 47,
+99, 115, 109, 97, 112, 32, 118, 97, 108, 117, 101, 32, 105, 95, 118,
+97, 108, 44, 32, 46, 46, 46, 32, 45, 45, 45, 45, 10, 10, 35, 105, 102,
+100, 101, 102, 32, 105, 95, 118, 97, 108, 95, 115, 116, 114, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 95,
+99, 108, 97, 115, 115, 32, 99, 115, 116, 114, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 114, 97, 119, 32,
+99, 111, 110, 115, 116, 32, 99, 104, 97, 114, 42, 10, 35, 101, 108,
+105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97,
+108, 95, 115, 115, 118, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 118, 97, 108, 95, 99, 108, 97, 115, 115, 32, 99, 115,
+116, 114, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+118, 97, 108, 114, 97, 119, 32, 99, 115, 118, 105, 101, 119, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 102,
+114, 111, 109, 32, 99, 115, 116, 114, 95, 102, 114, 111, 109, 95, 115,
+118, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118,
+97, 108, 116, 111, 32, 99, 115, 116, 114, 95, 115, 118, 10, 35, 101,
+108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+118, 97, 108, 95, 97, 114, 99, 98, 111, 120, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 95, 99, 108, 97, 115,
+115, 32, 105, 95, 118, 97, 108, 95, 97, 114, 99, 98, 111, 120, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 114,
+97, 119, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 118, 97, 108, 95,
+97, 114, 99, 98, 111, 120, 44, 32, 95, 114, 97, 119, 41, 10, 35, 101,
+110, 100, 105, 102, 10, 10, 35, 105, 102, 100, 101, 102, 32, 105, 95,
+118, 97, 108, 95, 99, 108, 97, 115, 115, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 32, 105, 95, 118, 97,
+108, 95, 99, 108, 97, 115, 115, 10, 32, 32, 35, 105, 102, 110, 100,
+101, 102, 32, 105, 95, 118, 97, 108, 99, 108, 111, 110, 101, 10, 32,
+32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97,
+108, 99, 108, 111, 110, 101, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95,
+118, 97, 108, 44, 32, 95, 99, 108, 111, 110, 101, 41, 10, 32, 32, 35,
+101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 100, 114, 111, 112, 10, 32, 32, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 100, 114,
+111, 112, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 118, 97, 108, 44,
+32, 95, 100, 114, 111, 112, 41, 10, 32, 32, 35, 101, 110, 100, 105,
+102, 10, 32, 32, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 32, 38, 38, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 114, 97,
+119, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 118, 97, 108, 102, 114, 111, 109, 32, 99, 95, 74, 79, 73, 78, 40,
+105, 95, 118, 97, 108, 44, 32, 95, 102, 114, 111, 109, 41, 10, 32, 32,
+35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32, 33, 100,
+101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 116, 111, 32,
+38, 38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97,
+108, 114, 97, 119, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 118, 97, 108, 116, 111, 32, 99, 95, 74, 79, 73, 78,
+40, 105, 95, 118, 97, 108, 44, 32, 95, 116, 111, 114, 97, 119, 41, 10,
+32, 32, 35, 101, 110, 100, 105, 102, 10, 35, 101, 110, 100, 105, 102,
+10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 118, 97, 108,
+10, 32, 32, 35, 101, 114, 114, 111, 114, 32, 34, 105, 95, 118, 97,
+108, 42, 32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 102, 111, 114, 32, 109, 97, 112, 115, 34, 10, 35,
+101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105,
+95, 118, 97, 108, 114, 97, 119, 32, 94, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 118, 97, 108, 116, 111, 10, 32, 32, 35, 101,
+114, 114, 111, 114, 32, 34, 66, 111, 116, 104, 32, 105, 95, 118, 97,
+108, 114, 97, 119, 32, 97, 110, 100, 32, 105, 95, 118, 97, 108, 116,
+111, 32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101, 102, 105, 110,
+101, 100, 44, 32, 105, 102, 32, 97, 110, 121, 34, 10, 35, 101, 108,
+105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 110,
+111, 95, 99, 108, 111, 110, 101, 32, 38, 38, 32, 40, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 99, 108, 111, 110, 101,
+32, 94, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97,
+108, 100, 114, 111, 112, 41, 10, 32, 32, 35, 101, 114, 114, 111, 114,
+32, 34, 66, 111, 116, 104, 32, 105, 95, 118, 97, 108, 99, 108, 111,
+110, 101, 32, 97, 110, 100, 32, 105, 95, 118, 97, 108, 100, 114, 111,
+112, 32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101, 102, 105, 110,
+101, 100, 44, 32, 105, 102, 32, 97, 110, 121, 34, 10, 35, 101, 110,
+100, 105, 102, 10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95,
+118, 97, 108, 114, 97, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 118, 97, 108, 114, 97, 119, 32, 105, 95, 118, 97,
+108, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110, 100, 101,
+102, 32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 102, 114,
+111, 109, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 99, 108,
+111, 110, 101, 10, 35, 101, 108, 115, 101, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 104, 97, 115, 95, 101, 109, 112, 108,
+97, 99, 101, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 105, 95, 118, 97, 108, 116, 111, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 116, 111, 32,
+99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 116, 111, 114, 97, 119,
+10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 99, 108, 111, 110, 101, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 99, 108, 111,
+110, 101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 99, 108,
+111, 110, 101, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 105, 95, 118, 97, 108, 100, 114, 111, 112, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 100,
+114, 111, 112, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 100,
+114, 111, 112, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 101, 110,
+100, 105, 102, 32, 47, 47, 32, 33, 95, 105, 95, 105, 115, 109, 97,
+112, 10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 118, 97,
+108, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118,
+97, 108, 32, 105, 95, 107, 101, 121, 10, 35, 101, 110, 100, 105, 102,
+10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 118, 97, 108, 114,
+97, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+118, 97, 108, 114, 97, 119, 32, 105, 95, 107, 101, 121, 114, 97, 119,
+10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110, 100, 101, 102,
+32, 105, 95, 104, 97, 115, 95, 101, 109, 112, 108, 97, 99, 101, 10,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 110, 111, 95,
+101, 109, 112, 108, 97, 99, 101, 10, 35, 101, 110, 100, 105, 102, 10,
+35, 101, 110, 100, 105, 102, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78,
+68, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 116,
+101, 109, 112, 108, 97, 116, 101, 46, 104, 10, 35, 105, 102, 110, 100,
+101, 102, 32, 105, 95, 105, 115, 95, 102, 111, 114, 119, 97, 114, 100,
+10, 32, 32, 95, 99, 95, 68, 69, 70, 84, 89, 80, 69, 83, 40, 95, 99,
+95, 99, 104, 97, 115, 104, 95, 116, 121, 112, 101, 115, 44, 32, 105,
+95, 116, 121, 112, 101, 44, 32, 105, 95, 107, 101, 121, 44, 32, 105,
+95, 118, 97, 108, 44, 32, 95, 105, 95, 77, 65, 80, 95, 79, 78, 76, 89,
+44, 32, 95, 105, 95, 83, 69, 84, 95, 79, 78, 76, 89, 41, 59, 10, 35,
+101, 110, 100, 105, 102, 10, 10, 95, 105, 95, 77, 65, 80, 95, 79, 78,
+76, 89, 40, 32, 115, 116, 114, 117, 99, 116, 32, 95, 109, 95, 118, 97,
+108, 117, 101, 32, 123, 10, 32, 32, 32, 32, 95, 109, 95, 107, 101,
+121, 32, 102, 105, 114, 115, 116, 59, 10, 32, 32, 32, 32, 95, 109, 95,
+109, 97, 112, 112, 101, 100, 32, 115, 101, 99, 111, 110, 100, 59, 10,
+125, 59, 32, 41, 10, 10, 116, 121, 112, 101, 100, 101, 102, 32, 105,
+95, 107, 101, 121, 114, 97, 119, 32, 95, 109, 95, 107, 101, 121, 114,
+97, 119, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 105, 95, 118,
+97, 108, 114, 97, 119, 32, 95, 109, 95, 114, 109, 97, 112, 112, 101,
+100, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 95, 105, 95, 83,
+69, 84, 95, 79, 78, 76, 89, 40, 32, 105, 95, 107, 101, 121, 114, 97,
+119, 32, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 105, 95, 77, 65,
+80, 95, 79, 78, 76, 89, 40, 32, 115, 116, 114, 117, 99, 116, 32, 123,
+32, 95, 109, 95, 107, 101, 121, 114, 97, 119, 32, 102, 105, 114, 115,
+116, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95,
+109, 95, 114, 109, 97, 112, 112, 101, 100, 32, 115, 101, 99, 111, 110,
+100, 59, 32, 125, 32, 41, 10, 95, 109, 95, 114, 97, 119, 59, 10, 10,
+83, 84, 67, 95, 65, 80, 73, 32, 105, 95, 116, 121, 112, 101, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+119, 105, 116, 104, 95, 99, 97, 112, 97, 99, 105, 116, 121, 41, 40,
+105, 110, 116, 112, 116, 114, 95, 116, 32, 99, 97, 112, 41, 59, 10,
+35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+110, 111, 95, 99, 108, 111, 110, 101, 10, 83, 84, 67, 95, 65, 80, 73,
+32, 105, 95, 116, 121, 112, 101, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 108, 111, 110, 101, 41,
+40, 105, 95, 116, 121, 112, 101, 32, 109, 97, 112, 41, 59, 10, 35,
+101, 110, 100, 105, 102, 10, 83, 84, 67, 95, 65, 80, 73, 32, 118, 111,
+105, 100, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 100, 114, 111, 112, 41, 40, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 41, 59, 10, 83, 84, 67, 95, 65,
+80, 73, 32, 118, 111, 105, 100, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 108, 101, 97, 114,
+41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 41,
+59, 10, 83, 84, 67, 95, 65, 80, 73, 32, 95, 66, 111, 111, 108, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 114, 101, 115, 101, 114, 118, 101, 41, 40, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 99, 97, 112, 97, 99, 105, 116, 121, 41, 59, 10, 83,
+84, 67, 95, 65, 80, 73, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116,
+32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 98,
+117, 99, 107, 101, 116, 95, 41, 40, 99, 111, 110, 115, 116, 32, 105,
+95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111,
+110, 115, 116, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119, 42, 32,
+114, 107, 101, 121, 112, 116, 114, 41, 59, 10, 83, 84, 67, 95, 65, 80,
+73, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 32, 32, 32, 32,
+32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 105, 110, 115, 101, 114,
+116, 95, 101, 110, 116, 114, 121, 95, 41, 40, 105, 95, 116, 121, 112,
+101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 107, 101, 121,
+114, 97, 119, 32, 114, 107, 101, 121, 41, 59, 10, 83, 84, 67, 95, 65,
+80, 73, 32, 118, 111, 105, 100, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 114, 97, 115,
+101, 95, 101, 110, 116, 114, 121, 41, 40, 105, 95, 116, 121, 112, 101,
+42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 118, 97, 108, 117,
+101, 42, 32, 118, 97, 108, 41, 59, 10, 83, 84, 67, 95, 65, 80, 73, 32,
+102, 108, 111, 97, 116, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 109, 97, 120, 95, 108, 111, 97,
+100, 95, 102, 97, 99, 116, 111, 114, 41, 40, 99, 111, 110, 115, 116,
+32, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 41, 59,
+10, 83, 84, 67, 95, 65, 80, 73, 32, 105, 110, 116, 112, 116, 114, 95,
+116, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 99, 97, 112, 97, 99, 105, 116, 121, 41, 40, 99, 111, 110, 115,
+116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 109, 97, 112, 41, 59,
+10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 105, 95, 116, 121,
+112, 101, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 105, 110, 105, 116, 41, 40, 118, 111, 105, 100, 41, 32, 123, 32,
+105, 95, 116, 121, 112, 101, 32, 109, 97, 112, 32, 61, 32, 123, 48,
+125, 59, 32, 114, 101, 116, 117, 114, 110, 32, 109, 97, 112, 59, 32,
+125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 118, 111, 105,
+100, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 115, 104, 114, 105, 110, 107, 95, 116, 111, 95, 102, 105, 116,
+41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 41,
+32, 123, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 101, 115, 101,
+114, 118, 101, 41, 40, 115, 101, 108, 102, 44, 32, 40, 105, 110, 116,
+112, 116, 114, 95, 116, 41, 115, 101, 108, 102, 45, 62, 115, 105, 122,
+101, 41, 59, 32, 125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32,
+95, 66, 111, 111, 108, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 101, 109, 112, 116, 121, 41, 40, 99, 111, 110,
+115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 109, 97, 112, 41,
+32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 33, 109, 97, 112, 45,
+62, 115, 105, 122, 101, 59, 32, 125, 10, 83, 84, 67, 95, 73, 78, 76,
+73, 78, 69, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 32, 32, 32,
+32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 115, 105, 122, 101, 41, 40,
+99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 109,
+97, 112, 41, 32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 40, 105,
+110, 116, 112, 116, 114, 95, 116, 41, 109, 97, 112, 45, 62, 115, 105,
+122, 101, 59, 32, 125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32,
+105, 110, 116, 112, 116, 114, 95, 116, 32, 32, 32, 32, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 98, 117, 99, 107, 101, 116, 95, 99, 111, 117,
+110, 116, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 109, 97, 112,
+41, 32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 109, 97, 112, 45,
+62, 98, 117, 99, 107, 101, 116, 95, 99, 111, 117, 110, 116, 59, 32,
+125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 66, 111, 111,
+108, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 99, 111, 110, 116, 97, 105, 110, 115, 41, 40, 99, 111, 110,
+115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102,
+44, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119, 32, 114, 107, 101,
+121, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 123, 32, 114,
+101, 116, 117, 114, 110, 32, 115, 101, 108, 102, 45, 62, 115, 105,
+122, 101, 32, 38, 38, 32, 33, 95, 99, 95, 77, 69, 77, 66, 40, 95, 98,
+117, 99, 107, 101, 116, 95, 41, 40, 115, 101, 108, 102, 44, 32, 38,
+114, 107, 101, 121, 41, 46, 105, 110, 115, 101, 114, 116, 101, 100,
+59, 32, 125, 10, 10, 35, 105, 102, 100, 101, 102, 32, 95, 105, 95,
+105, 115, 109, 97, 112, 10, 32, 32, 32, 32, 83, 84, 67, 95, 65, 80,
+73, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 105, 110, 115, 101, 114, 116, 95, 111, 114, 95,
+97, 115, 115, 105, 103, 110, 41, 40, 105, 95, 116, 121, 112, 101, 42,
+32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 107, 101, 121, 32, 107,
+101, 121, 44, 32, 95, 109, 95, 109, 97, 112, 112, 101, 100, 32, 109,
+97, 112, 112, 101, 100, 41, 59, 10, 32, 32, 32, 32, 35, 105, 102, 32,
+33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 110, 111, 95, 101,
+109, 112, 108, 97, 99, 101, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83,
+84, 67, 95, 65, 80, 73, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116,
+32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 109, 112, 108, 97,
+99, 101, 95, 111, 114, 95, 97, 115, 115, 105, 103, 110, 41, 40, 105,
+95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109,
+95, 107, 101, 121, 114, 97, 119, 32, 114, 107, 101, 121, 44, 32, 95,
+109, 95, 114, 109, 97, 112, 112, 101, 100, 32, 114, 109, 97, 112, 112,
+101, 100, 41, 59, 10, 32, 32, 32, 32, 35, 101, 110, 100, 105, 102, 10,
+10, 32, 32, 32, 32, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 99,
+111, 110, 115, 116, 32, 95, 109, 95, 109, 97, 112, 112, 101, 100, 42,
+10, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 97, 116, 41,
+40, 99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32,
+115, 101, 108, 102, 44, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119,
+32, 114, 107, 101, 121, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 98, 32, 61, 32, 95,
+99, 95, 77, 69, 77, 66, 40, 95, 98, 117, 99, 107, 101, 116, 95, 41,
+40, 115, 101, 108, 102, 44, 32, 38, 114, 107, 101, 121, 41, 59, 10,
+32, 32, 32, 32, 32, 32, 32, 32, 99, 95, 97, 115, 115, 101, 114, 116,
+40, 33, 98, 46, 105, 110, 115, 101, 114, 116, 101, 100, 41, 59, 10,
+32, 32, 32, 32, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 38,
+98, 46, 114, 101, 102, 45, 62, 115, 101, 99, 111, 110, 100, 59, 10,
+32, 32, 32, 32, 125, 10, 10, 32, 32, 32, 32, 83, 84, 67, 95, 73, 78,
+76, 73, 78, 69, 32, 95, 109, 95, 109, 97, 112, 112, 101, 100, 42, 10,
+32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 97, 116, 95, 109,
+117, 116, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108,
+102, 44, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119, 32, 114, 107,
+101, 121, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 123, 32, 114, 101,
+116, 117, 114, 110, 32, 40, 95, 109, 95, 109, 97, 112, 112, 101, 100,
+42, 41, 95, 99, 95, 77, 69, 77, 66, 40, 95, 97, 116, 41, 40, 115, 101,
+108, 102, 44, 32, 114, 107, 101, 121, 41, 59, 32, 125, 10, 35, 101,
+110, 100, 105, 102, 32, 47, 47, 32, 95, 105, 95, 105, 115, 109, 97,
+112, 10, 10, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100,
+32, 105, 95, 110, 111, 95, 99, 108, 111, 110, 101, 10, 83, 84, 67, 95,
+73, 78, 76, 73, 78, 69, 32, 118, 111, 105, 100, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 99, 111, 112, 121, 41, 40, 105, 95, 116, 121, 112,
+101, 32, 42, 115, 101, 108, 102, 44, 32, 99, 111, 110, 115, 116, 32,
+105, 95, 116, 121, 112, 101, 42, 32, 111, 116, 104, 101, 114, 41, 32,
+123, 10, 32, 32, 32, 32, 105, 102, 32, 40, 115, 101, 108, 102, 45, 62,
+116, 97, 98, 108, 101, 32, 61, 61, 32, 111, 116, 104, 101, 114, 45,
+62, 116, 97, 98, 108, 101, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+114, 101, 116, 117, 114, 110, 59, 10, 32, 32, 32, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 100, 114, 111, 112, 41, 40, 115, 101, 108, 102,
+41, 59, 10, 32, 32, 32, 32, 42, 115, 101, 108, 102, 32, 61, 32, 95,
+99, 95, 77, 69, 77, 66, 40, 95, 99, 108, 111, 110, 101, 41, 40, 42,
+111, 116, 104, 101, 114, 41, 59, 10, 125, 10, 10, 83, 84, 67, 95, 73,
+78, 76, 73, 78, 69, 32, 95, 109, 95, 118, 97, 108, 117, 101, 10, 95,
+99, 95, 77, 69, 77, 66, 40, 95, 118, 97, 108, 117, 101, 95, 99, 108,
+111, 110, 101, 41, 40, 95, 109, 95, 118, 97, 108, 117, 101, 32, 95,
+118, 97, 108, 41, 32, 123, 10, 32, 32, 32, 32, 42, 95, 105, 95, 107,
+101, 121, 114, 101, 102, 40, 38, 95, 118, 97, 108, 41, 32, 61, 32,
+105, 95, 107, 101, 121, 99, 108, 111, 110, 101, 40, 40, 42, 95, 105,
+95, 107, 101, 121, 114, 101, 102, 40, 38, 95, 118, 97, 108, 41, 41,
+41, 59, 10, 32, 32, 32, 32, 95, 105, 95, 77, 65, 80, 95, 79, 78, 76,
+89, 40, 32, 95, 118, 97, 108, 46, 115, 101, 99, 111, 110, 100, 32, 61,
+32, 105, 95, 118, 97, 108, 99, 108, 111, 110, 101, 40, 95, 118, 97,
+108, 46, 115, 101, 99, 111, 110, 100, 41, 59, 32, 41, 10, 32, 32, 32,
+32, 114, 101, 116, 117, 114, 110, 32, 95, 118, 97, 108, 59, 10, 125,
+10, 35, 101, 110, 100, 105, 102, 32, 47, 47, 32, 33, 105, 95, 110,
+111, 95, 99, 108, 111, 110, 101, 10, 10, 35, 105, 102, 32, 33, 100,
+101, 102, 105, 110, 101, 100, 32, 105, 95, 110, 111, 95, 101, 109,
+112, 108, 97, 99, 101, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32,
+95, 109, 95, 114, 101, 115, 117, 108, 116, 10, 95, 99, 95, 77, 69, 77,
+66, 40, 95, 101, 109, 112, 108, 97, 99, 101, 41, 40, 105, 95, 116,
+121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 107,
+101, 121, 114, 97, 119, 32, 114, 107, 101, 121, 32, 95, 105, 95, 77,
+65, 80, 95, 79, 78, 76, 89, 40, 44, 32, 95, 109, 95, 114, 109, 97,
+112, 112, 101, 100, 32, 114, 109, 97, 112, 112, 101, 100, 41, 41, 32,
+123, 10, 32, 32, 32, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116,
+32, 95, 114, 101, 115, 32, 61, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+105, 110, 115, 101, 114, 116, 95, 101, 110, 116, 114, 121, 95, 41, 40,
+115, 101, 108, 102, 44, 32, 114, 107, 101, 121, 41, 59, 10, 32, 32,
+32, 32, 105, 102, 32, 40, 95, 114, 101, 115, 46, 105, 110, 115, 101,
+114, 116, 101, 100, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+42, 95, 105, 95, 107, 101, 121, 114, 101, 102, 40, 95, 114, 101, 115,
+46, 114, 101, 102, 41, 32, 61, 32, 105, 95, 107, 101, 121, 102, 114,
+111, 109, 40, 114, 107, 101, 121, 41, 59, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 95, 105, 95, 77, 65, 80, 95, 79, 78, 76, 89, 40, 32, 95, 114,
+101, 115, 46, 114, 101, 102, 45, 62, 115, 101, 99, 111, 110, 100, 32,
+61, 32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 40, 114, 109, 97,
+112, 112, 101, 100, 41, 59, 32, 41, 10, 32, 32, 32, 32, 125, 10, 32,
+32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 95, 114, 101, 115, 59,
+10, 125, 10, 10, 35, 105, 102, 100, 101, 102, 32, 95, 105, 95, 105,
+115, 109, 97, 112, 10, 32, 32, 32, 32, 83, 84, 67, 95, 73, 78, 76, 73,
+78, 69, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 10, 32, 32, 32,
+32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 109, 112, 108, 97, 99,
+101, 95, 107, 101, 121, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32,
+115, 101, 108, 102, 44, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119,
+32, 114, 107, 101, 121, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 95, 114, 101, 115,
+32, 61, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 105, 110, 115, 101,
+114, 116, 95, 101, 110, 116, 114, 121, 95, 41, 40, 115, 101, 108, 102,
+44, 32, 114, 107, 101, 121, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 105, 102, 32, 40, 95, 114, 101, 115, 46, 105, 110, 115, 101, 114,
+116, 101, 100, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+95, 114, 101, 115, 46, 114, 101, 102, 45, 62, 102, 105, 114, 115, 116,
+32, 61, 32, 105, 95, 107, 101, 121, 102, 114, 111, 109, 40, 114, 107,
+101, 121, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 114, 101, 116,
+117, 114, 110, 32, 95, 114, 101, 115, 59, 10, 32, 32, 32, 32, 125, 10,
+35, 101, 110, 100, 105, 102, 32, 47, 47, 32, 95, 105, 95, 105, 115,
+109, 97, 112, 10, 35, 101, 110, 100, 105, 102, 32, 47, 47, 32, 33,
+105, 95, 110, 111, 95, 101, 109, 112, 108, 97, 99, 101, 10, 10, 83,
+84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 114, 97, 119, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 118, 97, 108, 117, 101, 95, 116,
+111, 114, 97, 119, 41, 40, 99, 111, 110, 115, 116, 32, 95, 109, 95,
+118, 97, 108, 117, 101, 42, 32, 118, 97, 108, 41, 32, 123, 10, 32, 32,
+32, 32, 114, 101, 116, 117, 114, 110, 32, 95, 105, 95, 83, 69, 84, 95,
+79, 78, 76, 89, 40, 32, 105, 95, 107, 101, 121, 116, 111, 40, 118, 97,
+108, 41, 32, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95,
+105, 95, 77, 65, 80, 95, 79, 78, 76, 89, 40, 32, 99, 95, 76, 73, 84,
+69, 82, 65, 76, 40, 95, 109, 95, 114, 97, 119, 41, 123, 105, 95, 107,
+101, 121, 116, 111, 40, 40, 38, 118, 97, 108, 45, 62, 102, 105, 114,
+115, 116, 41, 41, 44, 32, 105, 95, 118, 97, 108, 116, 111, 40, 40, 38,
+118, 97, 108, 45, 62, 115, 101, 99, 111, 110, 100, 41, 41, 125, 32,
+41, 59, 10, 125, 10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32,
+118, 111, 105, 100, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 118, 97,
+108, 117, 101, 95, 100, 114, 111, 112, 41, 40, 95, 109, 95, 118, 97,
+108, 117, 101, 42, 32, 95, 118, 97, 108, 41, 32, 123, 10, 32, 32, 32,
+32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 40, 95, 105, 95, 107,
+101, 121, 114, 101, 102, 40, 95, 118, 97, 108, 41, 41, 59, 10, 32, 32,
+32, 32, 95, 105, 95, 77, 65, 80, 95, 79, 78, 76, 89, 40, 32, 105, 95,
+118, 97, 108, 100, 114, 111, 112, 40, 40, 38, 95, 118, 97, 108, 45,
+62, 115, 101, 99, 111, 110, 100, 41, 41, 59, 32, 41, 10, 125, 10, 10,
+83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 114, 101,
+115, 117, 108, 116, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 105, 110,
+115, 101, 114, 116, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 44, 32, 95, 109, 95, 107, 101, 121, 32, 95, 107, 101,
+121, 32, 95, 105, 95, 77, 65, 80, 95, 79, 78, 76, 89, 40, 44, 32, 95,
+109, 95, 109, 97, 112, 112, 101, 100, 32, 95, 109, 97, 112, 112, 101,
+100, 41, 41, 32, 123, 10, 32, 32, 32, 32, 95, 109, 95, 114, 101, 115,
+117, 108, 116, 32, 95, 114, 101, 115, 32, 61, 32, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 105, 110, 115, 101, 114, 116, 95, 101, 110, 116, 114,
+121, 95, 41, 40, 115, 101, 108, 102, 44, 32, 105, 95, 107, 101, 121,
+116, 111, 40, 40, 38, 95, 107, 101, 121, 41, 41, 41, 59, 10, 32, 32,
+32, 32, 105, 102, 32, 40, 95, 114, 101, 115, 46, 105, 110, 115, 101,
+114, 116, 101, 100, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 123, 32,
+42, 95, 105, 95, 107, 101, 121, 114, 101, 102, 40, 95, 114, 101, 115,
+46, 114, 101, 102, 41, 32, 61, 32, 95, 107, 101, 121, 59, 32, 95, 105,
+95, 77, 65, 80, 95, 79, 78, 76, 89, 40, 32, 95, 114, 101, 115, 46,
+114, 101, 102, 45, 62, 115, 101, 99, 111, 110, 100, 32, 61, 32, 95,
+109, 97, 112, 112, 101, 100, 59, 32, 41, 125, 10, 32, 32, 32, 32, 101,
+108, 115, 101, 10, 32, 32, 32, 32, 32, 32, 32, 32, 123, 32, 105, 95,
+107, 101, 121, 100, 114, 111, 112, 40, 40, 38, 95, 107, 101, 121, 41,
+41, 59, 32, 95, 105, 95, 77, 65, 80, 95, 79, 78, 76, 89, 40, 32, 105,
+95, 118, 97, 108, 100, 114, 111, 112, 40, 40, 38, 95, 109, 97, 112,
+112, 101, 100, 41, 41, 59, 32, 41, 125, 10, 32, 32, 32, 32, 114, 101,
+116, 117, 114, 110, 32, 95, 114, 101, 115, 59, 10, 125, 10, 10, 83,
+84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 118, 97, 108,
+117, 101, 42, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 112, 117, 115,
+104, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102,
+44, 32, 95, 109, 95, 118, 97, 108, 117, 101, 32, 95, 118, 97, 108, 41,
+32, 123, 10, 32, 32, 32, 32, 95, 109, 95, 114, 101, 115, 117, 108,
+116, 32, 95, 114, 101, 115, 32, 61, 32, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 105, 110, 115, 101, 114, 116, 95, 101, 110, 116, 114, 121, 95,
+41, 40, 115, 101, 108, 102, 44, 32, 105, 95, 107, 101, 121, 116, 111,
+40, 95, 105, 95, 107, 101, 121, 114, 101, 102, 40, 38, 95, 118, 97,
+108, 41, 41, 41, 59, 10, 32, 32, 32, 32, 105, 102, 32, 40, 95, 114,
+101, 115, 46, 105, 110, 115, 101, 114, 116, 101, 100, 41, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 42, 95, 114, 101, 115, 46, 114, 101, 102, 32,
+61, 32, 95, 118, 97, 108, 59, 10, 32, 32, 32, 32, 101, 108, 115, 101,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 118, 97, 108, 117, 101, 95, 100, 114, 111, 112, 41, 40, 38, 95,
+118, 97, 108, 41, 59, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114,
+110, 32, 95, 114, 101, 115, 46, 114, 101, 102, 59, 10, 125, 10, 10,
+83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 118, 111, 105, 100, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 112, 117, 116, 95, 110, 41, 40,
+105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99,
+111, 110, 115, 116, 32, 95, 109, 95, 114, 97, 119, 42, 32, 114, 97,
+119, 44, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 110, 41, 32,
+123, 10, 32, 32, 32, 32, 119, 104, 105, 108, 101, 32, 40, 110, 45, 45,
+41, 32, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+95, 105, 95, 105, 115, 115, 101, 116, 32, 38, 38, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 110, 111, 95, 101, 109, 112, 108, 97,
+99, 101, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77,
+66, 40, 95, 105, 110, 115, 101, 114, 116, 41, 40, 115, 101, 108, 102,
+44, 32, 42, 114, 97, 119, 43, 43, 41, 59, 10, 35, 101, 108, 105, 102,
+32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 105, 95, 105, 115, 115,
+101, 116, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77,
+66, 40, 95, 101, 109, 112, 108, 97, 99, 101, 41, 40, 115, 101, 108,
+102, 44, 32, 42, 114, 97, 119, 43, 43, 41, 59, 10, 35, 101, 108, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 110, 111, 95,
+101, 109, 112, 108, 97, 99, 101, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 105, 110, 115, 101, 114, 116, 95,
+111, 114, 95, 97, 115, 115, 105, 103, 110, 41, 40, 115, 101, 108, 102,
+44, 32, 114, 97, 119, 45, 62, 102, 105, 114, 115, 116, 44, 32, 114,
+97, 119, 45, 62, 115, 101, 99, 111, 110, 100, 41, 44, 32, 43, 43, 114,
+97, 119, 59, 10, 35, 101, 108, 115, 101, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 109, 112, 108, 97,
+99, 101, 95, 111, 114, 95, 97, 115, 115, 105, 103, 110, 41, 40, 115,
+101, 108, 102, 44, 32, 114, 97, 119, 45, 62, 102, 105, 114, 115, 116,
+44, 32, 114, 97, 119, 45, 62, 115, 101, 99, 111, 110, 100, 41, 44, 32,
+43, 43, 114, 97, 119, 59, 10, 35, 101, 110, 100, 105, 102, 10, 125,
+10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 105, 95, 116, 121,
+112, 101, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 102, 114, 111, 109,
+95, 110, 41, 40, 99, 111, 110, 115, 116, 32, 95, 109, 95, 114, 97,
+119, 42, 32, 114, 97, 119, 44, 32, 105, 110, 116, 112, 116, 114, 95,
+116, 32, 110, 41, 10, 32, 32, 32, 32, 123, 32, 105, 95, 116, 121, 112,
+101, 32, 99, 120, 32, 61, 32, 123, 48, 125, 59, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 112, 117, 116, 95, 110, 41, 40, 38, 99, 120, 44,
+32, 114, 97, 119, 44, 32, 110, 41, 59, 32, 114, 101, 116, 117, 114,
+110, 32, 99, 120, 59, 32, 125, 10, 10, 83, 84, 67, 95, 65, 80, 73, 32,
+95, 109, 95, 105, 116, 101, 114, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 98, 101, 103, 105, 110, 41, 40, 99, 111, 110, 115, 116, 32, 105,
+95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 41, 59, 10, 10,
+83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 105, 116,
+101, 114, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 110, 100, 41,
+40, 99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32,
+115, 101, 108, 102, 41, 10, 32, 32, 32, 32, 123, 32, 40, 118, 111,
+105, 100, 41, 115, 101, 108, 102, 59, 32, 114, 101, 116, 117, 114,
+110, 32, 99, 95, 76, 73, 84, 69, 82, 65, 76, 40, 95, 109, 95, 105,
+116, 101, 114, 41, 123, 78, 85, 76, 76, 125, 59, 32, 125, 10, 10, 83,
+84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 118, 111, 105, 100, 32, 95,
+99, 95, 77, 69, 77, 66, 40, 95, 110, 101, 120, 116, 41, 40, 95, 109,
+95, 105, 116, 101, 114, 42, 32, 105, 116, 41, 32, 123, 32, 10, 32, 32,
+32, 32, 119, 104, 105, 108, 101, 32, 40, 40, 43, 43, 105, 116, 45, 62,
+114, 101, 102, 44, 32, 40, 43, 43, 105, 116, 45, 62, 95, 115, 114,
+101, 102, 41, 45, 62, 104, 97, 115, 104, 120, 32, 61, 61, 32, 48, 41,
+41, 32, 59, 10, 32, 32, 32, 32, 105, 102, 32, 40, 105, 116, 45, 62,
+114, 101, 102, 32, 61, 61, 32, 105, 116, 45, 62, 95, 101, 110, 100,
+41, 32, 105, 116, 45, 62, 114, 101, 102, 32, 61, 32, 78, 85, 76, 76,
+59, 10, 125, 10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95,
+109, 95, 105, 116, 101, 114, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+97, 100, 118, 97, 110, 99, 101, 41, 40, 95, 109, 95, 105, 116, 101,
+114, 32, 105, 116, 44, 32, 115, 105, 122, 101, 95, 116, 32, 110, 41,
+32, 123, 10, 32, 32, 32, 32, 119, 104, 105, 108, 101, 32, 40, 110, 45,
+45, 32, 38, 38, 32, 105, 116, 46, 114, 101, 102, 41, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 110, 101, 120, 116, 41, 40, 38, 105, 116, 41,
+59, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 105, 116,
+59, 10, 125, 10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95,
+109, 95, 105, 116, 101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+102, 105, 110, 100, 41, 40, 99, 111, 110, 115, 116, 32, 105, 95, 116,
+121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 107,
+101, 121, 114, 97, 119, 32, 114, 107, 101, 121, 41, 32, 123, 10, 32,
+32, 32, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 98, 59, 10,
+32, 32, 32, 32, 105, 102, 32, 40, 115, 101, 108, 102, 45, 62, 115,
+105, 122, 101, 32, 38, 38, 32, 33, 40, 98, 32, 61, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 98, 117, 99, 107, 101, 116, 95, 41, 40, 115, 101,
+108, 102, 44, 32, 38, 114, 107, 101, 121, 41, 41, 46, 105, 110, 115,
+101, 114, 116, 101, 100, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 99, 95, 76, 73, 84, 69, 82, 65, 76, 40,
+95, 109, 95, 105, 116, 101, 114, 41, 123, 98, 46, 114, 101, 102, 44,
+32, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 115, 101, 108, 102, 45, 62, 116, 97, 98, 108, 101, 32, 43, 32,
+115, 101, 108, 102, 45, 62, 98, 117, 99, 107, 101, 116, 95, 99, 111,
+117, 110, 116, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 115, 101, 108, 102, 45, 62, 115, 108, 111, 116,
+32, 43, 32, 40, 98, 46, 114, 101, 102, 32, 45, 32, 115, 101, 108, 102,
+45, 62, 116, 97, 98, 108, 101, 41, 125, 59, 10, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101,
+110, 100, 41, 40, 115, 101, 108, 102, 41, 59, 10, 125, 10, 10, 83, 84,
+67, 95, 73, 78, 76, 73, 78, 69, 32, 99, 111, 110, 115, 116, 32, 95,
+109, 95, 118, 97, 108, 117, 101, 42, 10, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 103, 101, 116, 41, 40, 99, 111, 110, 115, 116, 32, 105, 95,
+116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95,
+107, 101, 121, 114, 97, 119, 32, 114, 107, 101, 121, 41, 32, 123, 10,
+32, 32, 32, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 98, 59,
+10, 32, 32, 32, 32, 105, 102, 32, 40, 115, 101, 108, 102, 45, 62, 115,
+105, 122, 101, 32, 38, 38, 32, 33, 40, 98, 32, 61, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 98, 117, 99, 107, 101, 116, 95, 41, 40, 115, 101,
+108, 102, 44, 32, 38, 114, 107, 101, 121, 41, 41, 46, 105, 110, 115,
+101, 114, 116, 101, 100, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 98, 46, 114, 101, 102, 59, 10, 32, 32,
+32, 32, 114, 101, 116, 117, 114, 110, 32, 78, 85, 76, 76, 59, 10, 125,
+10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 118,
+97, 108, 117, 101, 42, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 103,
+101, 116, 95, 109, 117, 116, 41, 40, 105, 95, 116, 121, 112, 101, 42,
+32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 107, 101, 121, 114, 97,
+119, 32, 114, 107, 101, 121, 41, 10, 32, 32, 32, 32, 123, 32, 114,
+101, 116, 117, 114, 110, 32, 40, 95, 109, 95, 118, 97, 108, 117, 101,
+42, 41, 95, 99, 95, 77, 69, 77, 66, 40, 95, 103, 101, 116, 41, 40,
+115, 101, 108, 102, 44, 32, 114, 107, 101, 121, 41, 59, 32, 125, 10,
+10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 105, 110, 116, 10, 95,
+99, 95, 77, 69, 77, 66, 40, 95, 101, 114, 97, 115, 101, 41, 40, 105,
+95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109,
+95, 107, 101, 121, 114, 97, 119, 32, 114, 107, 101, 121, 41, 32, 123,
+10, 32, 32, 32, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 98,
+59, 10, 32, 32, 32, 32, 105, 102, 32, 40, 115, 101, 108, 102, 45, 62,
+115, 105, 122, 101, 32, 38, 38, 32, 33, 40, 98, 32, 61, 32, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 98, 117, 99, 107, 101, 116, 95, 41, 40,
+115, 101, 108, 102, 44, 32, 38, 114, 107, 101, 121, 41, 41, 46, 105,
+110, 115, 101, 114, 116, 101, 100, 41, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 123, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 114, 97, 115,
+101, 95, 101, 110, 116, 114, 121, 41, 40, 115, 101, 108, 102, 44, 32,
+98, 46, 114, 101, 102, 41, 59, 32, 114, 101, 116, 117, 114, 110, 32,
+49, 59, 32, 125, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32,
+48, 59, 10, 125, 10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32,
+95, 109, 95, 105, 116, 101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 101, 114, 97, 115, 101, 95, 97, 116, 41, 40, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 105, 116,
+101, 114, 32, 105, 116, 41, 32, 123, 10, 32, 32, 32, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 101, 114, 97, 115, 101, 95, 101, 110, 116,
+114, 121, 41, 40, 115, 101, 108, 102, 44, 32, 105, 116, 46, 114, 101,
+102, 41, 59, 10, 32, 32, 32, 32, 105, 102, 32, 40, 105, 116, 46, 95,
+115, 114, 101, 102, 45, 62, 104, 97, 115, 104, 120, 32, 61, 61, 32,
+48, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77,
+66, 40, 95, 110, 101, 120, 116, 41, 40, 38, 105, 116, 41, 59, 10, 32,
+32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 105, 116, 59, 10, 125,
+10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 66, 111, 111,
+108, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 113, 41, 40, 99,
+111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101,
+108, 102, 44, 32, 99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112,
+101, 42, 32, 111, 116, 104, 101, 114, 41, 32, 123, 10, 32, 32, 32, 32,
+105, 102, 32, 40, 95, 99, 95, 77, 69, 77, 66, 40, 95, 115, 105, 122,
+101, 41, 40, 115, 101, 108, 102, 41, 32, 33, 61, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 115, 105, 122, 101, 41, 40, 111, 116, 104, 101,
+114, 41, 41, 32, 114, 101, 116, 117, 114, 110, 32, 48, 59, 10, 32, 32,
+32, 32, 102, 111, 114, 32, 40, 95, 109, 95, 105, 116, 101, 114, 32,
+105, 32, 61, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 98, 101, 103,
+105, 110, 41, 40, 115, 101, 108, 102, 41, 59, 32, 105, 46, 114, 101,
+102, 59, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 110, 101, 120, 116,
+41, 40, 38, 105, 41, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+99, 111, 110, 115, 116, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119,
+32, 95, 114, 97, 119, 32, 61, 32, 105, 95, 107, 101, 121, 116, 111,
+40, 95, 105, 95, 107, 101, 121, 114, 101, 102, 40, 105, 46, 114, 101,
+102, 41, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 105, 102, 32, 40,
+33, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 111, 110, 116, 97, 105,
+110, 115, 41, 40, 111, 116, 104, 101, 114, 44, 32, 95, 114, 97, 119,
+41, 41, 32, 114, 101, 116, 117, 114, 110, 32, 48, 59, 10, 32, 32, 32,
+32, 125, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 49, 59,
+10, 125, 10, 10, 47, 42, 32, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 32,
+73, 77, 80, 76, 69, 77, 69, 78, 84, 65, 84, 73, 79, 78, 32, 45, 45,
+45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+45, 45, 45, 45, 45, 45, 32, 42, 47, 10, 35, 105, 102, 32, 100, 101,
+102, 105, 110, 101, 100, 40, 105, 95, 105, 109, 112, 108, 101, 109,
+101, 110, 116, 41, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101,
+100, 40, 105, 95, 115, 116, 97, 116, 105, 99, 41, 10, 35, 105, 102,
+110, 100, 101, 102, 32, 105, 95, 109, 97, 120, 95, 108, 111, 97, 100,
+95, 102, 97, 99, 116, 111, 114, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 109, 97, 120, 95, 108, 111, 97, 100, 95, 102,
+97, 99, 116, 111, 114, 32, 48, 46, 56, 48, 102, 10, 35, 101, 110, 100,
+105, 102, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 97, 115, 116,
+114, 97, 110, 103, 101, 95, 50, 40, 120, 44, 32, 110, 41, 32, 40, 105,
+110, 116, 112, 116, 114, 95, 116, 41, 40, 40, 120, 41, 32, 38, 32, 40,
+115, 105, 122, 101, 95, 116, 41, 40, 40, 110, 41, 32, 45, 32, 49, 41,
+41, 32, 47, 47, 32, 110, 32, 112, 111, 119, 101, 114, 32, 111, 102,
+32, 50, 46, 10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 95, 109, 95, 105,
+116, 101, 114, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 98, 101, 103,
+105, 110, 41, 40, 99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112,
+101, 42, 32, 115, 101, 108, 102, 41, 32, 123, 10, 32, 32, 32, 32, 95,
+109, 95, 105, 116, 101, 114, 32, 105, 116, 32, 61, 32, 123, 115, 101,
+108, 102, 45, 62, 116, 97, 98, 108, 101, 44, 32, 115, 101, 108, 102,
+45, 62, 116, 97, 98, 108, 101, 43, 115, 101, 108, 102, 45, 62, 98,
+117, 99, 107, 101, 116, 95, 99, 111, 117, 110, 116, 44, 32, 115, 101,
+108, 102, 45, 62, 115, 108, 111, 116, 125, 59, 10, 32, 32, 32, 32,
+105, 102, 32, 40, 105, 116, 46, 95, 115, 114, 101, 102, 41, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 119, 104, 105, 108, 101, 32, 40, 105, 116,
+46, 95, 115, 114, 101, 102, 45, 62, 104, 97, 115, 104, 120, 32, 61,
+61, 32, 48, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+43, 43, 105, 116, 46, 114, 101, 102, 44, 32, 43, 43, 105, 116, 46, 95,
+115, 114, 101, 102, 59, 10, 32, 32, 32, 32, 105, 102, 32, 40, 105,
+116, 46, 114, 101, 102, 32, 61, 61, 32, 105, 116, 46, 95, 101, 110,
+100, 41, 32, 105, 116, 46, 114, 101, 102, 32, 61, 32, 78, 85, 76, 76,
+59, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 105, 116,
+59, 10, 125, 10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 102, 108, 111,
+97, 116, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 109, 97, 120, 95,
+108, 111, 97, 100, 95, 102, 97, 99, 116, 111, 114, 41, 40, 99, 111,
+110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108,
+102, 41, 32, 123, 10, 32, 32, 32, 32, 40, 118, 111, 105, 100, 41, 115,
+101, 108, 102, 59, 32, 114, 101, 116, 117, 114, 110, 32, 40, 102, 108,
+111, 97, 116, 41, 40, 105, 95, 109, 97, 120, 95, 108, 111, 97, 100,
+95, 102, 97, 99, 116, 111, 114, 41, 59, 10, 125, 10, 10, 83, 84, 67,
+95, 68, 69, 70, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 99, 97, 112, 97, 99, 105, 116, 121, 41,
+40, 99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32,
+109, 97, 112, 41, 32, 123, 10, 32, 32, 32, 32, 114, 101, 116, 117,
+114, 110, 32, 40, 105, 110, 116, 112, 116, 114, 95, 116, 41, 40, 40,
+102, 108, 111, 97, 116, 41, 109, 97, 112, 45, 62, 98, 117, 99, 107,
+101, 116, 95, 99, 111, 117, 110, 116, 32, 42, 32, 40, 105, 95, 109,
+97, 120, 95, 108, 111, 97, 100, 95, 102, 97, 99, 116, 111, 114, 41,
+41, 59, 10, 125, 10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 105, 95, 116,
+121, 112, 101, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 119, 105, 116,
+104, 95, 99, 97, 112, 97, 99, 105, 116, 121, 41, 40, 99, 111, 110,
+115, 116, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 99, 97, 112,
+41, 32, 123, 10, 32, 32, 32, 32, 105, 95, 116, 121, 112, 101, 32, 109,
+97, 112, 32, 61, 32, 123, 48, 125, 59, 10, 32, 32, 32, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 114, 101, 115, 101, 114, 118, 101, 41, 40, 38,
+109, 97, 112, 44, 32, 99, 97, 112, 41, 59, 10, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 109, 97, 112, 59, 10, 125, 10, 10, 83,
+84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 118, 111, 105, 100, 32, 95,
+99, 95, 77, 69, 77, 66, 40, 95, 119, 105, 112, 101, 95, 41, 40, 105,
+95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 41, 32, 123, 10,
+32, 32, 32, 32, 105, 102, 32, 40, 115, 101, 108, 102, 45, 62, 115,
+105, 122, 101, 32, 61, 61, 32, 48, 41, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 114, 101, 116, 117, 114, 110, 59, 10, 32, 32, 32, 32, 95, 109, 95,
+118, 97, 108, 117, 101, 42, 32, 100, 32, 61, 32, 115, 101, 108, 102,
+45, 62, 116, 97, 98, 108, 101, 44, 32, 42, 95, 101, 110, 100, 32, 61,
+32, 100, 32, 43, 32, 115, 101, 108, 102, 45, 62, 98, 117, 99, 107,
+101, 116, 95, 99, 111, 117, 110, 116, 59, 10, 32, 32, 32, 32, 115,
+116, 114, 117, 99, 116, 32, 99, 104, 97, 115, 104, 95, 115, 108, 111,
+116, 42, 32, 115, 32, 61, 32, 115, 101, 108, 102, 45, 62, 115, 108,
+111, 116, 59, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 59, 32, 100,
+32, 33, 61, 32, 95, 101, 110, 100, 59, 32, 43, 43, 100, 41, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 105, 102, 32, 40, 40, 115, 43, 43, 41, 45,
+62, 104, 97, 115, 104, 120, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 118, 97, 108, 117,
+101, 95, 100, 114, 111, 112, 41, 40, 100, 41, 59, 10, 125, 10, 10, 83,
+84, 67, 95, 68, 69, 70, 32, 118, 111, 105, 100, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 100, 114, 111, 112, 41, 40, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 41, 32, 123, 10, 32, 32, 32, 32,
+105, 102, 32, 40, 115, 101, 108, 102, 45, 62, 98, 117, 99, 107, 101,
+116, 95, 99, 111, 117, 110, 116, 32, 62, 32, 48, 41, 32, 123, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 119,
+105, 112, 101, 95, 41, 40, 115, 101, 108, 102, 41, 59, 10, 32, 32, 32,
+32, 32, 32, 32, 32, 105, 95, 102, 114, 101, 101, 40, 115, 101, 108,
+102, 45, 62, 115, 108, 111, 116, 44, 32, 40, 115, 101, 108, 102, 45,
+62, 98, 117, 99, 107, 101, 116, 95, 99, 111, 117, 110, 116, 32, 43,
+32, 49, 41, 42, 99, 95, 115, 105, 122, 101, 111, 102, 32, 42, 115,
+101, 108, 102, 45, 62, 115, 108, 111, 116, 41, 59, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 105, 95, 102, 114, 101, 101, 40, 115, 101, 108, 102,
+45, 62, 116, 97, 98, 108, 101, 44, 32, 115, 101, 108, 102, 45, 62, 98,
+117, 99, 107, 101, 116, 95, 99, 111, 117, 110, 116, 42, 99, 95, 115,
+105, 122, 101, 111, 102, 32, 42, 115, 101, 108, 102, 45, 62, 116, 97,
+98, 108, 101, 41, 59, 10, 32, 32, 32, 32, 125, 10, 125, 10, 10, 83,
+84, 67, 95, 68, 69, 70, 32, 118, 111, 105, 100, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 99, 108, 101, 97, 114, 41, 40, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 41, 32, 123, 10, 32, 32, 32, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 119, 105, 112, 101, 95, 41, 40,
+115, 101, 108, 102, 41, 59, 10, 32, 32, 32, 32, 115, 101, 108, 102,
+45, 62, 115, 105, 122, 101, 32, 61, 32, 48, 59, 10, 32, 32, 32, 32,
+99, 95, 109, 101, 109, 115, 101, 116, 40, 115, 101, 108, 102, 45, 62,
+115, 108, 111, 116, 44, 32, 48, 44, 32, 99, 95, 115, 105, 122, 101,
+111, 102, 40, 115, 116, 114, 117, 99, 116, 32, 99, 104, 97, 115, 104,
+95, 115, 108, 111, 116, 41, 42, 115, 101, 108, 102, 45, 62, 98, 117,
+99, 107, 101, 116, 95, 99, 111, 117, 110, 116, 41, 59, 10, 125, 10,
+10, 35, 105, 102, 100, 101, 102, 32, 95, 105, 95, 105, 115, 109, 97,
+112, 10, 32, 32, 32, 32, 83, 84, 67, 95, 68, 69, 70, 32, 95, 109, 95,
+114, 101, 115, 117, 108, 116, 10, 32, 32, 32, 32, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 105, 110, 115, 101, 114, 116, 95, 111, 114, 95, 97,
+115, 115, 105, 103, 110, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32,
+115, 101, 108, 102, 44, 32, 95, 109, 95, 107, 101, 121, 32, 95, 107,
+101, 121, 44, 32, 95, 109, 95, 109, 97, 112, 112, 101, 100, 32, 95,
+109, 97, 112, 112, 101, 100, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 95, 114, 101,
+115, 32, 61, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 105, 110, 115,
+101, 114, 116, 95, 101, 110, 116, 114, 121, 95, 41, 40, 115, 101, 108,
+102, 44, 32, 105, 95, 107, 101, 121, 116, 111, 40, 40, 38, 95, 107,
+101, 121, 41, 41, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 109,
+95, 109, 97, 112, 112, 101, 100, 42, 32, 95, 109, 112, 32, 61, 32, 95,
+114, 101, 115, 46, 114, 101, 102, 32, 63, 32, 38, 95, 114, 101, 115,
+46, 114, 101, 102, 45, 62, 115, 101, 99, 111, 110, 100, 32, 58, 32,
+38, 95, 109, 97, 112, 112, 101, 100, 59, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 105, 102, 32, 40, 95, 114, 101, 115, 46, 105, 110, 115, 101,
+114, 116, 101, 100, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 95, 114, 101, 115, 46, 114, 101, 102, 45, 62, 102, 105, 114,
+115, 116, 32, 61, 32, 95, 107, 101, 121, 59, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 101, 108, 115, 101, 32, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 123, 32, 105, 95, 107, 101, 121, 100, 114, 111,
+112, 40, 40, 38, 95, 107, 101, 121, 41, 41, 59, 32, 105, 95, 118, 97,
+108, 100, 114, 111, 112, 40, 95, 109, 112, 41, 59, 32, 125, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 42, 95, 109, 112, 32, 61, 32, 95, 109, 97,
+112, 112, 101, 100, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 114, 101,
+116, 117, 114, 110, 32, 95, 114, 101, 115, 59, 10, 32, 32, 32, 32,
+125, 10, 10, 32, 32, 32, 32, 35, 105, 102, 32, 33, 100, 101, 102, 105,
+110, 101, 100, 32, 105, 95, 110, 111, 95, 101, 109, 112, 108, 97, 99,
+101, 10, 32, 32, 32, 32, 83, 84, 67, 95, 68, 69, 70, 32, 95, 109, 95,
+114, 101, 115, 117, 108, 116, 10, 32, 32, 32, 32, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 101, 109, 112, 108, 97, 99, 101, 95, 111, 114, 95, 97,
+115, 115, 105, 103, 110, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32,
+115, 101, 108, 102, 44, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119,
+32, 114, 107, 101, 121, 44, 32, 95, 109, 95, 114, 109, 97, 112, 112,
+101, 100, 32, 114, 109, 97, 112, 112, 101, 100, 41, 32, 123, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116,
+32, 95, 114, 101, 115, 32, 61, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+105, 110, 115, 101, 114, 116, 95, 101, 110, 116, 114, 121, 95, 41, 40,
+115, 101, 108, 102, 44, 32, 114, 107, 101, 121, 41, 59, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 105, 102, 32, 40, 95, 114, 101, 115, 46, 105,
+110, 115, 101, 114, 116, 101, 100, 41, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 95, 114, 101, 115, 46, 114, 101, 102, 45, 62, 102,
+105, 114, 115, 116, 32, 61, 32, 105, 95, 107, 101, 121, 102, 114, 111,
+109, 40, 114, 107, 101, 121, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 101, 108, 115, 101, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 105, 102, 32, 40, 33, 95, 114, 101, 115, 46, 114, 101,
+102, 41, 32, 114, 101, 116, 117, 114, 110, 32, 95, 114, 101, 115, 59,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 105, 95, 118, 97,
+108, 100, 114, 111, 112, 40, 40, 38, 95, 114, 101, 115, 46, 114, 101,
+102, 45, 62, 115, 101, 99, 111, 110, 100, 41, 41, 59, 10, 32, 32, 32,
+32, 32, 32, 32, 32, 125, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 114,
+101, 115, 46, 114, 101, 102, 45, 62, 115, 101, 99, 111, 110, 100, 32,
+61, 32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 40, 114, 109, 97,
+112, 112, 101, 100, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 95, 114, 101, 115, 59, 10, 32, 32, 32,
+32, 125, 10, 32, 32, 32, 32, 35, 101, 110, 100, 105, 102, 32, 47, 47,
+32, 33, 105, 95, 110, 111, 95, 101, 109, 112, 108, 97, 99, 101, 10,
+35, 101, 110, 100, 105, 102, 32, 47, 47, 32, 95, 105, 95, 105, 115,
+109, 97, 112, 10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 95, 109, 95,
+114, 101, 115, 117, 108, 116, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+98, 117, 99, 107, 101, 116, 95, 41, 40, 99, 111, 110, 115, 116, 32,
+105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99,
+111, 110, 115, 116, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119, 42,
+32, 114, 107, 101, 121, 112, 116, 114, 41, 32, 123, 10, 32, 32, 32,
+32, 99, 111, 110, 115, 116, 32, 117, 105, 110, 116, 54, 52, 95, 116,
+32, 95, 104, 97, 115, 104, 32, 61, 32, 105, 95, 104, 97, 115, 104, 40,
+114, 107, 101, 121, 112, 116, 114, 41, 59, 10, 32, 32, 32, 32, 105,
+110, 116, 112, 116, 114, 95, 116, 32, 95, 99, 97, 112, 32, 61, 32,
+115, 101, 108, 102, 45, 62, 98, 117, 99, 107, 101, 116, 95, 99, 111,
+117, 110, 116, 59, 10, 32, 32, 32, 32, 105, 110, 116, 112, 116, 114,
+95, 116, 32, 95, 105, 100, 120, 32, 61, 32, 102, 97, 115, 116, 114,
+97, 110, 103, 101, 95, 50, 40, 95, 104, 97, 115, 104, 44, 32, 95, 99,
+97, 112, 41, 59, 10, 32, 32, 32, 32, 95, 109, 95, 114, 101, 115, 117,
+108, 116, 32, 98, 32, 61, 32, 123, 78, 85, 76, 76, 44, 32, 49, 44, 32,
+40, 117, 105, 110, 116, 56, 95, 116, 41, 40, 95, 104, 97, 115, 104,
+32, 124, 32, 48, 120, 56, 48, 41, 125, 59, 10, 32, 32, 32, 32, 99,
+111, 110, 115, 116, 32, 115, 116, 114, 117, 99, 116, 32, 99, 104, 97,
+115, 104, 95, 115, 108, 111, 116, 42, 32, 115, 32, 61, 32, 115, 101,
+108, 102, 45, 62, 115, 108, 111, 116, 59, 10, 32, 32, 32, 32, 119,
+104, 105, 108, 101, 32, 40, 115, 91, 95, 105, 100, 120, 93, 46, 104,
+97, 115, 104, 120, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+105, 102, 32, 40, 115, 91, 95, 105, 100, 120, 93, 46, 104, 97, 115,
+104, 120, 32, 61, 61, 32, 98, 46, 104, 97, 115, 104, 120, 41, 32, 123,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 99, 111, 110, 115,
+116, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119, 32, 95, 114, 97,
+119, 32, 61, 32, 105, 95, 107, 101, 121, 116, 111, 40, 95, 105, 95,
+107, 101, 121, 114, 101, 102, 40, 115, 101, 108, 102, 45, 62, 116, 97,
+98, 108, 101, 32, 43, 32, 95, 105, 100, 120, 41, 41, 59, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 105, 102, 32, 40, 105, 95,
+101, 113, 40, 40, 38, 95, 114, 97, 119, 41, 44, 32, 114, 107, 101,
+121, 112, 116, 114, 41, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 98, 46, 105, 110, 115, 101, 114,
+116, 101, 100, 32, 61, 32, 48, 59, 32, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 98, 114, 101, 97, 107, 59, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 125, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 125, 10, 32, 32, 32, 32, 32, 32, 32, 32, 105, 102, 32,
+40, 43, 43, 95, 105, 100, 120, 32, 61, 61, 32, 95, 99, 97, 112, 41,
+32, 95, 105, 100, 120, 32, 61, 32, 48, 59, 10, 32, 32, 32, 32, 125,
+10, 32, 32, 32, 32, 98, 46, 114, 101, 102, 32, 61, 32, 115, 101, 108,
+102, 45, 62, 116, 97, 98, 108, 101, 32, 43, 32, 95, 105, 100, 120, 59,
+10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 98, 59, 10, 125,
+10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 95, 109, 95, 114, 101, 115,
+117, 108, 116, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 105, 110, 115,
+101, 114, 116, 95, 101, 110, 116, 114, 121, 95, 41, 40, 105, 95, 116,
+121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 107,
+101, 121, 114, 97, 119, 32, 114, 107, 101, 121, 41, 32, 123, 10, 32,
+32, 32, 32, 105, 102, 32, 40, 115, 101, 108, 102, 45, 62, 115, 105,
+122, 101, 32, 62, 61, 32, 40, 105, 110, 116, 112, 116, 114, 95, 116,
+41, 40, 40, 102, 108, 111, 97, 116, 41, 115, 101, 108, 102, 45, 62,
+98, 117, 99, 107, 101, 116, 95, 99, 111, 117, 110, 116, 32, 42, 32,
+40, 105, 95, 109, 97, 120, 95, 108, 111, 97, 100, 95, 102, 97, 99,
+116, 111, 114, 41, 41, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 105,
+102, 32, 40, 33, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 101, 115,
+101, 114, 118, 101, 41, 40, 115, 101, 108, 102, 44, 32, 40, 105, 110,
+116, 112, 116, 114, 95, 116, 41, 40, 115, 101, 108, 102, 45, 62, 115,
+105, 122, 101, 42, 51, 47, 50, 32, 43, 32, 50, 41, 41, 41, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110,
+32, 99, 95, 76, 73, 84, 69, 82, 65, 76, 40, 95, 109, 95, 114, 101,
+115, 117, 108, 116, 41, 123, 78, 85, 76, 76, 125, 59, 10, 10, 32, 32,
+32, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 98, 32, 61, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 98, 117, 99, 107, 101, 116, 95,
+41, 40, 115, 101, 108, 102, 44, 32, 38, 114, 107, 101, 121, 41, 59,
+10, 32, 32, 32, 32, 105, 102, 32, 40, 98, 46, 105, 110, 115, 101, 114,
+116, 101, 100, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 115,
+101, 108, 102, 45, 62, 115, 108, 111, 116, 91, 98, 46, 114, 101, 102,
+32, 45, 32, 115, 101, 108, 102, 45, 62, 116, 97, 98, 108, 101, 93, 46,
+104, 97, 115, 104, 120, 32, 61, 32, 98, 46, 104, 97, 115, 104, 120,
+59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 43, 43, 115, 101, 108, 102,
+45, 62, 115, 105, 122, 101, 59, 10, 32, 32, 32, 32, 125, 10, 32, 32,
+32, 32, 114, 101, 116, 117, 114, 110, 32, 98, 59, 10, 125, 10, 10, 35,
+105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 110,
+111, 95, 99, 108, 111, 110, 101, 10, 83, 84, 67, 95, 68, 69, 70, 32,
+105, 95, 116, 121, 112, 101, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+99, 108, 111, 110, 101, 41, 40, 105, 95, 116, 121, 112, 101, 32, 109,
+41, 32, 123, 10, 32, 32, 32, 32, 105, 102, 32, 40, 109, 46, 98, 117,
+99, 107, 101, 116, 95, 99, 111, 117, 110, 116, 41, 32, 123, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 95, 109, 95, 118, 97, 108, 117, 101, 32,
+42, 100, 32, 61, 32, 40, 95, 109, 95, 118, 97, 108, 117, 101, 32, 42,
+41, 105, 95, 109, 97, 108, 108, 111, 99, 40, 109, 46, 98, 117, 99,
+107, 101, 116, 95, 99, 111, 117, 110, 116, 42, 99, 95, 115, 105, 122,
+101, 111, 102, 32, 42, 100, 41, 44, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 42, 95, 100, 115, 116, 32, 61,
+32, 100, 44, 32, 42, 95, 101, 110, 100, 32, 61, 32, 109, 46, 116, 97,
+98, 108, 101, 32, 43, 32, 109, 46, 98, 117, 99, 107, 101, 116, 95, 99,
+111, 117, 110, 116, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 99, 111,
+110, 115, 116, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 95, 115,
+98, 121, 116, 101, 115, 32, 61, 32, 40, 109, 46, 98, 117, 99, 107,
+101, 116, 95, 99, 111, 117, 110, 116, 32, 43, 32, 49, 41, 42, 99, 95,
+115, 105, 122, 101, 111, 102, 32, 42, 109, 46, 115, 108, 111, 116, 59,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32,
+99, 104, 97, 115, 104, 95, 115, 108, 111, 116, 32, 42, 115, 32, 61,
+32, 40, 115, 116, 114, 117, 99, 116, 32, 99, 104, 97, 115, 104, 95,
+115, 108, 111, 116, 32, 42, 41, 99, 95, 109, 101, 109, 99, 112, 121,
+40, 105, 95, 109, 97, 108, 108, 111, 99, 40, 95, 115, 98, 121, 116,
+101, 115, 41, 44, 32, 109, 46, 115, 108, 111, 116, 44, 32, 95, 115,
+98, 121, 116, 101, 115, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+105, 102, 32, 40, 33, 40, 100, 32, 38, 38, 32, 115, 41, 41, 32, 123,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 105, 95, 102, 114,
+101, 101, 40, 100, 44, 32, 109, 46, 98, 117, 99, 107, 101, 116, 95,
+99, 111, 117, 110, 116, 42, 99, 95, 115, 105, 122, 101, 111, 102, 32,
+42, 100, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+105, 102, 32, 40, 115, 41, 32, 105, 95, 102, 114, 101, 101, 40, 115,
+44, 32, 95, 115, 98, 121, 116, 101, 115, 41, 59, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 100, 32, 61, 32, 48, 44, 32, 115, 32,
+61, 32, 48, 44, 32, 109, 46, 98, 117, 99, 107, 101, 116, 95, 99, 111,
+117, 110, 116, 32, 61, 32, 48, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+125, 32, 101, 108, 115, 101, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 102, 111, 114, 32, 40, 59, 32, 109, 46, 116, 97, 98, 108,
+101, 32, 33, 61, 32, 95, 101, 110, 100, 59, 32, 43, 43, 109, 46, 116,
+97, 98, 108, 101, 44, 32, 43, 43, 109, 46, 115, 108, 111, 116, 44, 32,
+43, 43, 95, 100, 115, 116, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 105, 102, 32, 40, 109, 46, 115, 108, 111,
+116, 45, 62, 104, 97, 115, 104, 120, 41, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 42, 95, 100,
+115, 116, 32, 61, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 118, 97,
+108, 117, 101, 95, 99, 108, 111, 110, 101, 41, 40, 42, 109, 46, 116,
+97, 98, 108, 101, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 109, 46,
+116, 97, 98, 108, 101, 32, 61, 32, 100, 44, 32, 109, 46, 115, 108,
+111, 116, 32, 61, 32, 115, 59, 10, 32, 32, 32, 32, 125, 10, 32, 32,
+32, 32, 114, 101, 116, 117, 114, 110, 32, 109, 59, 10, 125, 10, 35,
+101, 110, 100, 105, 102, 10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 95,
+66, 111, 111, 108, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 101,
+115, 101, 114, 118, 101, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32,
+115, 101, 108, 102, 44, 32, 99, 111, 110, 115, 116, 32, 105, 110, 116,
+112, 116, 114, 95, 116, 32, 95, 110, 101, 119, 99, 97, 112, 41, 32,
+123, 10, 32, 32, 32, 32, 99, 111, 110, 115, 116, 32, 105, 110, 116,
+112, 116, 114, 95, 116, 32, 95, 111, 108, 100, 98, 117, 99, 107, 115,
+32, 61, 32, 115, 101, 108, 102, 45, 62, 98, 117, 99, 107, 101, 116,
+95, 99, 111, 117, 110, 116, 59, 10, 32, 32, 32, 32, 105, 102, 32, 40,
+95, 110, 101, 119, 99, 97, 112, 32, 33, 61, 32, 115, 101, 108, 102,
+45, 62, 115, 105, 122, 101, 32, 38, 38, 32, 95, 110, 101, 119, 99, 97,
+112, 32, 60, 61, 32, 95, 111, 108, 100, 98, 117, 99, 107, 115, 41, 10,
+32, 32, 32, 32, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 49,
+59, 10, 32, 32, 32, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 95,
+110, 101, 119, 98, 117, 99, 107, 115, 32, 61, 32, 40, 105, 110, 116,
+112, 116, 114, 95, 116, 41, 40, 40, 102, 108, 111, 97, 116, 41, 95,
+110, 101, 119, 99, 97, 112, 32, 47, 32, 40, 105, 95, 109, 97, 120, 95,
+108, 111, 97, 100, 95, 102, 97, 99, 116, 111, 114, 41, 41, 32, 43, 32,
+52, 59, 10, 32, 32, 32, 32, 95, 110, 101, 119, 98, 117, 99, 107, 115,
+32, 61, 32, 115, 116, 99, 95, 110, 101, 120, 116, 112, 111, 119, 50,
+40, 95, 110, 101, 119, 98, 117, 99, 107, 115, 41, 59, 10, 32, 32, 32,
+32, 105, 95, 116, 121, 112, 101, 32, 109, 32, 61, 32, 123, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 40, 95, 109, 95, 118, 97, 108, 117, 101, 32,
+42, 41, 105, 95, 109, 97, 108, 108, 111, 99, 40, 95, 110, 101, 119,
+98, 117, 99, 107, 115, 42, 99, 95, 115, 105, 122, 101, 111, 102, 40,
+95, 109, 95, 118, 97, 108, 117, 101, 41, 41, 44, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 40, 115, 116, 114, 117, 99, 116, 32, 99, 104, 97, 115,
+104, 95, 115, 108, 111, 116, 32, 42, 41, 105, 95, 99, 97, 108, 108,
+111, 99, 40, 95, 110, 101, 119, 98, 117, 99, 107, 115, 32, 43, 32, 49,
+44, 32, 99, 95, 115, 105, 122, 101, 111, 102, 40, 115, 116, 114, 117,
+99, 116, 32, 99, 104, 97, 115, 104, 95, 115, 108, 111, 116, 41, 41,
+44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 115, 101, 108, 102, 45, 62,
+115, 105, 122, 101, 44, 32, 95, 110, 101, 119, 98, 117, 99, 107, 115,
+10, 32, 32, 32, 32, 125, 59, 10, 32, 32, 32, 32, 95, 66, 111, 111,
+108, 32, 111, 107, 32, 61, 32, 109, 46, 116, 97, 98, 108, 101, 32, 38,
+38, 32, 109, 46, 115, 108, 111, 116, 59, 10, 32, 32, 32, 32, 105, 102,
+32, 40, 111, 107, 41, 32, 123, 32, 32, 47, 47, 32, 82, 101, 104, 97,
+115, 104, 58, 10, 32, 32, 32, 32, 32, 32, 32, 32, 109, 46, 115, 108,
+111, 116, 91, 95, 110, 101, 119, 98, 117, 99, 107, 115, 93, 46, 104,
+97, 115, 104, 120, 32, 61, 32, 48, 120, 102, 102, 59, 10, 32, 32, 32,
+32, 32, 32, 32, 32, 99, 111, 110, 115, 116, 32, 95, 109, 95, 118, 97,
+108, 117, 101, 42, 32, 100, 32, 61, 32, 115, 101, 108, 102, 45, 62,
+116, 97, 98, 108, 101, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 99,
+111, 110, 115, 116, 32, 115, 116, 114, 117, 99, 116, 32, 99, 104, 97,
+115, 104, 95, 115, 108, 111, 116, 42, 32, 115, 32, 61, 32, 115, 101,
+108, 102, 45, 62, 115, 108, 111, 116, 59, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 102, 111, 114, 32, 40, 105, 110, 116, 112, 116, 114, 95, 116,
+32, 105, 32, 61, 32, 48, 59, 32, 105, 32, 60, 32, 95, 111, 108, 100,
+98, 117, 99, 107, 115, 59, 32, 43, 43, 105, 44, 32, 43, 43, 100, 41,
+32, 105, 102, 32, 40, 40, 115, 43, 43, 41, 45, 62, 104, 97, 115, 104,
+120, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+95, 109, 95, 107, 101, 121, 114, 97, 119, 32, 114, 32, 61, 32, 105,
+95, 107, 101, 121, 116, 111, 40, 95, 105, 95, 107, 101, 121, 114, 101,
+102, 40, 100, 41, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 98, 32, 61, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 98, 117, 99, 107, 101, 116, 95,
+41, 40, 38, 109, 44, 32, 38, 114, 41, 59, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 109, 46, 115, 108, 111, 116, 91, 98, 46, 114,
+101, 102, 32, 45, 32, 109, 46, 116, 97, 98, 108, 101, 93, 46, 104, 97,
+115, 104, 120, 32, 61, 32, 98, 46, 104, 97, 115, 104, 120, 59, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 42, 98, 46, 114, 101, 102,
+32, 61, 32, 42, 100, 59, 32, 47, 47, 32, 109, 111, 118, 101, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 125, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+99, 95, 115, 119, 97, 112, 40, 105, 95, 116, 121, 112, 101, 44, 32,
+115, 101, 108, 102, 44, 32, 38, 109, 41, 59, 10, 32, 32, 32, 32, 125,
+10, 32, 32, 32, 32, 105, 95, 102, 114, 101, 101, 40, 109, 46, 115,
+108, 111, 116, 44, 32, 40, 109, 46, 98, 117, 99, 107, 101, 116, 95,
+99, 111, 117, 110, 116, 32, 43, 32, 40, 105, 110, 116, 41, 40, 109,
+46, 115, 108, 111, 116, 32, 33, 61, 32, 78, 85, 76, 76, 41, 41, 42,
+99, 95, 115, 105, 122, 101, 111, 102, 32, 42, 109, 46, 115, 108, 111,
+116, 41, 59, 10, 32, 32, 32, 32, 105, 95, 102, 114, 101, 101, 40, 109,
+46, 116, 97, 98, 108, 101, 44, 32, 109, 46, 98, 117, 99, 107, 101,
+116, 95, 99, 111, 117, 110, 116, 42, 99, 95, 115, 105, 122, 101, 111,
+102, 32, 42, 109, 46, 116, 97, 98, 108, 101, 41, 59, 10, 32, 32, 32,
+32, 114, 101, 116, 117, 114, 110, 32, 111, 107, 59, 10, 125, 10, 10,
+83, 84, 67, 95, 68, 69, 70, 32, 118, 111, 105, 100, 10, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 101, 114, 97, 115, 101, 95, 101, 110, 116,
+114, 121, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108,
+102, 44, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42, 32, 95, 118, 97,
+108, 41, 32, 123, 10, 32, 32, 32, 32, 95, 109, 95, 118, 97, 108, 117,
+101, 42, 32, 100, 32, 61, 32, 115, 101, 108, 102, 45, 62, 116, 97, 98,
+108, 101, 59, 10, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32, 99,
+104, 97, 115, 104, 95, 115, 108, 111, 116, 42, 32, 115, 32, 61, 32,
+115, 101, 108, 102, 45, 62, 115, 108, 111, 116, 59, 10, 32, 32, 32,
+32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105, 32, 61, 32, 95,
+118, 97, 108, 32, 45, 32, 100, 44, 32, 106, 32, 61, 32, 105, 44, 32,
+107, 59, 10, 32, 32, 32, 32, 99, 111, 110, 115, 116, 32, 105, 110,
+116, 112, 116, 114, 95, 116, 32, 95, 99, 97, 112, 32, 61, 32, 115,
+101, 108, 102, 45, 62, 98, 117, 99, 107, 101, 116, 95, 99, 111, 117,
+110, 116, 59, 10, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+118, 97, 108, 117, 101, 95, 100, 114, 111, 112, 41, 40, 95, 118, 97,
+108, 41, 59, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 59, 59, 41,
+32, 123, 32, 47, 47, 32, 100, 101, 108, 101, 116, 101, 32, 119, 105,
+116, 104, 111, 117, 116, 32, 108, 101, 97, 118, 105, 110, 103, 32,
+116, 111, 109, 98, 115, 116, 111, 110, 101, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 105, 102, 32, 40, 43, 43, 106, 32, 61, 61, 32, 95, 99, 97,
+112, 41, 32, 106, 32, 61, 32, 48, 59, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 105, 102, 32, 40, 33, 32, 115, 91, 106, 93, 46, 104, 97, 115, 104,
+120, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 98, 114,
+101, 97, 107, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 99, 111, 110,
+115, 116, 32, 95, 109, 95, 107, 101, 121, 114, 97, 119, 32, 95, 114,
+97, 119, 32, 61, 32, 105, 95, 107, 101, 121, 116, 111, 40, 95, 105,
+95, 107, 101, 121, 114, 101, 102, 40, 100, 32, 43, 32, 106, 41, 41,
+59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 107, 32, 61, 32, 102, 97, 115,
+116, 114, 97, 110, 103, 101, 95, 50, 40, 105, 95, 104, 97, 115, 104,
+40, 40, 38, 95, 114, 97, 119, 41, 41, 44, 32, 95, 99, 97, 112, 41, 59,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 105, 102, 32, 40, 40, 106, 32, 60,
+32, 105, 41, 32, 94, 32, 40, 107, 32, 60, 61, 32, 105, 41, 32, 94, 32,
+40, 107, 32, 62, 32, 106, 41, 41, 32, 123, 32, 47, 47, 32, 105, 115,
+32, 107, 32, 111, 117, 116, 115, 105, 100, 101, 32, 40, 105, 44, 32,
+106, 93, 63, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 100,
+91, 105, 93, 32, 61, 32, 100, 91, 106, 93, 59, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 115, 91, 105, 93, 32, 61, 32, 115, 91,
+106, 93, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 105,
+32, 61, 32, 106, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 125, 10, 32,
+32, 32, 32, 125, 10, 32, 32, 32, 32, 115, 91, 105, 93, 46, 104, 97,
+115, 104, 120, 32, 61, 32, 48, 59, 10, 32, 32, 32, 32, 45, 45, 115,
+101, 108, 102, 45, 62, 115, 105, 122, 101, 59, 10, 125, 10, 35, 101,
+110, 100, 105, 102, 32, 47, 47, 32, 105, 95, 105, 109, 112, 108, 101,
+109, 101, 110, 116, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 109,
+97, 120, 95, 108, 111, 97, 100, 95, 102, 97, 99, 116, 111, 114, 10,
+35, 117, 110, 100, 101, 102, 32, 95, 105, 95, 105, 115, 115, 101, 116,
+10, 35, 117, 110, 100, 101, 102, 32, 95, 105, 95, 105, 115, 109, 97,
+112, 10, 35, 117, 110, 100, 101, 102, 32, 95, 105, 95, 105, 115, 104,
+97, 115, 104, 10, 35, 117, 110, 100, 101, 102, 32, 95, 105, 95, 107,
+101, 121, 114, 101, 102, 10, 35, 117, 110, 100, 101, 102, 32, 95, 105,
+95, 77, 65, 80, 95, 79, 78, 76, 89, 10, 35, 117, 110, 100, 101, 102,
+32, 95, 105, 95, 83, 69, 84, 95, 79, 78, 76, 89, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 67, 77, 65, 80, 95, 72, 95, 73, 78, 67, 76,
+85, 68, 69, 68, 10, 47, 47, 32, 35, 35, 35, 32, 66, 69, 71, 73, 78,
+95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 116, 101,
+109, 112, 108, 97, 116, 101, 50, 46, 104, 10, 35, 105, 102, 100, 101,
+102, 32, 105, 95, 109, 111, 114, 101, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 109, 111, 114, 101, 10, 35, 101, 108, 115, 101, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 116, 121, 112, 101, 10, 35, 117,
+110, 100, 101, 102, 32, 105, 95, 116, 97, 103, 10, 35, 117, 110, 100,
+101, 102, 32, 105, 95, 105, 109, 112, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 111, 112, 116, 10, 35, 117, 110, 100, 101, 102, 32, 105,
+95, 108, 101, 115, 115, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95,
+99, 109, 112, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 101, 113,
+10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 104, 97, 115, 104, 10,
+35, 117, 110, 100, 101, 102, 32, 105, 95, 99, 97, 112, 97, 99, 105,
+116, 121, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 114, 97, 119,
+95, 99, 108, 97, 115, 115, 10, 10, 35, 117, 110, 100, 101, 102, 32,
+105, 95, 118, 97, 108, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95,
+118, 97, 108, 95, 115, 116, 114, 10, 35, 117, 110, 100, 101, 102, 32,
+105, 95, 118, 97, 108, 95, 115, 115, 118, 10, 35, 117, 110, 100, 101,
+102, 32, 105, 95, 118, 97, 108, 95, 97, 114, 99, 98, 111, 120, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 118, 97, 108, 95, 99, 108, 97,
+115, 115, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 118, 97, 108,
+114, 97, 119, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 118, 97,
+108, 99, 108, 111, 110, 101, 10, 35, 117, 110, 100, 101, 102, 32, 105,
+95, 118, 97, 108, 102, 114, 111, 109, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 116, 111, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 100, 114, 111, 112, 10, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 107, 101, 121, 10, 35, 117, 110, 100, 101,
+102, 32, 105, 95, 107, 101, 121, 95, 115, 116, 114, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 107, 101, 121, 95, 115, 115, 118, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 95, 97, 114, 99,
+98, 111, 120, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 107, 101,
+121, 95, 99, 108, 97, 115, 115, 10, 35, 117, 110, 100, 101, 102, 32,
+105, 95, 107, 101, 121, 114, 97, 119, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 107, 101, 121, 99, 108, 111, 110, 101, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 107, 101, 121, 102, 114, 111, 109, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 116, 111, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 100, 114, 111,
+112, 10, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 117, 115, 101,
+95, 99, 109, 112, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 110,
+111, 95, 104, 97, 115, 104, 10, 35, 117, 110, 100, 101, 102, 32, 105,
+95, 110, 111, 95, 99, 108, 111, 110, 101, 10, 35, 117, 110, 100, 101,
+102, 32, 105, 95, 110, 111, 95, 101, 109, 112, 108, 97, 99, 101, 10,
+35, 117, 110, 100, 101, 102, 32, 105, 95, 105, 115, 95, 102, 111, 114,
+119, 97, 114, 100, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 104,
+97, 115, 95, 101, 109, 112, 108, 97, 99, 101, 10, 10, 35, 117, 110,
+100, 101, 102, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 10,
+35, 117, 110, 100, 101, 102, 32, 95, 105, 95, 104, 97, 115, 95, 101,
+113, 10, 35, 117, 110, 100, 101, 102, 32, 95, 105, 95, 112, 114, 101,
+102, 105, 120, 10, 35, 117, 110, 100, 101, 102, 32, 95, 105, 95, 116,
+101, 109, 112, 108, 97, 116, 101, 10, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 107, 101, 121, 99, 108, 97, 115, 115, 32, 47, 47, 32, 91,
+100, 101, 112, 114, 101, 99, 97, 116, 101, 100, 93, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 118, 97, 108, 99, 108, 97, 115, 115, 32,
+47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116, 101, 100, 93,
+10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 114, 97, 119, 99, 108,
+97, 115, 115, 32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97,
+116, 101, 100, 93, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 107,
+101, 121, 98, 111, 120, 101, 100, 32, 47, 47, 32, 91, 100, 101, 112,
+114, 101, 99, 97, 116, 101, 100, 93, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 98, 111, 120, 101, 100, 32, 47, 47, 32, 91,
+100, 101, 112, 114, 101, 99, 97, 116, 101, 100, 93, 10, 35, 101, 110,
+100, 105, 102, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78, 68, 95, 70, 73,
+76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 116, 101, 109, 112,
+108, 97, 116, 101, 50, 46, 104, 10, 47, 47, 32, 35, 35, 35, 32, 66,
+69, 71, 73, 78, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69,
+58, 32, 108, 105, 110, 107, 97, 103, 101, 50, 46, 104, 10, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 97, 108, 108, 111, 99, 97, 116,
+111, 114, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 109, 97, 108,
+108, 111, 99, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 99, 97,
+108, 108, 111, 99, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 114,
+101, 97, 108, 108, 111, 99, 10, 35, 117, 110, 100, 101, 102, 32, 105,
+95, 102, 114, 101, 101, 10, 10, 35, 117, 110, 100, 101, 102, 32, 105,
+95, 115, 116, 97, 116, 105, 99, 10, 35, 117, 110, 100, 101, 102, 32,
+105, 95, 104, 101, 97, 100, 101, 114, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 105, 109, 112, 108, 101, 109, 101, 110, 116, 10, 35, 117,
+110, 100, 101, 102, 32, 105, 95, 105, 109, 112, 111, 114, 116, 10, 10,
+35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 99,
+108, 97, 110, 103, 95, 95, 32, 38, 38, 32, 33, 100, 101, 102, 105,
+110, 101, 100, 32, 95, 95, 99, 112, 108, 117, 115, 112, 108, 117, 115,
+10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110, 103,
+32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 112, 111, 112,
+10, 35, 101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+95, 95, 71, 78, 85, 67, 95, 95, 32, 38, 38, 32, 33, 100, 101, 102,
+105, 110, 101, 100, 32, 95, 95, 99, 112, 108, 117, 115, 112, 108, 117,
+115, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 71, 67, 67, 32,
+100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 112, 111, 112, 10,
+35, 101, 110, 100, 105, 102, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78,
+68, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 108,
+105, 110, 107, 97, 103, 101, 50, 46, 104, 10, 47, 47, 32, 35, 35, 35,
+32, 69, 78, 68, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69,
+58, 32, 99, 109, 97, 112, 46, 104, 10, 10, 0, 47, 47, 32, 66, 69, 71,
+73, 78, 32, 114, 101, 103, 101, 110, 95, 99, 111, 110, 116, 97, 105,
+110, 101, 114, 95, 104, 101, 97, 100, 101, 114, 115, 46, 112, 121, 10,
+35, 105, 102, 110, 100, 101, 102, 32, 95, 95, 100, 121, 105, 98, 105,
+99, 99, 95, 105, 110, 116, 101, 114, 110, 97, 108, 95, 105, 110, 99,
+108, 117, 100, 101, 95, 95, 10, 35, 101, 114, 114, 111, 114, 32, 67,
+97, 110, 32, 111, 110, 108, 121, 32, 98, 101, 32, 105, 110, 99, 108,
+117, 100, 101, 100, 32, 98, 121, 32, 116, 104, 101, 32, 99, 111, 109,
+112, 105, 108, 101, 114, 44, 32, 111, 114, 32, 99, 111, 110, 102, 117,
+115, 105, 110, 103, 32, 101, 114, 114, 111, 114, 115, 32, 119, 105,
+108, 108, 32, 114, 101, 115, 117, 108, 116, 33, 10, 35, 101, 110, 100,
+105, 102, 10, 35, 117, 110, 100, 101, 102, 32, 95, 95, 97, 116, 116,
+114, 105, 98, 117, 116, 101, 95, 95, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 117, 110, 115, 105, 103, 110, 101, 100, 32, 99, 104, 97, 114,
+32, 117, 105, 110, 116, 56, 95, 116, 59, 10, 116, 121, 112, 101, 100,
+101, 102, 32, 117, 110, 115, 105, 103, 110, 101, 100, 32, 108, 111,
+110, 103, 32, 108, 111, 110, 103, 32, 117, 105, 110, 116, 54, 52, 95,
+116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32, 117, 110, 115,
+105, 103, 110, 101, 100, 32, 108, 111, 110, 103, 32, 108, 111, 110,
+103, 32, 115, 105, 122, 101, 95, 116, 59, 10, 116, 121, 112, 101, 100,
+101, 102, 32, 108, 111, 110, 103, 32, 108, 111, 110, 103, 32, 105,
+110, 116, 54, 52, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102,
+32, 108, 111, 110, 103, 32, 108, 111, 110, 103, 32, 105, 110, 116,
+112, 116, 114, 95, 116, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32,
+117, 110, 115, 105, 103, 110, 101, 100, 32, 105, 110, 116, 32, 117,
+105, 110, 116, 51, 50, 95, 116, 59, 10, 118, 111, 105, 100, 42, 32,
+109, 101, 109, 115, 101, 116, 40, 118, 111, 105, 100, 42, 32, 100,
+101, 115, 116, 44, 32, 105, 110, 116, 32, 99, 104, 44, 32, 115, 105,
+122, 101, 95, 116, 32, 99, 111, 117, 110, 116, 41, 59, 10, 118, 111,
+105, 100, 42, 32, 109, 101, 109, 99, 112, 121, 40, 118, 111, 105, 100,
+42, 32, 100, 101, 115, 116, 44, 32, 99, 111, 110, 115, 116, 32, 118,
+111, 105, 100, 42, 32, 115, 114, 99, 44, 32, 115, 105, 122, 101, 95,
+116, 32, 99, 111, 117, 110, 116, 41, 59, 10, 105, 110, 116, 32, 109,
+101, 109, 99, 109, 112, 40, 99, 111, 110, 115, 116, 32, 118, 111, 105,
+100, 42, 32, 108, 104, 115, 44, 32, 99, 111, 110, 115, 116, 32, 118,
+111, 105, 100, 42, 32, 114, 104, 115, 44, 32, 115, 105, 122, 101, 95,
+116, 32, 99, 111, 117, 110, 116, 41, 59, 10, 118, 111, 105, 100, 42,
+32, 109, 101, 109, 109, 111, 118, 101, 40, 118, 111, 105, 100, 42, 32,
+100, 101, 115, 116, 44, 32, 99, 111, 110, 115, 116, 32, 118, 111, 105,
+100, 42, 32, 115, 114, 99, 44, 32, 115, 105, 122, 101, 95, 116, 32,
+99, 111, 117, 110, 116, 41, 59, 10, 115, 105, 122, 101, 95, 116, 32,
+115, 116, 114, 108, 101, 110, 40, 99, 111, 110, 115, 116, 32, 99, 104,
+97, 114, 42, 32, 115, 116, 114, 41, 59, 10, 118, 111, 105, 100, 32,
+102, 114, 101, 101, 40, 118, 111, 105, 100, 42, 32, 112, 116, 114, 41,
+59, 10, 118, 111, 105, 100, 32, 42, 109, 97, 108, 108, 111, 99, 40,
+115, 105, 122, 101, 95, 116, 32, 115, 105, 122, 101, 41, 59, 10, 118,
+111, 105, 100, 32, 42, 99, 97, 108, 108, 111, 99, 40, 115, 105, 122,
+101, 95, 116, 32, 110, 117, 109, 44, 32, 115, 105, 122, 101, 95, 116,
+32, 115, 105, 122, 101, 41, 59, 10, 118, 111, 105, 100, 42, 32, 114,
+101, 97, 108, 108, 111, 99, 40, 118, 111, 105, 100, 42, 32, 112, 116,
+114, 44, 32, 115, 105, 122, 101, 95, 116, 32, 110, 101, 119, 95, 115,
+105, 122, 101, 41, 59, 10, 35, 100, 101, 102, 105, 110, 101, 32, 78,
+85, 76, 76, 32, 40, 40, 118, 111, 105, 100, 42, 41, 48, 41, 32, 47,
+42, 32, 116, 111, 100, 111, 33, 32, 42, 47, 10, 47, 47, 32, 35, 35,
+35, 32, 69, 78, 68, 32, 114, 101, 103, 101, 110, 95, 99, 111, 110,
+116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100, 101, 114, 115, 46,
+112, 121, 10, 47, 47, 32, 35, 35, 35, 32, 66, 69, 71, 73, 78, 95, 70,
+73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 99, 118, 101, 99,
+46, 104, 10, 10, 47, 47, 32, 35, 35, 35, 32, 66, 69, 71, 73, 78, 95,
+70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 108, 105, 110,
+107, 97, 103, 101, 46, 104, 10, 35, 117, 110, 100, 101, 102, 32, 83,
+84, 67, 95, 65, 80, 73, 10, 35, 117, 110, 100, 101, 102, 32, 83, 84,
+67, 95, 68, 69, 70, 10, 10, 35, 105, 102, 32, 33, 100, 101, 102, 105,
+110, 101, 100, 32, 105, 95, 115, 116, 97, 116, 105, 99, 32, 32, 38,
+38, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67, 95, 83,
+84, 65, 84, 73, 67, 32, 32, 38, 38, 32, 40, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 104, 101, 97, 100, 101, 114, 32, 124, 124, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67, 95, 72, 69, 65, 68,
+69, 82, 32, 32, 124, 124, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 100, 101, 102, 105, 110, 101, 100,
+32, 105, 95, 105, 109, 112, 108, 101, 109, 101, 110, 116, 32, 124,
+124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67, 95, 73,
+77, 80, 76, 69, 77, 69, 78, 84, 41, 10, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 83, 84, 67, 95, 65, 80, 73, 32, 101, 120, 116, 101,
+114, 110, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 83, 84,
+67, 95, 68, 69, 70, 10, 35, 101, 108, 115, 101, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 115, 116, 97, 116, 105, 99, 10,
+32, 32, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95,
+95, 71, 78, 85, 67, 95, 95, 32, 124, 124, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 95, 95, 99, 108, 97, 110, 103, 95, 95, 10, 32, 32, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 65, 80, 73,
+32, 115, 116, 97, 116, 105, 99, 32, 95, 95, 97, 116, 116, 114, 105,
+98, 117, 116, 101, 95, 95, 40, 40, 117, 110, 117, 115, 101, 100, 41,
+41, 10, 32, 32, 35, 101, 108, 115, 101, 10, 32, 32, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 65, 80, 73, 32, 115, 116,
+97, 116, 105, 99, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32,
+35, 100, 101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 68, 69, 70, 32,
+115, 116, 97, 116, 105, 99, 10, 35, 101, 110, 100, 105, 102, 10, 35,
+105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67, 95,
+73, 77, 80, 76, 69, 77, 69, 78, 84, 32, 124, 124, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 105, 109, 112, 111, 114, 116, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 105, 109, 112, 108,
+101, 109, 101, 110, 116, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35,
+105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67, 95,
+65, 76, 76, 79, 67, 65, 84, 79, 82, 32, 38, 38, 32, 33, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111,
+114, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 97,
+108, 108, 111, 99, 97, 116, 111, 114, 32, 83, 84, 67, 95, 65, 76, 76,
+79, 67, 65, 84, 79, 82, 10, 35, 101, 108, 105, 102, 32, 33, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 97, 108, 108, 111, 99, 97, 116,
+111, 114, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+97, 108, 108, 111, 99, 97, 116, 111, 114, 32, 99, 10, 35, 101, 110,
+100, 105, 102, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 109,
+97, 108, 108, 111, 99, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 109, 97, 108, 108, 111, 99, 32, 99, 95, 74, 79, 73, 78,
+40, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111, 114, 44, 32, 95,
+109, 97, 108, 108, 111, 99, 41, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 99, 97, 108, 108, 111, 99, 32, 99, 95, 74, 79,
+73, 78, 40, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111, 114, 44, 32,
+95, 99, 97, 108, 108, 111, 99, 41, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 114, 101, 97, 108, 108, 111, 99, 32, 99, 95,
+74, 79, 73, 78, 40, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111, 114,
+44, 32, 95, 114, 101, 97, 108, 108, 111, 99, 41, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 102, 114, 101, 101, 32, 99, 95,
+74, 79, 73, 78, 40, 105, 95, 97, 108, 108, 111, 99, 97, 116, 111, 114,
+44, 32, 95, 102, 114, 101, 101, 41, 10, 35, 101, 110, 100, 105, 102,
+10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95,
+95, 99, 108, 97, 110, 103, 95, 95, 32, 38, 38, 32, 33, 100, 101, 102,
+105, 110, 101, 100, 32, 95, 95, 99, 112, 108, 117, 115, 112, 108, 117,
+115, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110,
+103, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 112, 117,
+115, 104, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97,
+110, 103, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119,
+97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 97, 108, 108, 34, 10, 32,
+32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110, 103, 32,
+100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110,
+105, 110, 103, 32, 34, 45, 87, 101, 120, 116, 114, 97, 34, 10, 32, 32,
+35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110, 103, 32, 100,
+105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110, 105,
+110, 103, 32, 34, 45, 87, 112, 101, 100, 97, 110, 116, 105, 99, 34,
+10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110, 103,
+32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114,
+110, 105, 110, 103, 32, 34, 45, 87, 99, 111, 110, 118, 101, 114, 115,
+105, 111, 110, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99,
+108, 97, 110, 103, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99,
+32, 119, 97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 100, 111, 117,
+98, 108, 101, 45, 112, 114, 111, 109, 111, 116, 105, 111, 110, 34, 10,
+32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 99, 108, 97, 110, 103, 32,
+100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110,
+105, 110, 103, 32, 34, 45, 87, 119, 114, 105, 116, 101, 45, 115, 116,
+114, 105, 110, 103, 115, 34, 10, 32, 32, 47, 47, 32, 105, 103, 110,
+111, 114, 101, 100, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32,
+99, 108, 97, 110, 103, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105,
+99, 32, 105, 103, 110, 111, 114, 101, 100, 32, 34, 45, 87, 109, 105,
+115, 115, 105, 110, 103, 45, 102, 105, 101, 108, 100, 45, 105, 110,
+105, 116, 105, 97, 108, 105, 122, 101, 114, 115, 34, 10, 35, 101, 108,
+105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 71, 78,
+85, 67, 95, 95, 32, 38, 38, 32, 33, 100, 101, 102, 105, 110, 101, 100,
+32, 95, 95, 99, 112, 108, 117, 115, 112, 108, 117, 115, 10, 32, 32,
+35, 112, 114, 97, 103, 109, 97, 32, 71, 67, 67, 32, 100, 105, 97, 103,
+110, 111, 115, 116, 105, 99, 32, 112, 117, 115, 104, 10, 32, 32, 35,
+112, 114, 97, 103, 109, 97, 32, 71, 67, 67, 32, 100, 105, 97, 103,
+110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110, 105, 110, 103, 32,
+34, 45, 87, 97, 108, 108, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109,
+97, 32, 71, 67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105,
+99, 32, 119, 97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 101, 120,
+116, 114, 97, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 71,
+67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119,
+97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 112, 101, 100, 97, 110,
+116, 105, 99, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 71,
+67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119,
+97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 99, 111, 110, 118, 101,
+114, 115, 105, 111, 110, 34, 10, 32, 32, 35, 112, 114, 97, 103, 109,
+97, 32, 71, 67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105,
+99, 32, 119, 97, 114, 110, 105, 110, 103, 32, 34, 45, 87, 100, 111,
+117, 98, 108, 101, 45, 112, 114, 111, 109, 111, 116, 105, 111, 110,
+34, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32, 71, 67, 67, 32,
+100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32, 119, 97, 114, 110,
+105, 110, 103, 32, 34, 45, 87, 119, 114, 105, 116, 101, 45, 115, 116,
+114, 105, 110, 103, 115, 34, 10, 32, 32, 47, 47, 32, 105, 103, 110,
+111, 114, 101, 100, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97, 32,
+71, 67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116, 105, 99, 32,
+105, 103, 110, 111, 114, 101, 100, 32, 34, 45, 87, 109, 105, 115, 115,
+105, 110, 103, 45, 102, 105, 101, 108, 100, 45, 105, 110, 105, 116,
+105, 97, 108, 105, 122, 101, 114, 115, 34, 10, 35, 101, 110, 100, 105,
+102, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78, 68, 95, 70, 73, 76, 69,
+95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 108, 105, 110, 107, 97, 103,
+101, 46, 104, 10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 67, 86,
+69, 67, 95, 72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 47, 47, 32,
+35, 35, 35, 32, 66, 69, 71, 73, 78, 95, 70, 73, 76, 69, 95, 73, 78,
+67, 76, 85, 68, 69, 58, 32, 99, 99, 111, 109, 109, 111, 110, 46, 104,
+10, 35, 105, 102, 110, 100, 101, 102, 32, 67, 67, 79, 77, 77, 79, 78,
+95, 72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 67, 67, 79, 77, 77, 79, 78, 95, 72, 95, 73, 78, 67,
+76, 85, 68, 69, 68, 10, 10, 35, 105, 102, 100, 101, 102, 32, 95, 77,
+83, 67, 95, 86, 69, 82, 10, 32, 32, 32, 32, 35, 112, 114, 97, 103,
+109, 97, 32, 119, 97, 114, 110, 105, 110, 103, 40, 100, 105, 115, 97,
+98, 108, 101, 58, 32, 52, 49, 49, 54, 32, 52, 57, 57, 54, 41, 32, 47,
+47, 32, 117, 110, 110, 97, 109, 101, 100, 32, 116, 121, 112, 101, 32,
+100, 101, 102, 105, 110, 105, 116, 105, 111, 110, 32, 105, 110, 32,
+112, 97, 114, 101, 110, 116, 104, 101, 115, 101, 115, 10, 35, 101,
+110, 100, 105, 102, 10, 47, 47, 32, 69, 88, 67, 76, 85, 68, 69, 68,
+32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99, 111, 110, 116, 97,
+105, 110, 101, 114, 95, 104, 101, 97, 100, 101, 114, 115, 46, 112,
+121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60, 105, 110, 116,
+116, 121, 112, 101, 115, 46, 104, 62, 10, 47, 47, 32, 69, 88, 67, 76,
+85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99, 111,
+110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100, 101, 114,
+115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60,
+115, 116, 100, 100, 101, 102, 46, 104, 62, 10, 47, 47, 32, 69, 88, 67,
+76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99,
+111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100, 101,
+114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32,
+60, 115, 116, 100, 98, 111, 111, 108, 46, 104, 62, 10, 47, 47, 32, 69,
+88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110,
+95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100,
+101, 114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101,
+32, 60, 115, 116, 114, 105, 110, 103, 46, 104, 62, 10, 47, 47, 32, 69,
+88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110,
+95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100,
+101, 114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101,
+32, 60, 97, 115, 115, 101, 114, 116, 46, 104, 62, 10, 10, 116, 121,
+112, 101, 100, 101, 102, 32, 108, 111, 110, 103, 32, 108, 111, 110,
+103, 32, 95, 108, 108, 111, 110, 103, 59, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 78, 80, 79, 83, 32, 73, 78, 84, 80, 84, 82, 95,
+77, 65, 88, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 90, 73,
+32, 80, 82, 73, 105, 80, 84, 82, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 90, 85, 32, 80, 82, 73, 117, 80, 84, 82, 10, 10, 35, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 71, 78, 85,
+67, 95, 95, 32, 47, 47, 32, 105, 110, 99, 108, 117, 100, 101, 115, 32,
+95, 95, 99, 108, 97, 110, 103, 95, 95, 10, 32, 32, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69,
+32, 115, 116, 97, 116, 105, 99, 32, 105, 110, 108, 105, 110, 101, 32,
+95, 95, 97, 116, 116, 114, 105, 98, 117, 116, 101, 40, 40, 117, 110,
+117, 115, 101, 100, 41, 41, 10, 35, 101, 108, 115, 101, 10, 32, 32,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 73, 78,
+76, 73, 78, 69, 32, 115, 116, 97, 116, 105, 99, 32, 105, 110, 108,
+105, 110, 101, 10, 35, 101, 110, 100, 105, 102, 10, 10, 47, 42, 32,
+77, 97, 99, 114, 111, 32, 111, 118, 101, 114, 108, 111, 97, 100, 105,
+110, 103, 32, 102, 101, 97, 116, 117, 114, 101, 32, 115, 117, 112,
+112, 111, 114, 116, 32, 98, 97, 115, 101, 100, 32, 111, 110, 58, 32,
+104, 116, 116, 112, 115, 58, 47, 47, 114, 101, 120, 116, 101, 115,
+116, 101, 114, 46, 99, 111, 109, 47, 79, 78, 80, 56, 48, 49, 48, 55,
+32, 42, 47, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 77, 65,
+67, 82, 79, 95, 79, 86, 69, 82, 76, 79, 65, 68, 40, 110, 97, 109, 101,
+44, 32, 46, 46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 99, 95, 74, 79,
+73, 78, 40, 99, 95, 74, 79, 73, 78, 48, 40, 110, 97, 109, 101, 44, 95,
+41, 44, 99, 95, 78, 85, 77, 65, 82, 71, 83, 40, 95, 95, 86, 65, 95,
+65, 82, 71, 83, 95, 95, 41, 41, 40, 95, 95, 86, 65, 95, 65, 82, 71,
+83, 95, 95, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 74,
+79, 73, 78, 48, 40, 97, 44, 32, 98, 41, 32, 97, 32, 35, 35, 32, 98,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 74, 79, 73, 78, 40,
+97, 44, 32, 98, 41, 32, 99, 95, 74, 79, 73, 78, 48, 40, 97, 44, 32,
+98, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 69, 88, 80,
+65, 78, 68, 40, 46, 46, 46, 41, 32, 95, 95, 86, 65, 95, 65, 82, 71,
+83, 95, 95, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 78, 85,
+77, 65, 82, 71, 83, 40, 46, 46, 46, 41, 32, 95, 99, 95, 65, 80, 80,
+76, 89, 95, 65, 82, 71, 95, 78, 40, 40, 95, 95, 86, 65, 95, 65, 82,
+71, 83, 95, 95, 44, 32, 95, 99, 95, 82, 83, 69, 81, 95, 78, 41, 41,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 99, 95, 65, 80, 80, 76,
+89, 95, 65, 82, 71, 95, 78, 40, 97, 114, 103, 115, 41, 32, 99, 95, 69,
+88, 80, 65, 78, 68, 40, 95, 99, 95, 65, 82, 71, 95, 78, 32, 97, 114,
+103, 115, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 99, 95,
+82, 83, 69, 81, 95, 78, 32, 49, 54, 44, 32, 49, 53, 44, 32, 49, 52,
+44, 32, 49, 51, 44, 32, 49, 50, 44, 32, 49, 49, 44, 32, 49, 48, 44,
+32, 57, 44, 32, 56, 44, 32, 55, 44, 32, 54, 44, 32, 53, 44, 32, 52,
+44, 32, 51, 44, 32, 50, 44, 32, 49, 44, 32, 48, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 99, 95, 65, 82, 71, 95, 78, 40, 95, 49, 44, 32,
+95, 50, 44, 32, 95, 51, 44, 32, 95, 52, 44, 32, 95, 53, 44, 32, 95,
+54, 44, 32, 95, 55, 44, 32, 95, 56, 44, 32, 95, 57, 44, 32, 95, 49,
+48, 44, 32, 95, 49, 49, 44, 32, 95, 49, 50, 44, 32, 95, 49, 51, 44,
+32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 95, 49, 52, 44, 32, 95, 49, 53, 44, 32, 95, 49, 54, 44,
+32, 78, 44, 32, 46, 46, 46, 41, 32, 78, 10, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 95, 95, 99, 112, 108, 117, 115, 112, 108, 117, 115,
+32, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105,
+95, 97, 108, 108, 111, 99, 40, 84, 41, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 40, 40, 84, 42, 41, 105, 95, 109, 97, 108, 108, 111, 99, 40, 99,
+95, 115, 105, 122, 101, 111, 102, 40, 84, 41, 41, 41, 10, 32, 32, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105, 95, 110, 101, 119,
+40, 84, 44, 32, 46, 46, 46, 41, 32, 32, 32, 32, 32, 32, 40, 40, 84,
+42, 41, 109, 101, 109, 99, 112, 121, 40, 95, 105, 95, 97, 108, 108,
+111, 99, 40, 84, 41, 44, 32, 40, 40, 84, 91, 93, 41, 123, 95, 95, 86,
+65, 95, 65, 82, 71, 83, 95, 95, 125, 41, 44, 32, 115, 105, 122, 101,
+111, 102, 40, 84, 41, 41, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 110, 101, 119, 40, 84, 44, 32, 46, 46, 46,
+41, 32, 32, 32, 32, 32, 32, 32, 40, 40, 84, 42, 41, 109, 101, 109, 99,
+112, 121, 40, 109, 97, 108, 108, 111, 99, 40, 115, 105, 122, 101, 111,
+102, 40, 84, 41, 41, 44, 32, 40, 40, 84, 91, 93, 41, 123, 95, 95, 86,
+65, 95, 65, 82, 71, 83, 95, 95, 125, 41, 44, 32, 115, 105, 122, 101,
+111, 102, 40, 84, 41, 41, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 76, 73, 84, 69, 82, 65, 76, 40, 84, 41, 32,
+32, 32, 32, 32, 32, 32, 32, 40, 84, 41, 10, 35, 101, 108, 115, 101,
+10, 47, 47, 32, 69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114,
+101, 103, 101, 110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95,
+104, 101, 97, 100, 101, 114, 115, 46, 112, 121, 32, 32, 32, 32, 32,
+35, 105, 110, 99, 108, 117, 100, 101, 32, 60, 110, 101, 119, 62, 10,
+32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105, 95, 97,
+108, 108, 111, 99, 40, 84, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+115, 116, 97, 116, 105, 99, 95, 99, 97, 115, 116, 60, 84, 42, 62, 40,
+105, 95, 109, 97, 108, 108, 111, 99, 40, 99, 95, 115, 105, 122, 101,
+111, 102, 40, 84, 41, 41, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 105, 95, 110, 101, 119, 40, 84, 44, 32, 46, 46,
+46, 41, 32, 32, 32, 32, 32, 32, 110, 101, 119, 32, 40, 95, 105, 95,
+97, 108, 108, 111, 99, 40, 84, 41, 41, 32, 84, 40, 95, 95, 86, 65, 95,
+65, 82, 71, 83, 95, 95, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 110, 101, 119, 40, 84, 44, 32, 46, 46, 46,
+41, 32, 32, 32, 32, 32, 32, 32, 110, 101, 119, 32, 40, 109, 97, 108,
+108, 111, 99, 40, 115, 105, 122, 101, 111, 102, 40, 84, 41, 41, 41,
+32, 84, 40, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10, 32,
+32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 76, 73, 84,
+69, 82, 65, 76, 40, 84, 41, 32, 32, 32, 32, 32, 32, 32, 32, 84, 10,
+35, 101, 110, 100, 105, 102, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 110, 101, 119, 95, 110, 40, 84, 44, 32, 110, 41, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 40, 40, 84, 42, 41, 109, 97, 108, 108,
+111, 99, 40, 115, 105, 122, 101, 111, 102, 40, 84, 41, 42, 99, 95,
+105, 50, 117, 95, 115, 105, 122, 101, 40, 110, 41, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 109, 97, 108, 108, 111, 99,
+40, 115, 122, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 109,
+97, 108, 108, 111, 99, 40, 99, 95, 105, 50, 117, 95, 115, 105, 122,
+101, 40, 115, 122, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 99, 97, 108, 108, 111, 99, 40, 110, 44, 32, 115, 122, 41, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 99, 97, 108, 108, 111, 99, 40, 99, 95,
+105, 50, 117, 95, 115, 105, 122, 101, 40, 110, 41, 44, 32, 99, 95,
+105, 50, 117, 95, 115, 105, 122, 101, 40, 115, 122, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 114, 101, 97, 108, 108, 111,
+99, 40, 112, 44, 32, 111, 108, 100, 95, 115, 122, 44, 32, 115, 122,
+41, 32, 114, 101, 97, 108, 108, 111, 99, 40, 112, 44, 32, 99, 95, 105,
+50, 117, 95, 115, 105, 122, 101, 40, 49, 32, 63, 32, 40, 115, 122, 41,
+32, 58, 32, 40, 111, 108, 100, 95, 115, 122, 41, 41, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 102, 114, 101, 101, 40, 112, 44,
+32, 115, 122, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 100,
+111, 32, 123, 32, 40, 118, 111, 105, 100, 41, 40, 115, 122, 41, 59,
+32, 102, 114, 101, 101, 40, 112, 41, 59, 32, 125, 32, 119, 104, 105,
+108, 101, 40, 48, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99,
+95, 100, 101, 108, 101, 116, 101, 40, 84, 44, 32, 112, 116, 114, 41,
+32, 32, 32, 32, 32, 32, 32, 32, 100, 111, 32, 123, 32, 84, 32, 42, 95,
+116, 112, 32, 61, 32, 112, 116, 114, 59, 32, 84, 35, 35, 95, 100, 114,
+111, 112, 40, 95, 116, 112, 41, 59, 32, 102, 114, 101, 101, 40, 95,
+116, 112, 41, 59, 32, 125, 32, 119, 104, 105, 108, 101, 32, 40, 48,
+41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 116,
+97, 116, 105, 99, 95, 97, 115, 115, 101, 114, 116, 40, 101, 120, 112,
+114, 41, 32, 32, 32, 40, 49, 32, 63, 32, 48, 32, 58, 32, 40, 105, 110,
+116, 41, 115, 105, 122, 101, 111, 102, 40, 105, 110, 116, 91, 40, 101,
+120, 112, 114, 41, 32, 63, 32, 49, 32, 58, 32, 45, 49, 93, 41, 41, 10,
+35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 83, 84, 67,
+95, 78, 68, 69, 66, 85, 71, 32, 124, 124, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 78, 68, 69, 66, 85, 71, 10, 32, 32, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 97, 115, 115, 101, 114, 116, 40,
+101, 120, 112, 114, 41, 32, 32, 32, 32, 32, 32, 40, 40, 118, 111, 105,
+100, 41, 48, 41, 10, 35, 101, 108, 115, 101, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 83, 84, 67, 95, 65, 83, 83, 69, 82, 84, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 83, 84, 67, 95, 65, 83, 83, 69, 82,
+84, 40, 101, 120, 112, 114, 41, 10, 35, 101, 110, 100, 105, 102, 10,
+32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 97, 115,
+115, 101, 114, 116, 40, 101, 120, 112, 114, 41, 32, 32, 32, 32, 32,
+32, 83, 84, 67, 95, 65, 83, 83, 69, 82, 84, 40, 101, 120, 112, 114,
+41, 10, 35, 101, 110, 100, 105, 102, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 111,
+102, 40, 112, 44, 32, 67, 44, 32, 109, 41, 32, 40, 40, 67, 42, 41, 40,
+40, 99, 104, 97, 114, 42, 41, 40, 49, 32, 63, 32, 40, 112, 41, 32, 58,
+32, 38, 40, 40, 67, 42, 41, 48, 41, 45, 62, 109, 41, 32, 45, 32, 111,
+102, 102, 115, 101, 116, 111, 102, 40, 67, 44, 32, 109, 41, 41, 41,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 99, 111, 110, 115,
+116, 95, 99, 97, 115, 116, 40, 84, 112, 44, 32, 112, 41, 32, 32, 32,
+32, 32, 40, 40, 84, 112, 41, 40, 49, 32, 63, 32, 40, 112, 41, 32, 58,
+32, 40, 84, 112, 41, 48, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 115, 97, 102, 101, 95, 99, 97, 115, 116, 40, 84, 44, 32,
+70, 44, 32, 120, 41, 32, 32, 32, 32, 40, 40, 84, 41, 40, 49, 32, 63,
+32, 40, 120, 41, 32, 58, 32, 40, 70, 41, 123, 48, 125, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 119, 97, 112, 40, 84,
+44, 32, 120, 112, 44, 32, 121, 112, 41, 32, 32, 32, 32, 32, 32, 32,
+100, 111, 32, 123, 32, 84, 32, 42, 95, 120, 112, 32, 61, 32, 120, 112,
+44, 32, 42, 95, 121, 112, 32, 61, 32, 121, 112, 44, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 95, 116, 118, 32, 61, 32, 42, 95, 120, 112, 59, 32, 42, 95, 120,
+112, 32, 61, 32, 42, 95, 121, 112, 59, 32, 42, 95, 121, 112, 32, 61,
+32, 95, 116, 118, 59, 32, 125, 32, 119, 104, 105, 108, 101, 32, 40,
+48, 41, 10, 47, 47, 32, 117, 115, 101, 32, 119, 105, 116, 104, 32,
+103, 99, 99, 32, 45, 87, 99, 111, 110, 118, 101, 114, 115, 105, 111,
+110, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 105, 122,
+101, 111, 102, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 40, 105, 110, 116, 112, 116, 114, 95, 116, 41, 115, 105, 122,
+101, 111, 102, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115,
+116, 114, 108, 101, 110, 40, 115, 41, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 40, 105, 110, 116, 112, 116, 114, 95, 116, 41,
+115, 116, 114, 108, 101, 110, 40, 115, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 115, 116, 114, 110, 99, 109, 112, 40, 97, 44,
+32, 98, 44, 32, 105, 108, 101, 110, 41, 32, 32, 32, 115, 116, 114,
+110, 99, 109, 112, 40, 97, 44, 32, 98, 44, 32, 99, 95, 105, 50, 117,
+95, 115, 105, 122, 101, 40, 105, 108, 101, 110, 41, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 109, 101, 109, 99, 112, 121, 40,
+100, 44, 32, 115, 44, 32, 105, 108, 101, 110, 41, 32, 32, 32, 32, 109,
+101, 109, 99, 112, 121, 40, 100, 44, 32, 115, 44, 32, 99, 95, 105, 50,
+117, 95, 115, 105, 122, 101, 40, 105, 108, 101, 110, 41, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 109, 101, 109, 109, 111,
+118, 101, 40, 100, 44, 32, 115, 44, 32, 105, 108, 101, 110, 41, 32,
+32, 32, 109, 101, 109, 109, 111, 118, 101, 40, 100, 44, 32, 115, 44,
+32, 99, 95, 105, 50, 117, 95, 115, 105, 122, 101, 40, 105, 108, 101,
+110, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 109,
+101, 109, 115, 101, 116, 40, 100, 44, 32, 118, 97, 108, 44, 32, 105,
+108, 101, 110, 41, 32, 32, 109, 101, 109, 115, 101, 116, 40, 100, 44,
+32, 118, 97, 108, 44, 32, 99, 95, 105, 50, 117, 95, 115, 105, 122,
+101, 40, 105, 108, 101, 110, 41, 41, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 109, 101, 109, 99, 109, 112, 40, 97, 44, 32, 98, 44,
+32, 105, 108, 101, 110, 41, 32, 32, 32, 32, 109, 101, 109, 99, 109,
+112, 40, 97, 44, 32, 98, 44, 32, 99, 95, 105, 50, 117, 95, 115, 105,
+122, 101, 40, 105, 108, 101, 110, 41, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 117, 50, 105, 95, 115, 105, 122, 101, 40, 117,
+41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 105, 110, 116,
+112, 116, 114, 95, 116, 41, 40, 49, 32, 63, 32, 40, 117, 41, 32, 58,
+32, 40, 115, 105, 122, 101, 95, 116, 41, 49, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 105, 50, 117, 95, 115, 105, 122, 101,
+40, 105, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 115, 105,
+122, 101, 95, 116, 41, 40, 49, 32, 63, 32, 40, 105, 41, 32, 58, 32,
+45, 49, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 108,
+101, 115, 115, 95, 117, 110, 115, 105, 103, 110, 101, 100, 40, 97, 44,
+32, 98, 41, 32, 32, 32, 40, 40, 115, 105, 122, 101, 95, 116, 41, 40,
+97, 41, 32, 60, 32, 40, 115, 105, 122, 101, 95, 116, 41, 40, 98, 41,
+41, 10, 10, 47, 47, 32, 120, 32, 97, 110, 100, 32, 121, 32, 97, 114,
+101, 32, 105, 95, 107, 101, 121, 114, 97, 119, 42, 32, 116, 121, 112,
+101, 44, 32, 100, 101, 102, 97, 117, 108, 116, 115, 32, 116, 111, 32,
+105, 95, 107, 101, 121, 42, 58, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 99, 109, 112, 40,
+120, 44, 32, 121, 41, 32, 32, 32, 32, 32, 40, 99, 95, 100, 101, 102,
+97, 117, 108, 116, 95, 108, 101, 115, 115, 40, 121, 44, 32, 120, 41,
+32, 45, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 108, 101,
+115, 115, 40, 120, 44, 32, 121, 41, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 108, 101,
+115, 115, 40, 120, 44, 32, 121, 41, 32, 32, 32, 32, 40, 42, 40, 120,
+41, 32, 60, 32, 42, 40, 121, 41, 41, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 101, 113, 40,
+120, 44, 32, 121, 41, 32, 32, 32, 32, 32, 32, 40, 42, 40, 120, 41, 32,
+61, 61, 32, 42, 40, 121, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 109, 101, 109, 99, 109, 112, 95, 101, 113, 40, 120, 44,
+32, 121, 41, 32, 32, 32, 32, 32, 32, 32, 40, 109, 101, 109, 99, 109,
+112, 40, 120, 44, 32, 121, 44, 32, 115, 105, 122, 101, 111, 102, 32,
+42, 40, 120, 41, 41, 32, 61, 61, 32, 48, 41, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 104,
+97, 115, 104, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 115, 116, 99,
+95, 104, 97, 115, 104, 95, 49, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 99, 108, 111,
+110, 101, 40, 118, 41, 32, 32, 32, 32, 32, 32, 40, 118, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 99, 95, 100, 101, 102, 97, 117, 108,
+116, 95, 116, 111, 114, 97, 119, 40, 118, 112, 41, 32, 32, 32, 32, 32,
+40, 42, 40, 118, 112, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 100, 114, 111, 112,
+40, 118, 112, 41, 32, 32, 32, 32, 32, 32, 40, 40, 118, 111, 105, 100,
+41, 32, 40, 118, 112, 41, 41, 10, 10, 47, 42, 32, 70, 117, 110, 99,
+116, 105, 111, 110, 32, 109, 97, 99, 114, 111, 115, 32, 97, 110, 100,
+32, 111, 116, 104, 101, 114, 115, 32, 42, 47, 10, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 108, 105, 116, 115, 116, 114, 108,
+101, 110, 40, 108, 105, 116, 101, 114, 97, 108, 41, 32, 40, 99, 95,
+115, 105, 122, 101, 111, 102, 40, 34, 34, 32, 108, 105, 116, 101, 114,
+97, 108, 41, 32, 45, 32, 49, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 97, 114, 114, 97, 121, 108, 101, 110, 40, 97, 41, 32, 40,
+105, 110, 116, 112, 116, 114, 95, 116, 41, 40, 115, 105, 122, 101,
+111, 102, 40, 97, 41, 47, 115, 105, 122, 101, 111, 102, 32, 48, 91,
+97, 93, 41, 10, 10, 47, 47, 32, 78, 111, 110, 45, 111, 119, 110, 105,
+110, 103, 32, 99, 45, 115, 116, 114, 105, 110, 103, 32, 34, 99, 108,
+97, 115, 115, 34, 10, 116, 121, 112, 101, 100, 101, 102, 32, 99, 111,
+110, 115, 116, 32, 99, 104, 97, 114, 42, 32, 99, 99, 104, 97, 114,
+112, 116, 114, 59, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 99,
+104, 97, 114, 112, 116, 114, 95, 99, 109, 112, 40, 120, 112, 44, 32,
+121, 112, 41, 32, 115, 116, 114, 99, 109, 112, 40, 42, 40, 120, 112,
+41, 44, 32, 42, 40, 121, 112, 41, 41, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 99, 104, 97, 114, 112, 116, 114, 95, 104, 97, 115, 104,
+40, 112, 41, 32, 115, 116, 99, 95, 115, 116, 114, 104, 97, 115, 104,
+40, 42, 40, 112, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99,
+99, 104, 97, 114, 112, 116, 114, 95, 99, 108, 111, 110, 101, 40, 115,
+41, 32, 40, 115, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 99,
+104, 97, 114, 112, 116, 114, 95, 100, 114, 111, 112, 40, 112, 41, 32,
+40, 40, 118, 111, 105, 100, 41, 112, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 115, 118, 40, 46, 46, 46, 41, 32, 99, 95,
+77, 65, 67, 82, 79, 95, 79, 86, 69, 82, 76, 79, 65, 68, 40, 99, 95,
+115, 118, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 118, 95, 49, 40,
+108, 105, 116, 101, 114, 97, 108, 41, 32, 99, 95, 115, 118, 95, 50,
+40, 108, 105, 116, 101, 114, 97, 108, 44, 32, 99, 95, 108, 105, 116,
+115, 116, 114, 108, 101, 110, 40, 108, 105, 116, 101, 114, 97, 108,
+41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 118,
+95, 50, 40, 115, 116, 114, 44, 32, 110, 41, 32, 40, 99, 95, 76, 73,
+84, 69, 82, 65, 76, 40, 99, 115, 118, 105, 101, 119, 41, 123, 115,
+116, 114, 44, 32, 110, 125, 41, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 83, 86, 40, 115, 118, 41, 32, 40, 105, 110, 116, 41, 40,
+115, 118, 41, 46, 115, 105, 122, 101, 44, 32, 40, 115, 118, 41, 46,
+98, 117, 102, 32, 47, 47, 32, 112, 114, 105, 110, 116, 102, 40, 34,
+37, 46, 42, 115, 92, 110, 34, 44, 32, 99, 95, 83, 86, 40, 115, 118,
+41, 41, 59, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 114,
+115, 40, 108, 105, 116, 101, 114, 97, 108, 41, 32, 99, 95, 114, 115,
+95, 50, 40, 108, 105, 116, 101, 114, 97, 108, 44, 32, 99, 95, 108,
+105, 116, 115, 116, 114, 108, 101, 110, 40, 108, 105, 116, 101, 114,
+97, 108, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95,
+114, 115, 95, 50, 40, 115, 116, 114, 44, 32, 110, 41, 32, 40, 99, 95,
+76, 73, 84, 69, 82, 65, 76, 40, 99, 114, 97, 119, 115, 116, 114, 41,
+123, 115, 116, 114, 44, 32, 110, 125, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 82, 79, 84, 76, 40, 120, 44, 32, 107, 41,
+32, 40, 120, 32, 60, 60, 32, 40, 107, 41, 32, 124, 32, 120, 32, 62,
+62, 32, 40, 56, 42, 115, 105, 122, 101, 111, 102, 40, 120, 41, 32, 45,
+32, 40, 107, 41, 41, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+115, 116, 99, 95, 104, 97, 115, 104, 40, 46, 46, 46, 41, 32, 99, 95,
+77, 65, 67, 82, 79, 95, 79, 86, 69, 82, 76, 79, 65, 68, 40, 115, 116,
+99, 95, 104, 97, 115, 104, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83,
+95, 95, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 115, 116, 99,
+95, 104, 97, 115, 104, 95, 49, 40, 120, 41, 32, 115, 116, 99, 95, 104,
+97, 115, 104, 95, 50, 40, 120, 44, 32, 99, 95, 115, 105, 122, 101,
+111, 102, 40, 42, 40, 120, 41, 41, 41, 10, 10, 83, 84, 67, 95, 73, 78,
+76, 73, 78, 69, 32, 117, 105, 110, 116, 54, 52, 95, 116, 32, 115, 116,
+99, 95, 104, 97, 115, 104, 95, 50, 40, 99, 111, 110, 115, 116, 32,
+118, 111, 105, 100, 42, 32, 107, 101, 121, 44, 32, 105, 110, 116, 112,
+116, 114, 95, 116, 32, 108, 101, 110, 41, 32, 123, 10, 32, 32, 32, 32,
+117, 105, 110, 116, 51, 50, 95, 116, 32, 117, 52, 59, 32, 117, 105,
+110, 116, 54, 52, 95, 116, 32, 117, 56, 59, 10, 32, 32, 32, 32, 115,
+119, 105, 116, 99, 104, 32, 40, 108, 101, 110, 41, 32, 123, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 99, 97, 115, 101, 32, 56, 58, 32, 109,
+101, 109, 99, 112, 121, 40, 38, 117, 56, 44, 32, 107, 101, 121, 44,
+32, 56, 41, 59, 32, 114, 101, 116, 117, 114, 110, 32, 117, 56, 42, 48,
+120, 99, 54, 97, 52, 97, 55, 57, 51, 53, 98, 100, 49, 101, 57, 57,
+100, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 99, 97, 115, 101, 32, 52,
+58, 32, 109, 101, 109, 99, 112, 121, 40, 38, 117, 52, 44, 32, 107,
+101, 121, 44, 32, 52, 41, 59, 32, 114, 101, 116, 117, 114, 110, 32,
+117, 52, 42, 48, 120, 99, 54, 97, 52, 97, 55, 57, 51, 53, 98, 100, 49,
+101, 57, 57, 100, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 99, 97, 115,
+101, 32, 48, 58, 32, 114, 101, 116, 117, 114, 110, 32, 49, 59, 10, 32,
+32, 32, 32, 125, 10, 32, 32, 32, 32, 99, 111, 110, 115, 116, 32, 117,
+105, 110, 116, 56, 95, 116, 32, 42, 120, 32, 61, 32, 40, 99, 111, 110,
+115, 116, 32, 117, 105, 110, 116, 56, 95, 116, 42, 41, 107, 101, 121,
+59, 10, 32, 32, 32, 32, 117, 105, 110, 116, 54, 52, 95, 116, 32, 104,
+32, 61, 32, 40, 117, 105, 110, 116, 54, 52, 95, 116, 41, 42, 120, 32,
+60, 60, 32, 55, 44, 32, 110, 32, 61, 32, 40, 117, 105, 110, 116, 54,
+52, 95, 116, 41, 108, 101, 110, 32, 62, 62, 32, 51, 59, 10, 32, 32,
+32, 32, 108, 101, 110, 32, 38, 61, 32, 55, 59, 10, 32, 32, 32, 32,
+119, 104, 105, 108, 101, 32, 40, 110, 45, 45, 41, 32, 123, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 109, 101, 109, 99, 112, 121, 40, 38, 117, 56,
+44, 32, 120, 44, 32, 56, 41, 44, 32, 120, 32, 43, 61, 32, 56, 59, 10,
+32, 32, 32, 32, 32, 32, 32, 32, 104, 32, 61, 32, 40, 104, 32, 94, 32,
+117, 56, 41, 42, 48, 120, 99, 54, 97, 52, 97, 55, 57, 51, 53, 98, 100,
+49, 101, 57, 57, 100, 59, 10, 32, 32, 32, 32, 125, 10, 32, 32, 32, 32,
+119, 104, 105, 108, 101, 32, 40, 108, 101, 110, 45, 45, 41, 32, 104,
+32, 61, 32, 40, 104, 32, 94, 32, 42, 120, 43, 43, 41, 42, 48, 120, 49,
+48, 48, 48, 48, 48, 48, 48, 49, 98, 51, 59, 10, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 104, 32, 94, 32, 99, 95, 82, 79, 84, 76,
+40, 104, 44, 32, 50, 54, 41, 59, 10, 125, 10, 10, 83, 84, 67, 95, 73,
+78, 76, 73, 78, 69, 32, 117, 105, 110, 116, 54, 52, 95, 116, 32, 115,
+116, 99, 95, 115, 116, 114, 104, 97, 115, 104, 40, 99, 111, 110, 115,
+116, 32, 99, 104, 97, 114, 32, 42, 115, 116, 114, 41, 10, 32, 32, 32,
+32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 115, 116, 99, 95, 104,
+97, 115, 104, 95, 50, 40, 115, 116, 114, 44, 32, 99, 95, 115, 116,
+114, 108, 101, 110, 40, 115, 116, 114, 41, 41, 59, 32, 125, 10, 10,
+83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 117, 105, 110, 116, 54,
+52, 95, 116, 32, 95, 115, 116, 99, 95, 104, 97, 115, 104, 95, 109,
+105, 120, 40, 117, 105, 110, 116, 54, 52, 95, 116, 32, 104, 91, 93,
+44, 32, 105, 110, 116, 32, 110, 41, 32, 123, 32, 47, 47, 32, 110, 32,
+62, 32, 48, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 105, 110, 116,
+32, 105, 32, 61, 32, 49, 59, 32, 105, 32, 60, 32, 110, 59, 32, 43, 43,
+105, 41, 32, 104, 91, 48, 93, 32, 94, 61, 32, 104, 91, 48, 93, 32, 43,
+32, 104, 91, 105, 93, 59, 32, 47, 47, 32, 110, 111, 110, 45, 99, 111,
+109, 109, 117, 116, 97, 116, 105, 118, 101, 33, 10, 32, 32, 32, 32,
+114, 101, 116, 117, 114, 110, 32, 104, 91, 48, 93, 59, 10, 125, 10,
+10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 99, 104, 97, 114, 42,
+32, 115, 116, 99, 95, 115, 116, 114, 110, 115, 116, 114, 110, 40, 99,
+111, 110, 115, 116, 32, 99, 104, 97, 114, 32, 42, 115, 116, 114, 44,
+32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 115, 108, 101, 110, 44,
+32, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 99, 111,
+110, 115, 116, 32, 99, 104, 97, 114, 32, 42, 110, 101, 101, 100, 108,
+101, 44, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 110, 108, 101,
+110, 41, 32, 123, 10, 32, 32, 32, 32, 105, 102, 32, 40, 33, 110, 108,
+101, 110, 41, 32, 114, 101, 116, 117, 114, 110, 32, 40, 99, 104, 97,
+114, 32, 42, 41, 115, 116, 114, 59, 10, 32, 32, 32, 32, 105, 102, 32,
+40, 110, 108, 101, 110, 32, 62, 32, 115, 108, 101, 110, 41, 32, 114,
+101, 116, 117, 114, 110, 32, 78, 85, 76, 76, 59, 10, 32, 32, 32, 32,
+115, 108, 101, 110, 32, 45, 61, 32, 110, 108, 101, 110, 59, 10, 32,
+32, 32, 32, 100, 111, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+105, 102, 32, 40, 42, 115, 116, 114, 32, 61, 61, 32, 42, 110, 101,
+101, 100, 108, 101, 32, 38, 38, 32, 33, 99, 95, 109, 101, 109, 99,
+109, 112, 40, 115, 116, 114, 44, 32, 110, 101, 101, 100, 108, 101, 44,
+32, 110, 108, 101, 110, 41, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 40, 99, 104, 97,
+114, 32, 42, 41, 115, 116, 114, 59, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 43, 43, 115, 116, 114, 59, 10, 32, 32, 32, 32, 125, 32, 119, 104,
+105, 108, 101, 32, 40, 115, 108, 101, 110, 45, 45, 41, 59, 10, 32, 32,
+32, 32, 114, 101, 116, 117, 114, 110, 32, 78, 85, 76, 76, 59, 10, 125,
+10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 105, 110, 116,
+112, 116, 114, 95, 116, 32, 115, 116, 99, 95, 110, 101, 120, 116, 112,
+111, 119, 50, 40, 105, 110, 116, 112, 116, 114, 95, 116, 32, 110, 41,
+32, 123, 10, 32, 32, 32, 32, 110, 45, 45, 59, 10, 32, 32, 32, 32, 110,
+32, 124, 61, 32, 110, 32, 62, 62, 32, 49, 44, 32, 110, 32, 124, 61,
+32, 110, 32, 62, 62, 32, 50, 59, 10, 32, 32, 32, 32, 110, 32, 124, 61,
+32, 110, 32, 62, 62, 32, 52, 44, 32, 110, 32, 124, 61, 32, 110, 32,
+62, 62, 32, 56, 59, 10, 32, 32, 32, 32, 110, 32, 124, 61, 32, 110, 32,
+62, 62, 32, 49, 54, 59, 10, 32, 32, 32, 32, 35, 105, 102, 32, 73, 78,
+84, 80, 84, 82, 95, 77, 65, 88, 32, 61, 61, 32, 73, 78, 84, 54, 52,
+95, 77, 65, 88, 10, 32, 32, 32, 32, 110, 32, 124, 61, 32, 110, 32, 62,
+62, 32, 51, 50, 59, 10, 32, 32, 32, 32, 35, 101, 110, 100, 105, 102,
+10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 110, 32, 43, 32,
+49, 59, 10, 125, 10, 47, 42, 32, 67, 111, 110, 116, 114, 111, 108, 32,
+98, 108, 111, 99, 107, 32, 109, 97, 99, 114, 111, 115, 32, 42, 47, 10,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102, 111, 114, 101,
+97, 99, 104, 40, 46, 46, 46, 41, 32, 99, 95, 77, 65, 67, 82, 79, 95,
+79, 86, 69, 82, 76, 79, 65, 68, 40, 99, 95, 102, 111, 114, 101, 97,
+99, 104, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102, 111, 114, 101, 97,
+99, 104, 95, 51, 40, 105, 116, 44, 32, 67, 44, 32, 99, 110, 116, 41,
+32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 67, 35, 35, 95,
+105, 116, 101, 114, 32, 105, 116, 32, 61, 32, 67, 35, 35, 95, 98, 101,
+103, 105, 110, 40, 38, 99, 110, 116, 41, 59, 32, 105, 116, 46, 114,
+101, 102, 59, 32, 67, 35, 35, 95, 110, 101, 120, 116, 40, 38, 105,
+116, 41, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102,
+111, 114, 101, 97, 99, 104, 95, 52, 40, 105, 116, 44, 32, 67, 44, 32,
+115, 116, 97, 114, 116, 44, 32, 102, 105, 110, 105, 115, 104, 41, 32,
+92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 67, 35, 35, 95, 105,
+116, 101, 114, 32, 105, 116, 32, 61, 32, 40, 115, 116, 97, 114, 116,
+41, 44, 32, 42, 95, 101, 110, 100, 114, 101, 102, 32, 61, 32, 99, 95,
+115, 97, 102, 101, 95, 99, 97, 115, 116, 40, 67, 35, 35, 95, 105, 116,
+101, 114, 42, 44, 32, 67, 35, 35, 95, 118, 97, 108, 117, 101, 42, 44,
+32, 40, 102, 105, 110, 105, 115, 104, 41, 46, 114, 101, 102, 41, 32,
+92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 105, 116, 46, 114,
+101, 102, 32, 33, 61, 32, 40, 67, 35, 35, 95, 118, 97, 108, 117, 101,
+42, 41, 95, 101, 110, 100, 114, 101, 102, 59, 32, 67, 35, 35, 95, 110,
+101, 120, 116, 40, 38, 105, 116, 41, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 112, 97, 105, 114, 40, 107,
+101, 121, 44, 32, 118, 97, 108, 44, 32, 67, 44, 32, 99, 110, 116, 41,
+32, 47, 42, 32, 115, 116, 114, 117, 99, 116, 117, 114, 101, 100, 32,
+98, 105, 110, 100, 105, 110, 103, 32, 42, 47, 32, 92, 10, 32, 32, 32,
+32, 102, 111, 114, 32, 40, 115, 116, 114, 117, 99, 116, 32, 123, 67,
+35, 35, 95, 105, 116, 101, 114, 32, 105, 116, 101, 114, 59, 32, 99,
+111, 110, 115, 116, 32, 67, 35, 35, 95, 107, 101, 121, 42, 32, 107,
+101, 121, 59, 32, 67, 35, 35, 95, 109, 97, 112, 112, 101, 100, 42, 32,
+118, 97, 108, 59, 125, 32, 95, 32, 61, 32, 123, 46, 105, 116, 101,
+114, 61, 67, 35, 35, 95, 98, 101, 103, 105, 110, 40, 38, 99, 110, 116,
+41, 125, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 95,
+46, 105, 116, 101, 114, 46, 114, 101, 102, 32, 38, 38, 32, 40, 95, 46,
+107, 101, 121, 32, 61, 32, 38, 95, 46, 105, 116, 101, 114, 46, 114,
+101, 102, 45, 62, 102, 105, 114, 115, 116, 44, 32, 95, 46, 118, 97,
+108, 32, 61, 32, 38, 95, 46, 105, 116, 101, 114, 46, 114, 101, 102,
+45, 62, 115, 101, 99, 111, 110, 100, 41, 32, 92, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 59, 32, 67, 35, 35, 95, 110, 101, 120, 116, 40,
+38, 95, 46, 105, 116, 101, 114, 41, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 105, 110, 100, 101, 120,
+101, 100, 40, 105, 116, 44, 32, 67, 44, 32, 99, 110, 116, 41, 32, 92,
+10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 115, 116, 114, 117, 99,
+116, 32, 123, 67, 35, 35, 95, 105, 116, 101, 114, 32, 105, 116, 101,
+114, 59, 32, 67, 35, 35, 95, 118, 97, 108, 117, 101, 42, 32, 114, 101,
+102, 59, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105, 110, 100,
+101, 120, 59, 125, 32, 105, 116, 32, 61, 32, 123, 46, 105, 116, 101,
+114, 61, 67, 35, 35, 95, 98, 101, 103, 105, 110, 40, 38, 99, 110, 116,
+41, 125, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 40,
+105, 116, 46, 114, 101, 102, 32, 61, 32, 105, 116, 46, 105, 116, 101,
+114, 46, 114, 101, 102, 41, 32, 59, 32, 67, 35, 35, 95, 110, 101, 120,
+116, 40, 38, 105, 116, 46, 105, 116, 101, 114, 41, 44, 32, 43, 43,
+105, 116, 46, 105, 110, 100, 101, 120, 41, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 105, 116, 101, 114, 40, 101,
+120, 105, 115, 116, 105, 110, 103, 95, 105, 116, 101, 114, 44, 32, 67,
+44, 32, 99, 110, 116, 41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114,
+32, 40, 101, 120, 105, 115, 116, 105, 110, 103, 95, 105, 116, 101,
+114, 32, 61, 32, 67, 35, 35, 95, 98, 101, 103, 105, 110, 40, 38, 99,
+110, 116, 41, 59, 32, 40, 101, 120, 105, 115, 116, 105, 110, 103, 95,
+105, 116, 101, 114, 41, 46, 114, 101, 102, 59, 32, 67, 35, 35, 95,
+110, 101, 120, 116, 40, 38, 101, 120, 105, 115, 116, 105, 110, 103,
+95, 105, 116, 101, 114, 41, 41, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 40, 46, 46,
+46, 41, 32, 99, 95, 77, 65, 67, 82, 79, 95, 79, 86, 69, 82, 76, 79,
+65, 68, 40, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 44, 32, 95,
+95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 95,
+49, 40, 115, 116, 111, 112, 41, 32, 99, 95, 102, 111, 114, 114, 97,
+110, 103, 101, 95, 51, 40, 95, 105, 44, 32, 48, 44, 32, 115, 116, 111,
+112, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102, 111,
+114, 114, 97, 110, 103, 101, 95, 50, 40, 105, 44, 32, 115, 116, 111,
+112, 41, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 95, 51,
+40, 105, 44, 32, 48, 44, 32, 115, 116, 111, 112, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101,
+95, 51, 40, 105, 44, 32, 115, 116, 97, 114, 116, 44, 32, 115, 116,
+111, 112, 41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 95,
+108, 108, 111, 110, 103, 32, 105, 61, 115, 116, 97, 114, 116, 44, 32,
+95, 101, 110, 100, 61, 115, 116, 111, 112, 59, 32, 105, 32, 60, 32,
+95, 101, 110, 100, 59, 32, 43, 43, 105, 41, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 102, 111, 114, 114, 97, 110, 103, 101, 95,
+52, 40, 105, 44, 32, 115, 116, 97, 114, 116, 44, 32, 115, 116, 111,
+112, 44, 32, 115, 116, 101, 112, 41, 32, 92, 10, 32, 32, 32, 32, 102,
+111, 114, 32, 40, 95, 108, 108, 111, 110, 103, 32, 105, 61, 115, 116,
+97, 114, 116, 44, 32, 95, 105, 110, 99, 61, 115, 116, 101, 112, 44,
+32, 95, 101, 110, 100, 61, 40, 95, 108, 108, 111, 110, 103, 41, 40,
+115, 116, 111, 112, 41, 32, 45, 32, 40, 95, 105, 110, 99, 32, 62, 32,
+48, 41, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 40,
+95, 105, 110, 99, 32, 62, 32, 48, 41, 32, 94, 32, 40, 105, 32, 62, 32,
+95, 101, 110, 100, 41, 59, 32, 105, 32, 43, 61, 32, 95, 105, 110, 99,
+41, 10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 95, 95, 99, 112,
+108, 117, 115, 112, 108, 117, 115, 10, 32, 32, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 105, 110, 105, 116, 40, 67, 44, 32,
+46, 46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 67, 35,
+35, 95, 102, 114, 111, 109, 95, 110, 40, 40, 67, 35, 35, 95, 114, 97,
+119, 91, 93, 41, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 44, 32,
+99, 95, 115, 105, 122, 101, 111, 102, 40, 40, 67, 35, 35, 95, 114, 97,
+119, 91, 93, 41, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 47,
+99, 95, 115, 105, 122, 101, 111, 102, 40, 67, 35, 35, 95, 114, 97,
+119, 41, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 102, 111, 114, 108, 105, 115, 116, 40, 105, 116, 44, 32, 84,
+44, 32, 46, 46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+102, 111, 114, 32, 40, 115, 116, 114, 117, 99, 116, 32, 123, 84, 42,
+32, 114, 101, 102, 59, 32, 105, 110, 116, 32, 115, 105, 122, 101, 44,
+32, 105, 110, 100, 101, 120, 59, 125, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 105, 116, 32, 61, 32, 123, 46, 114,
+101, 102, 61, 40, 84, 91, 93, 41, 95, 95, 86, 65, 95, 65, 82, 71, 83,
+95, 95, 44, 32, 46, 115, 105, 122, 101, 61, 40, 105, 110, 116, 41, 40,
+115, 105, 122, 101, 111, 102, 40, 40, 84, 91, 93, 41, 95, 95, 86, 65,
+95, 65, 82, 71, 83, 95, 95, 41, 47, 115, 105, 122, 101, 111, 102, 40,
+84, 41, 41, 125, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 59, 32, 105, 116, 46, 105, 110, 100, 101, 120, 32, 60, 32,
+105, 116, 46, 115, 105, 122, 101, 59, 32, 43, 43, 105, 116, 46, 114,
+101, 102, 44, 32, 43, 43, 105, 116, 46, 105, 110, 100, 101, 120, 41,
+10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 115, 116,
+99, 95, 104, 97, 115, 104, 95, 109, 105, 120, 40, 46, 46, 46, 41, 32,
+92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 115, 116, 99, 95, 104, 97,
+115, 104, 95, 109, 105, 120, 40, 40, 117, 105, 110, 116, 54, 52, 95,
+116, 91, 93, 41, 123, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 125,
+44, 32, 99, 95, 78, 85, 77, 65, 82, 71, 83, 40, 95, 95, 86, 65, 95,
+65, 82, 71, 83, 95, 95, 41, 41, 10, 35, 101, 108, 115, 101, 10, 47,
+47, 32, 69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103,
+101, 110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101,
+97, 100, 101, 114, 115, 46, 112, 121, 32, 32, 32, 32, 32, 35, 105,
+110, 99, 108, 117, 100, 101, 32, 60, 105, 110, 105, 116, 105, 97, 108,
+105, 122, 101, 114, 95, 108, 105, 115, 116, 62, 10, 47, 47, 32, 69,
+88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110,
+95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100,
+101, 114, 115, 46, 112, 121, 32, 32, 32, 32, 32, 35, 105, 110, 99,
+108, 117, 100, 101, 32, 60, 97, 114, 114, 97, 121, 62, 10, 32, 32, 32,
+32, 116, 101, 109, 112, 108, 97, 116, 101, 32, 60, 99, 108, 97, 115,
+115, 32, 67, 44, 32, 99, 108, 97, 115, 115, 32, 84, 62, 10, 32, 32,
+32, 32, 105, 110, 108, 105, 110, 101, 32, 67, 32, 95, 102, 114, 111,
+109, 95, 110, 40, 67, 32, 40, 42, 102, 117, 110, 99, 41, 40, 99, 111,
+110, 115, 116, 32, 84, 91, 93, 44, 32, 105, 110, 116, 112, 116, 114,
+95, 116, 41, 44, 32, 115, 116, 100, 58, 58, 105, 110, 105, 116, 105,
+97, 108, 105, 122, 101, 114, 95, 108, 105, 115, 116, 60, 84, 62, 32,
+105, 108, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 123, 32, 114, 101,
+116, 117, 114, 110, 32, 102, 117, 110, 99, 40, 38, 42, 105, 108, 46,
+98, 101, 103, 105, 110, 40, 41, 44, 32, 105, 108, 46, 115, 105, 122,
+101, 40, 41, 41, 59, 32, 125, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 105, 110, 105, 116, 40, 67, 44, 32, 46, 46,
+46, 41, 32, 95, 102, 114, 111, 109, 95, 110, 60, 67, 44, 67, 35, 35,
+95, 114, 97, 119, 62, 40, 67, 35, 35, 95, 102, 114, 111, 109, 95, 110,
+44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10, 32, 32,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 102, 111, 114,
+108, 105, 115, 116, 40, 105, 116, 44, 32, 84, 44, 32, 46, 46, 46, 41,
+32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 102, 111, 114, 32, 40,
+115, 116, 114, 117, 99, 116, 32, 123, 115, 116, 100, 58, 58, 105, 110,
+105, 116, 105, 97, 108, 105, 122, 101, 114, 95, 108, 105, 115, 116,
+60, 84, 62, 32, 95, 105, 108, 59, 32, 115, 116, 100, 58, 58, 105, 110,
+105, 116, 105, 97, 108, 105, 122, 101, 114, 95, 108, 105, 115, 116,
+60, 84, 62, 58, 58, 105, 116, 101, 114, 97, 116, 111, 114, 32, 114,
+101, 102, 59, 32, 115, 105, 122, 101, 95, 116, 32, 115, 105, 122, 101,
+44, 32, 105, 110, 100, 101, 120, 59, 125, 32, 92, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 105, 116, 32, 61, 32, 123, 46, 95,
+105, 108, 61, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 44, 32, 46,
+114, 101, 102, 61, 105, 116, 46, 95, 105, 108, 46, 98, 101, 103, 105,
+110, 40, 41, 44, 32, 46, 115, 105, 122, 101, 61, 105, 116, 46, 95,
+105, 108, 46, 115, 105, 122, 101, 40, 41, 125, 32, 92, 10, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 59, 32, 105, 116, 46, 105,
+110, 100, 101, 120, 32, 60, 32, 105, 116, 46, 115, 105, 122, 101, 59,
+32, 43, 43, 105, 116, 46, 114, 101, 102, 44, 32, 43, 43, 105, 116, 46,
+105, 110, 100, 101, 120, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 115, 116, 99, 95, 104, 97, 115, 104, 95, 109, 105,
+120, 40, 46, 46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+95, 115, 116, 99, 95, 104, 97, 115, 104, 95, 109, 105, 120, 40, 115,
+116, 100, 58, 58, 97, 114, 114, 97, 121, 60, 117, 105, 110, 116, 54,
+52, 95, 116, 44, 32, 99, 95, 78, 85, 77, 65, 82, 71, 83, 40, 95, 95,
+86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 62, 123, 95, 95, 86, 65, 95,
+65, 82, 71, 83, 95, 95, 125, 46, 100, 97, 116, 97, 40, 41, 44, 32, 99,
+95, 78, 85, 77, 65, 82, 71, 83, 40, 95, 95, 86, 65, 95, 65, 82, 71,
+83, 95, 95, 41, 41, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 100, 101, 102, 101, 114, 40, 46,
+46, 46, 41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 105,
+110, 116, 32, 95, 105, 32, 61, 32, 49, 59, 32, 95, 105, 59, 32, 95,
+105, 32, 61, 32, 48, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95,
+95, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 119,
+105, 116, 104, 40, 46, 46, 46, 41, 32, 99, 95, 77, 65, 67, 82, 79, 95,
+79, 86, 69, 82, 76, 79, 65, 68, 40, 99, 95, 119, 105, 116, 104, 44,
+32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 119, 105, 116, 104, 95, 50, 40, 100,
+101, 99, 108, 118, 97, 114, 44, 32, 100, 114, 111, 112, 41, 32, 92,
+10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 100, 101, 99, 108, 118, 97,
+114, 44, 32, 42, 95, 105, 44, 32, 42, 42, 95, 105, 112, 32, 61, 32,
+38, 95, 105, 59, 32, 95, 105, 112, 59, 32, 95, 105, 112, 32, 61, 32,
+48, 44, 32, 100, 114, 111, 112, 41, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 119, 105, 116, 104, 95, 51, 40, 100, 101, 99, 108,
+118, 97, 114, 44, 32, 112, 114, 101, 100, 44, 32, 100, 114, 111, 112,
+41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 100, 101, 99,
+108, 118, 97, 114, 44, 32, 42, 95, 105, 44, 32, 42, 42, 95, 105, 112,
+32, 61, 32, 38, 95, 105, 59, 32, 95, 105, 112, 32, 38, 38, 32, 40,
+112, 114, 101, 100, 41, 59, 32, 95, 105, 112, 32, 61, 32, 48, 44, 32,
+100, 114, 111, 112, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 115, 99, 111, 112, 101, 40, 46, 46, 46, 41, 32, 99, 95, 77,
+65, 67, 82, 79, 95, 79, 86, 69, 82, 76, 79, 65, 68, 40, 99, 95, 115,
+99, 111, 112, 101, 44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95,
+41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 99, 111,
+112, 101, 95, 50, 40, 105, 110, 105, 116, 44, 32, 100, 114, 111, 112,
+41, 32, 92, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 105, 110, 116,
+32, 95, 105, 32, 61, 32, 40, 105, 110, 105, 116, 44, 32, 49, 41, 59,
+32, 95, 105, 59, 32, 95, 105, 32, 61, 32, 48, 44, 32, 100, 114, 111,
+112, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 115, 99,
+111, 112, 101, 95, 51, 40, 105, 110, 105, 116, 44, 32, 112, 114, 101,
+100, 44, 32, 100, 114, 111, 112, 41, 32, 92, 10, 32, 32, 32, 32, 102,
+111, 114, 32, 40, 105, 110, 116, 32, 95, 105, 32, 61, 32, 40, 105,
+110, 105, 116, 44, 32, 49, 41, 59, 32, 95, 105, 32, 38, 38, 32, 40,
+112, 114, 101, 100, 41, 59, 32, 95, 105, 32, 61, 32, 48, 44, 32, 100,
+114, 111, 112, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99,
+95, 100, 114, 111, 112, 40, 67, 44, 32, 46, 46, 46, 41, 32, 92, 10,
+32, 32, 32, 32, 100, 111, 32, 123, 32, 99, 95, 102, 111, 114, 108,
+105, 115, 116, 32, 40, 95, 105, 44, 32, 67, 42, 44, 32, 123, 95, 95,
+86, 65, 95, 65, 82, 71, 83, 95, 95, 125, 41, 32, 67, 35, 35, 95, 100,
+114, 111, 112, 40, 42, 95, 105, 46, 114, 101, 102, 41, 59, 32, 125,
+32, 119, 104, 105, 108, 101, 40, 48, 41, 10, 10, 35, 105, 102, 32,
+100, 101, 102, 105, 110, 101, 100, 40, 95, 95, 83, 73, 90, 69, 79, 70,
+95, 73, 78, 84, 49, 50, 56, 95, 95, 41, 10, 32, 32, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 99, 95, 117, 109, 117, 108, 49, 50, 56,
+40, 97, 44, 32, 98, 44, 32, 108, 111, 44, 32, 104, 105, 41, 32, 92,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 100, 111, 32, 123, 32, 95, 95,
+117, 105, 110, 116, 49, 50, 56, 95, 116, 32, 95, 122, 32, 61, 32, 40,
+95, 95, 117, 105, 110, 116, 49, 50, 56, 95, 116, 41, 40, 97, 41, 42,
+40, 98, 41, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 42, 40, 108, 111, 41, 32, 61, 32, 40, 117, 105, 110, 116,
+54, 52, 95, 116, 41, 95, 122, 44, 32, 42, 40, 104, 105, 41, 32, 61,
+32, 40, 117, 105, 110, 116, 54, 52, 95, 116, 41, 40, 95, 122, 32, 62,
+62, 32, 54, 52, 85, 41, 59, 32, 125, 32, 119, 104, 105, 108, 101, 40,
+48, 41, 10, 35, 101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101,
+100, 40, 95, 77, 83, 67, 95, 86, 69, 82, 41, 32, 38, 38, 32, 100, 101,
+102, 105, 110, 101, 100, 40, 95, 87, 73, 78, 54, 52, 41, 10, 47, 47,
+32, 69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103,
+101, 110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101,
+97, 100, 101, 114, 115, 46, 112, 121, 32, 32, 32, 32, 32, 35, 105,
+110, 99, 108, 117, 100, 101, 32, 60, 105, 110, 116, 114, 105, 110, 46,
+104, 62, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 99,
+95, 117, 109, 117, 108, 49, 50, 56, 40, 97, 44, 32, 98, 44, 32, 108,
+111, 44, 32, 104, 105, 41, 32, 40, 40, 118, 111, 105, 100, 41, 40, 42,
+40, 108, 111, 41, 32, 61, 32, 95, 117, 109, 117, 108, 49, 50, 56, 40,
+97, 44, 32, 98, 44, 32, 104, 105, 41, 41, 41, 10, 35, 101, 108, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 40, 95, 95, 120, 56, 54,
+95, 54, 52, 95, 95, 41, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 117, 109, 117, 108, 49, 50, 56, 40, 97, 44, 32,
+98, 44, 32, 108, 111, 44, 32, 104, 105, 41, 32, 92, 10, 32, 32, 32,
+32, 32, 32, 32, 32, 97, 115, 109, 40, 34, 109, 117, 108, 113, 32, 37,
+51, 34, 32, 58, 32, 34, 61, 97, 34, 40, 42, 40, 108, 111, 41, 41, 44,
+32, 34, 61, 100, 34, 40, 42, 40, 104, 105, 41, 41, 32, 58, 32, 34, 97,
+34, 40, 97, 41, 44, 32, 34, 114, 109, 34, 40, 98, 41, 41, 10, 35, 101,
+110, 100, 105, 102, 10, 10, 35, 101, 110, 100, 105, 102, 32, 47, 47,
+32, 67, 67, 79, 77, 77, 79, 78, 95, 72, 95, 73, 78, 67, 76, 85, 68,
+69, 68, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78, 68, 95, 70, 73, 76,
+69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 99, 99, 111, 109, 109,
+111, 110, 46, 104, 10, 47, 47, 32, 35, 35, 35, 32, 66, 69, 71, 73, 78,
+95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 102, 111,
+114, 119, 97, 114, 100, 46, 104, 10, 35, 105, 102, 110, 100, 101, 102,
+32, 83, 84, 67, 95, 70, 79, 82, 87, 65, 82, 68, 95, 72, 95, 73, 78,
+67, 76, 85, 68, 69, 68, 10, 35, 100, 101, 102, 105, 110, 101, 32, 83,
+84, 67, 95, 70, 79, 82, 87, 65, 82, 68, 95, 72, 95, 73, 78, 67, 76,
+85, 68, 69, 68, 10, 10, 47, 47, 32, 69, 88, 67, 76, 85, 68, 69, 68,
+32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99, 111, 110, 116, 97,
+105, 110, 101, 114, 95, 104, 101, 97, 100, 101, 114, 115, 46, 112,
+121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60, 115, 116, 100,
+105, 110, 116, 46, 104, 62, 10, 47, 47, 32, 69, 88, 67, 76, 85, 68,
+69, 68, 32, 66, 89, 32, 114, 101, 103, 101, 110, 95, 99, 111, 110,
+116, 97, 105, 110, 101, 114, 95, 104, 101, 97, 100, 101, 114, 115, 46,
+112, 121, 32, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60, 115, 116,
+100, 100, 101, 102, 46, 104, 62, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 97, 114, 99, 40,
+67, 44, 32, 86, 65, 76, 41, 32, 95, 99, 95, 99, 97, 114, 99, 95, 116,
+121, 112, 101, 115, 40, 67, 44, 32, 86, 65, 76, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 98,
+111, 120, 40, 67, 44, 32, 86, 65, 76, 41, 32, 95, 99, 95, 99, 98, 111,
+120, 95, 116, 121, 112, 101, 115, 40, 67, 44, 32, 86, 65, 76, 41, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114,
+100, 95, 99, 100, 101, 113, 40, 67, 44, 32, 86, 65, 76, 41, 32, 95,
+99, 95, 99, 100, 101, 113, 95, 116, 121, 112, 101, 115, 40, 67, 44,
+32, 86, 65, 76, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102,
+111, 114, 119, 97, 114, 100, 95, 99, 108, 105, 115, 116, 40, 67, 44,
+32, 86, 65, 76, 41, 32, 95, 99, 95, 99, 108, 105, 115, 116, 95, 116,
+121, 112, 101, 115, 40, 67, 44, 32, 86, 65, 76, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 109,
+97, 112, 40, 67, 44, 32, 75, 69, 89, 44, 32, 86, 65, 76, 41, 32, 95,
+99, 95, 99, 104, 97, 115, 104, 95, 116, 121, 112, 101, 115, 40, 67,
+44, 32, 75, 69, 89, 44, 32, 86, 65, 76, 44, 32, 99, 95, 116, 114, 117,
+101, 44, 32, 99, 95, 102, 97, 108, 115, 101, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 115,
+101, 116, 40, 67, 44, 32, 75, 69, 89, 41, 32, 95, 99, 95, 99, 104, 97,
+115, 104, 95, 116, 121, 112, 101, 115, 40, 67, 44, 32, 99, 115, 101,
+116, 44, 32, 75, 69, 89, 44, 32, 75, 69, 89, 44, 32, 99, 95, 102, 97,
+108, 115, 101, 44, 32, 99, 95, 116, 114, 117, 101, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99,
+115, 109, 97, 112, 40, 67, 44, 32, 75, 69, 89, 44, 32, 86, 65, 76, 41,
+32, 95, 99, 95, 97, 97, 116, 114, 101, 101, 95, 116, 121, 112, 101,
+115, 40, 67, 44, 32, 75, 69, 89, 44, 32, 86, 65, 76, 44, 32, 99, 95,
+116, 114, 117, 101, 44, 32, 99, 95, 102, 97, 108, 115, 101, 41, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114,
+100, 95, 99, 115, 115, 101, 116, 40, 67, 44, 32, 75, 69, 89, 41, 32,
+95, 99, 95, 97, 97, 116, 114, 101, 101, 95, 116, 121, 112, 101, 115,
+40, 67, 44, 32, 75, 69, 89, 44, 32, 75, 69, 89, 44, 32, 99, 95, 102,
+97, 108, 115, 101, 44, 32, 99, 95, 116, 114, 117, 101, 41, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100,
+95, 99, 115, 116, 97, 99, 107, 40, 67, 44, 32, 86, 65, 76, 41, 32, 95,
+99, 95, 99, 115, 116, 97, 99, 107, 95, 116, 121, 112, 101, 115, 40,
+67, 44, 32, 86, 65, 76, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+102, 111, 114, 119, 97, 114, 100, 95, 99, 112, 113, 117, 101, 40, 67,
+44, 32, 86, 65, 76, 41, 32, 95, 99, 95, 99, 112, 113, 117, 101, 95,
+116, 121, 112, 101, 115, 40, 67, 44, 32, 86, 65, 76, 41, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99,
+113, 117, 101, 117, 101, 40, 67, 44, 32, 86, 65, 76, 41, 32, 95, 99,
+95, 99, 100, 101, 113, 95, 116, 121, 112, 101, 115, 40, 67, 44, 32,
+86, 65, 76, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 99, 118, 101, 99, 40, 67, 44, 32, 86, 65,
+76, 41, 32, 95, 99, 95, 99, 118, 101, 99, 95, 116, 121, 112, 101, 115,
+40, 67, 44, 32, 86, 65, 76, 41, 10, 47, 47, 32, 97, 108, 116, 101,
+114, 110, 97, 116, 105, 118, 101, 32, 110, 97, 109, 101, 115, 32, 40,
+105, 110, 99, 108, 117, 100, 101, 47, 115, 116, 120, 41, 58, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100,
+95, 97, 114, 99, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 97,
+114, 99, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119,
+97, 114, 100, 95, 98, 111, 120, 32, 102, 111, 114, 119, 97, 114, 100,
+95, 99, 98, 111, 120, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102,
+111, 114, 119, 97, 114, 100, 95, 100, 101, 113, 32, 102, 111, 114,
+119, 97, 114, 100, 95, 99, 100, 101, 113, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 108, 105, 115,
+116, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 108, 105, 115, 116,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114,
+100, 95, 104, 109, 97, 112, 32, 102, 111, 114, 119, 97, 114, 100, 95,
+99, 109, 97, 112, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 104, 115, 101, 116, 32, 102, 111, 114,
+119, 97, 114, 100, 95, 99, 115, 101, 116, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 115, 109, 97, 112,
+32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 115, 109, 97, 112, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114,
+100, 95, 115, 115, 101, 116, 32, 102, 111, 114, 119, 97, 114, 100, 95,
+99, 115, 115, 101, 116, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102,
+111, 114, 119, 97, 114, 100, 95, 115, 116, 97, 99, 107, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 99, 115, 116, 97, 99, 107, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95,
+112, 113, 117, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 112,
+113, 117, 101, 10, 35, 100, 101, 102, 105, 110, 101, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 113, 117, 101, 117, 101, 32, 102, 111,
+114, 119, 97, 114, 100, 95, 99, 113, 117, 101, 117, 101, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 102, 111, 114, 119, 97, 114, 100, 95,
+118, 101, 99, 32, 102, 111, 114, 119, 97, 114, 100, 95, 99, 118, 101,
+99, 10, 10, 47, 47, 32, 99, 115, 118, 105, 101, 119, 32, 58, 32, 110,
+111, 110, 45, 110, 117, 108, 108, 32, 116, 101, 114, 109, 105, 110,
+97, 116, 101, 100, 32, 115, 116, 114, 105, 110, 103, 32, 118, 105,
+101, 119, 10, 116, 121, 112, 101, 100, 101, 102, 32, 99, 111, 110,
+115, 116, 32, 99, 104, 97, 114, 32, 99, 115, 118, 105, 101, 119, 95,
+118, 97, 108, 117, 101, 59, 10, 116, 121, 112, 101, 100, 101, 102, 32,
+115, 116, 114, 117, 99, 116, 32, 99, 115, 118, 105, 101, 119, 32, 123,
+10, 32, 32, 32, 32, 99, 115, 118, 105, 101, 119, 95, 118, 97, 108,
+117, 101, 42, 32, 98, 117, 102, 59, 10, 32, 32, 32, 32, 105, 110, 116,
+112, 116, 114, 95, 116, 32, 115, 105, 122, 101, 59, 10, 125, 32, 99,
+115, 118, 105, 101, 119, 59, 10, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 117, 110, 105, 111, 110, 32, 123, 10, 32, 32, 32, 32, 99,
+115, 118, 105, 101, 119, 95, 118, 97, 108, 117, 101, 42, 32, 114, 101,
+102, 59, 10, 32, 32, 32, 32, 99, 115, 118, 105, 101, 119, 32, 99, 104,
+114, 59, 10, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32,
+99, 115, 118, 105, 101, 119, 32, 99, 104, 114, 59, 32, 99, 115, 118,
+105, 101, 119, 95, 118, 97, 108, 117, 101, 42, 32, 101, 110, 100, 59,
+32, 125, 32, 117, 56, 59, 10, 125, 32, 99, 115, 118, 105, 101, 119,
+95, 105, 116, 101, 114, 59, 10, 10, 10, 47, 47, 32, 99, 114, 97, 119,
+115, 116, 114, 32, 58, 32, 110, 117, 108, 108, 45, 116, 101, 114, 109,
+105, 110, 97, 116, 101, 100, 32, 115, 116, 114, 105, 110, 103, 32,
+118, 105, 101, 119, 10, 116, 121, 112, 101, 100, 101, 102, 32, 99,
+115, 118, 105, 101, 119, 95, 118, 97, 108, 117, 101, 32, 99, 114, 97,
+119, 115, 116, 114, 95, 118, 97, 108, 117, 101, 59, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 99, 114, 97,
+119, 115, 116, 114, 32, 123, 10, 32, 32, 32, 32, 99, 114, 97, 119,
+115, 116, 114, 95, 118, 97, 108, 117, 101, 42, 32, 115, 116, 114, 59,
+10, 32, 32, 32, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 115,
+105, 122, 101, 59, 10, 125, 32, 99, 114, 97, 119, 115, 116, 114, 59,
+10, 10, 116, 121, 112, 101, 100, 101, 102, 32, 117, 110, 105, 111,
+110, 32, 123, 10, 32, 32, 32, 32, 99, 114, 97, 119, 115, 116, 114, 95,
+118, 97, 108, 117, 101, 42, 32, 114, 101, 102, 59, 10, 32, 32, 32, 32,
+99, 115, 118, 105, 101, 119, 32, 99, 104, 114, 59, 10, 125, 32, 99,
+114, 97, 119, 115, 116, 114, 95, 105, 116, 101, 114, 59, 10, 10, 10,
+47, 47, 32, 99, 115, 116, 114, 32, 58, 32, 110, 117, 108, 108, 45,
+116, 101, 114, 109, 105, 110, 97, 116, 101, 100, 32, 111, 119, 110,
+105, 110, 103, 32, 115, 116, 114, 105, 110, 103, 32, 40, 115, 104,
+111, 114, 116, 32, 115, 116, 114, 105, 110, 103, 32, 111, 112, 116,
+105, 109, 105, 122, 101, 100, 32, 45, 32, 115, 115, 111, 41, 10, 116,
+121, 112, 101, 100, 101, 102, 32, 99, 104, 97, 114, 32, 99, 115, 116,
+114, 95, 118, 97, 108, 117, 101, 59, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32, 99, 115, 116, 114,
+95, 118, 97, 108, 117, 101, 42, 32, 100, 97, 116, 97, 59, 32, 105,
+110, 116, 112, 116, 114, 95, 116, 32, 115, 105, 122, 101, 44, 32, 99,
+97, 112, 59, 32, 125, 32, 99, 115, 116, 114, 95, 98, 117, 102, 59, 10,
+116, 121, 112, 101, 100, 101, 102, 32, 117, 110, 105, 111, 110, 32,
+99, 115, 116, 114, 32, 123, 10, 32, 32, 32, 32, 115, 116, 114, 117,
+99, 116, 32, 123, 32, 99, 115, 116, 114, 95, 118, 97, 108, 117, 101,
+32, 100, 97, 116, 97, 91, 32, 115, 105, 122, 101, 111, 102, 40, 99,
+115, 116, 114, 95, 98, 117, 102, 41, 32, 93, 59, 32, 125, 32, 115,
+109, 108, 59, 10, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32,
+123, 32, 99, 115, 116, 114, 95, 118, 97, 108, 117, 101, 42, 32, 100,
+97, 116, 97, 59, 32, 115, 105, 122, 101, 95, 116, 32, 115, 105, 122,
+101, 44, 32, 110, 99, 97, 112, 59, 32, 125, 32, 108, 111, 110, 59, 10,
+125, 32, 99, 115, 116, 114, 59, 10, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 117, 110, 105, 111, 110, 32, 123, 10, 32, 32, 32, 32, 99,
+115, 116, 114, 95, 118, 97, 108, 117, 101, 42, 32, 114, 101, 102, 59,
+10, 32, 32, 32, 32, 99, 115, 118, 105, 101, 119, 32, 99, 104, 114, 59,
+32, 47, 47, 32, 117, 116, 102, 56, 32, 99, 104, 97, 114, 97, 99, 116,
+101, 114, 47, 99, 111, 100, 101, 112, 111, 105, 110, 116, 10, 125, 32,
+99, 115, 116, 114, 95, 105, 116, 101, 114, 59, 10, 10, 10, 35, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 71, 78, 85,
+67, 95, 95, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+95, 95, 99, 108, 97, 110, 103, 95, 95, 32, 124, 124, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 95, 77, 83, 67, 95, 86, 69, 82, 10, 32,
+32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 108, 111, 110, 103,
+32, 99, 97, 116, 111, 109, 105, 99, 95, 108, 111, 110, 103, 59, 10,
+35, 101, 108, 115, 101, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100,
+101, 102, 32, 95, 65, 116, 111, 109, 105, 99, 40, 108, 111, 110, 103,
+41, 32, 99, 97, 116, 111, 109, 105, 99, 95, 108, 111, 110, 103, 59,
+10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 116, 114, 117, 101, 40, 46, 46, 46, 41, 32, 95, 95,
+86, 65, 95, 65, 82, 71, 83, 95, 95, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 99, 95, 102, 97, 108, 115, 101, 40, 46, 46, 46, 41, 10, 10,
+35, 100, 101, 102, 105, 110, 101, 32, 95, 99, 95, 99, 97, 114, 99, 95,
+116, 121, 112, 101, 115, 40, 83, 69, 76, 70, 44, 32, 86, 65, 76, 41,
+32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 86,
+65, 76, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 59,
+32, 92, 10, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117,
+99, 116, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117, 116, 101, 95,
+95, 40, 40, 109, 101, 116, 104, 111, 100, 99, 97, 108, 108, 40, 83,
+69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70, 32, 123, 32,
+92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95,
+118, 97, 108, 117, 101, 42, 32, 103, 101, 116, 59, 32, 92, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 99, 97, 116, 111, 109, 105, 99, 95, 108, 111,
+110, 103, 42, 32, 117, 115, 101, 95, 99, 111, 117, 110, 116, 59, 32,
+92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 95, 99, 95, 99, 98, 111, 120, 95, 116, 121,
+112, 101, 115, 40, 83, 69, 76, 70, 44, 32, 86, 65, 76, 41, 32, 92, 10,
+32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 86, 65, 76, 32,
+83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92, 10,
+116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116,
+32, 95, 95, 97, 116, 116, 114, 105, 98, 117, 116, 101, 95, 95, 40, 40,
+109, 101, 116, 104, 111, 100, 99, 97, 108, 108, 40, 83, 69, 76, 70,
+35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70, 32, 123, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108,
+117, 101, 42, 32, 103, 101, 116, 59, 32, 92, 10, 32, 32, 32, 32, 125,
+32, 83, 69, 76, 70, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+99, 95, 99, 100, 101, 113, 95, 116, 121, 112, 101, 115, 40, 83, 69,
+76, 70, 44, 32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121,
+112, 101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35,
+95, 118, 97, 108, 117, 101, 59, 32, 92, 10, 92, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97,
+116, 116, 114, 105, 98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116,
+104, 111, 100, 99, 97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41,
+41, 41, 32, 83, 69, 76, 70, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32,
+42, 99, 98, 117, 102, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+105, 110, 116, 112, 116, 114, 95, 116, 32, 115, 116, 97, 114, 116, 44,
+32, 101, 110, 100, 44, 32, 99, 97, 112, 109, 97, 115, 107, 59, 32, 92,
+10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 59, 32, 92, 10, 92, 10,
+32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114,
+117, 99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83,
+69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102,
+59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 105, 110, 116, 112,
+116, 114, 95, 116, 32, 112, 111, 115, 59, 32, 92, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 99, 111, 110, 115, 116, 32, 83, 69, 76, 70, 42, 32,
+95, 115, 59, 32, 92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 35,
+35, 95, 105, 116, 101, 114, 10, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 95, 99, 95, 99, 108, 105, 115, 116, 95, 116, 121, 112, 101, 115,
+40, 83, 69, 76, 70, 44, 32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32,
+32, 116, 121, 112, 101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76,
+70, 35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92, 10, 32, 32, 32,
+32, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99,
+116, 32, 83, 69, 76, 70, 35, 35, 95, 110, 111, 100, 101, 32, 83, 69,
+76, 70, 35, 35, 95, 110, 111, 100, 101, 59, 32, 92, 10, 92, 10, 32,
+32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117,
+99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69,
+76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102, 59,
+32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35,
+95, 110, 111, 100, 101, 32, 42, 99, 111, 110, 115, 116, 32, 42, 95,
+108, 97, 115, 116, 44, 32, 42, 112, 114, 101, 118, 59, 32, 92, 10, 32,
+32, 32, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95, 105, 116, 101, 114,
+59, 32, 92, 10, 92, 10, 116, 121, 112, 101, 100, 101, 102, 32, 115,
+116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117,
+116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111, 100, 99, 97, 108,
+108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70,
+32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70,
+35, 35, 95, 110, 111, 100, 101, 32, 42, 108, 97, 115, 116, 59, 32, 92,
+10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 95, 99, 95, 99, 104, 97, 115, 104, 95, 116,
+121, 112, 101, 115, 40, 83, 69, 76, 70, 44, 32, 75, 69, 89, 44, 32,
+86, 65, 76, 44, 32, 77, 65, 80, 95, 79, 78, 76, 89, 44, 32, 83, 69,
+84, 95, 79, 78, 76, 89, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112,
+101, 100, 101, 102, 32, 75, 69, 89, 32, 83, 69, 76, 70, 35, 35, 95,
+107, 101, 121, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101,
+100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35, 95, 109,
+97, 112, 112, 101, 100, 59, 32, 92, 10, 92, 10, 32, 32, 32, 32, 116,
+121, 112, 101, 100, 101, 102, 32, 83, 69, 84, 95, 79, 78, 76, 89, 40,
+32, 83, 69, 76, 70, 35, 35, 95, 107, 101, 121, 32, 41, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 77, 65, 80, 95, 79, 78,
+76, 89, 40, 32, 115, 116, 114, 117, 99, 116, 32, 83, 69, 76, 70, 35,
+35, 95, 118, 97, 108, 117, 101, 32, 41, 32, 92, 10, 32, 32, 32, 32,
+83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92, 10,
+92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32, 115,
+116, 114, 117, 99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42,
+114, 101, 102, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95, 66,
+111, 111, 108, 32, 105, 110, 115, 101, 114, 116, 101, 100, 59, 32, 92,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 117, 105, 110, 116, 56, 95, 116,
+32, 104, 97, 115, 104, 120, 59, 32, 92, 10, 32, 32, 32, 32, 125, 32,
+83, 69, 76, 70, 35, 35, 95, 114, 101, 115, 117, 108, 116, 59, 32, 92,
+10, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32,
+115, 116, 114, 117, 99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32,
+42, 114, 101, 102, 44, 32, 42, 95, 101, 110, 100, 59, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 115, 116, 114, 117, 99, 116, 32, 99, 104,
+97, 115, 104, 95, 115, 108, 111, 116, 32, 42, 95, 115, 114, 101, 102,
+59, 32, 92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95,
+105, 116, 101, 114, 59, 32, 92, 10, 92, 10, 116, 121, 112, 101, 100,
+101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116,
+114, 105, 98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111,
+100, 99, 97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32,
+83, 69, 76, 70, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 42, 32, 116, 97,
+98, 108, 101, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 115,
+116, 114, 117, 99, 116, 32, 99, 104, 97, 115, 104, 95, 115, 108, 111,
+116, 42, 32, 115, 108, 111, 116, 59, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 115, 105, 122,
+101, 44, 32, 98, 117, 99, 107, 101, 116, 95, 99, 111, 117, 110, 116,
+59, 32, 92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 95, 99, 95, 97, 97, 116, 114, 101,
+101, 95, 116, 121, 112, 101, 115, 40, 83, 69, 76, 70, 44, 32, 75, 69,
+89, 44, 32, 86, 65, 76, 44, 32, 77, 65, 80, 95, 79, 78, 76, 89, 44,
+32, 83, 69, 84, 95, 79, 78, 76, 89, 41, 32, 92, 10, 32, 32, 32, 32,
+116, 121, 112, 101, 100, 101, 102, 32, 75, 69, 89, 32, 83, 69, 76, 70,
+35, 35, 95, 107, 101, 121, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121,
+112, 101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35,
+95, 109, 97, 112, 112, 101, 100, 59, 32, 92, 10, 32, 32, 32, 32, 116,
+121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 83,
+69, 76, 70, 35, 35, 95, 110, 111, 100, 101, 32, 83, 69, 76, 70, 35,
+35, 95, 110, 111, 100, 101, 59, 32, 92, 10, 92, 10, 32, 32, 32, 32,
+116, 121, 112, 101, 100, 101, 102, 32, 83, 69, 84, 95, 79, 78, 76, 89,
+40, 32, 83, 69, 76, 70, 35, 35, 95, 107, 101, 121, 32, 41, 32, 92, 10,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 77, 65, 80, 95, 79,
+78, 76, 89, 40, 32, 115, 116, 114, 117, 99, 116, 32, 83, 69, 76, 70,
+35, 35, 95, 118, 97, 108, 117, 101, 32, 41, 32, 92, 10, 32, 32, 32,
+32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92,
+10, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102, 32,
+115, 116, 114, 117, 99, 116, 32, 123, 32, 92, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32,
+42, 114, 101, 102, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 95,
+66, 111, 111, 108, 32, 105, 110, 115, 101, 114, 116, 101, 100, 59, 32,
+92, 10, 32, 32, 32, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95, 114, 101,
+115, 117, 108, 116, 59, 32, 92, 10, 92, 10, 32, 32, 32, 32, 116, 121,
+112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32,
+92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95,
+118, 97, 108, 117, 101, 32, 42, 114, 101, 102, 59, 32, 92, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 110, 111, 100,
+101, 32, 42, 95, 100, 59, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+105, 110, 116, 32, 95, 116, 111, 112, 59, 32, 92, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 105, 110, 116, 51, 50, 95, 116, 32, 95, 116, 110, 44,
+32, 95, 115, 116, 91, 51, 54, 93, 59, 32, 92, 10, 32, 32, 32, 32, 125,
+32, 83, 69, 76, 70, 35, 35, 95, 105, 116, 101, 114, 59, 32, 92, 10,
+92, 10, 116, 121, 112, 101, 100, 101, 102, 32, 115, 116, 114, 117, 99,
+116, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117, 116, 101, 95, 95,
+40, 40, 109, 101, 116, 104, 111, 100, 99, 97, 108, 108, 40, 83, 69,
+76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70, 32, 123, 32, 92,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 83, 69, 76, 70, 35, 35, 95, 110,
+111, 100, 101, 32, 42, 110, 111, 100, 101, 115, 59, 32, 92, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 105, 110, 116, 51, 50, 95, 116, 32, 114,
+111, 111, 116, 44, 32, 100, 105, 115, 112, 44, 32, 104, 101, 97, 100,
+44, 32, 115, 105, 122, 101, 44, 32, 99, 97, 112, 59, 32, 92, 10, 32,
+32, 32, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 95, 99, 95, 99, 115, 116, 97, 99, 107, 95, 102, 105,
+120, 101, 100, 40, 83, 69, 76, 70, 44, 32, 86, 65, 76, 44, 32, 67, 65,
+80, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101, 102,
+32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117,
+101, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101, 100, 101,
+102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32, 83, 69, 76, 70, 35,
+35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102, 44, 32, 42,
+101, 110, 100, 59, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95, 105, 116,
+101, 114, 59, 32, 92, 10, 116, 121, 112, 101, 100, 101, 102, 32, 115,
+116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116, 114, 105, 98, 117,
+116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111, 100, 99, 97, 108,
+108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69, 76, 70,
+32, 123, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32,
+100, 97, 116, 97, 91, 67, 65, 80, 93, 59, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 95, 108, 101, 110, 59, 32, 125, 32, 83, 69, 76, 70,
+10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 99, 95, 99, 115,
+116, 97, 99, 107, 95, 116, 121, 112, 101, 115, 40, 83, 69, 76, 70, 44,
+32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101,
+100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35, 95, 118,
+97, 108, 117, 101, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112, 101,
+100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32, 83, 69,
+76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102, 44,
+32, 42, 101, 110, 100, 59, 32, 125, 32, 83, 69, 76, 70, 35, 35, 95,
+105, 116, 101, 114, 59, 32, 92, 10, 116, 121, 112, 101, 100, 101, 102,
+32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116, 114, 105,
+98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111, 100, 99,
+97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83, 69,
+76, 70, 32, 123, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108, 117,
+101, 42, 32, 100, 97, 116, 97, 59, 32, 105, 110, 116, 112, 116, 114,
+95, 116, 32, 95, 108, 101, 110, 44, 32, 95, 99, 97, 112, 59, 32, 125,
+32, 83, 69, 76, 70, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+99, 95, 99, 118, 101, 99, 95, 116, 121, 112, 101, 115, 40, 83, 69, 76,
+70, 44, 32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112,
+101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70, 35, 35, 95,
+118, 97, 108, 117, 101, 59, 32, 92, 10, 32, 32, 32, 32, 116, 121, 112,
+101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 32, 83,
+69, 76, 70, 35, 35, 95, 118, 97, 108, 117, 101, 32, 42, 114, 101, 102,
+44, 32, 42, 101, 110, 100, 59, 32, 125, 32, 83, 69, 76, 70, 35, 35,
+95, 105, 116, 101, 114, 59, 32, 92, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97, 116, 116, 114,
+105, 98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116, 104, 111, 100,
+99, 97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41, 41, 41, 32, 83,
+69, 76, 70, 32, 123, 32, 83, 69, 76, 70, 35, 35, 95, 118, 97, 108,
+117, 101, 32, 42, 100, 97, 116, 97, 59, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 95, 108, 101, 110, 44, 32, 95, 99, 97, 112, 59, 32,
+125, 32, 83, 69, 76, 70, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+95, 99, 95, 99, 112, 113, 117, 101, 95, 116, 121, 112, 101, 115, 40,
+83, 69, 76, 70, 44, 32, 86, 65, 76, 41, 32, 92, 10, 32, 32, 32, 32,
+116, 121, 112, 101, 100, 101, 102, 32, 86, 65, 76, 32, 83, 69, 76, 70,
+35, 35, 95, 118, 97, 108, 117, 101, 59, 32, 92, 10, 116, 121, 112,
+101, 100, 101, 102, 32, 115, 116, 114, 117, 99, 116, 32, 95, 95, 97,
+116, 116, 114, 105, 98, 117, 116, 101, 95, 95, 40, 40, 109, 101, 116,
+104, 111, 100, 99, 97, 108, 108, 40, 83, 69, 76, 70, 35, 35, 95, 41,
+41, 41, 32, 83, 69, 76, 70, 32, 123, 32, 83, 69, 76, 70, 35, 35, 95,
+118, 97, 108, 117, 101, 42, 32, 100, 97, 116, 97, 59, 32, 105, 110,
+116, 112, 116, 114, 95, 116, 32, 95, 108, 101, 110, 44, 32, 95, 99,
+97, 112, 59, 32, 125, 32, 83, 69, 76, 70, 10, 10, 35, 101, 110, 100,
+105, 102, 32, 47, 47, 32, 83, 84, 67, 95, 70, 79, 82, 87, 65, 82, 68,
+95, 72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 47, 47, 32, 35, 35,
+35, 32, 69, 78, 68, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68,
+69, 58, 32, 102, 111, 114, 119, 97, 114, 100, 46, 104, 10, 47, 47, 32,
+69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101,
+110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97,
+100, 101, 114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100,
+101, 32, 60, 115, 116, 100, 108, 105, 98, 46, 104, 62, 10, 47, 47, 32,
+69, 88, 67, 76, 85, 68, 69, 68, 32, 66, 89, 32, 114, 101, 103, 101,
+110, 95, 99, 111, 110, 116, 97, 105, 110, 101, 114, 95, 104, 101, 97,
+100, 101, 114, 115, 46, 112, 121, 32, 35, 105, 110, 99, 108, 117, 100,
+101, 32, 60, 115, 116, 114, 105, 110, 103, 46, 104, 62, 10, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 95, 105, 116, 50, 95, 112, 116, 114,
+40, 105, 116, 49, 44, 32, 105, 116, 50, 41, 32, 40, 105, 116, 49, 46,
+114, 101, 102, 32, 38, 38, 32, 33, 105, 116, 50, 46, 114, 101, 102,
+32, 63, 32, 105, 116, 50, 46, 101, 110, 100, 32, 58, 32, 105, 116, 50,
+46, 114, 101, 102, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+105, 116, 95, 112, 116, 114, 40, 105, 116, 41, 32, 40, 105, 116, 46,
+114, 101, 102, 32, 63, 32, 105, 116, 46, 114, 101, 102, 32, 58, 32,
+105, 116, 46, 101, 110, 100, 41, 10, 35, 101, 110, 100, 105, 102, 32,
+47, 47, 32, 67, 86, 69, 67, 95, 72, 95, 73, 78, 67, 76, 85, 68, 69,
+68, 10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 95, 105, 95, 112,
+114, 101, 102, 105, 120, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 95, 105, 95, 112, 114, 101, 102, 105, 120, 32, 99, 118, 101, 99,
+95, 10, 35, 101, 110, 100, 105, 102, 10, 47, 47, 32, 35, 35, 35, 32,
+66, 69, 71, 73, 78, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68,
+69, 58, 32, 116, 101, 109, 112, 108, 97, 116, 101, 46, 104, 10, 35,
+105, 102, 110, 100, 101, 102, 32, 95, 105, 95, 116, 101, 109, 112,
+108, 97, 116, 101, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105,
+95, 116, 101, 109, 112, 108, 97, 116, 101, 10, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 83, 84, 67, 95, 84, 69, 77, 80, 76, 65, 84, 69, 95,
+72, 95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 83, 84, 67, 95, 84, 69, 77, 80, 76, 65, 84, 69, 95, 72,
+95, 73, 78, 67, 76, 85, 68, 69, 68, 10, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 99, 95, 77, 69, 77, 66, 40, 110, 97, 109, 101,
+41, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 116, 121, 112, 101, 44,
+32, 110, 97, 109, 101, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 95, 99, 95, 68, 69, 70, 84, 89, 80, 69, 83, 40, 109, 97, 99,
+114, 111, 44, 32, 83, 69, 76, 70, 44, 32, 46, 46, 46, 41, 32, 99, 95,
+69, 88, 80, 65, 78, 68, 40, 109, 97, 99, 114, 111, 40, 83, 69, 76, 70,
+44, 32, 95, 95, 86, 65, 95, 65, 82, 71, 83, 95, 95, 41, 41, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 109, 95, 118, 97, 108,
+117, 101, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 118, 97, 108, 117,
+101, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 109,
+95, 107, 101, 121, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 107, 101,
+121, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 109,
+95, 109, 97, 112, 112, 101, 100, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 109, 97, 112, 112, 101, 100, 41, 10, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 109, 95, 114, 109, 97, 112, 112, 101, 100, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 109, 97, 112, 112, 101, 100,
+41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 109, 95,
+114, 97, 119, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 97, 119,
+41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 109, 95,
+107, 101, 121, 114, 97, 119, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+107, 101, 121, 114, 97, 119, 41, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 95, 109, 95, 105, 116, 101, 114, 32, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 105, 116, 101, 114, 41, 10, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 95, 109, 95, 114, 101, 115, 117, 108, 116, 32, 95,
+99, 95, 77, 69, 77, 66, 40, 95, 114, 101, 115, 117, 108, 116, 41, 10,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 109, 95, 110, 111,
+100, 101, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 110, 111, 100, 101,
+41, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105, 102, 110, 100,
+101, 102, 32, 105, 95, 116, 121, 112, 101, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 116, 121, 112, 101, 32, 99, 95, 74,
+79, 73, 78, 40, 95, 105, 95, 112, 114, 101, 102, 105, 120, 44, 32,
+105, 95, 116, 97, 103, 41, 10, 35, 101, 110, 100, 105, 102, 10, 10,
+35, 105, 102, 100, 101, 102, 32, 105, 95, 107, 101, 121, 99, 108, 97,
+115, 115, 32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116,
+101, 100, 93, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 95, 99, 108, 97, 115, 115, 32, 105, 95, 107, 101,
+121, 99, 108, 97, 115, 115, 10, 35, 101, 110, 100, 105, 102, 10, 35,
+105, 102, 100, 101, 102, 32, 105, 95, 118, 97, 108, 99, 108, 97, 115,
+115, 32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116, 101,
+100, 93, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+118, 97, 108, 95, 99, 108, 97, 115, 115, 32, 105, 95, 118, 97, 108,
+99, 108, 97, 115, 115, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105,
+102, 100, 101, 102, 32, 105, 95, 114, 97, 119, 99, 108, 97, 115, 115,
+32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116, 101, 100,
+93, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 114,
+97, 119, 95, 99, 108, 97, 115, 115, 32, 105, 95, 114, 97, 119, 99,
+108, 97, 115, 115, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102,
+100, 101, 102, 32, 105, 95, 107, 101, 121, 98, 111, 120, 101, 100, 32,
+47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116, 101, 100, 93,
+10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101,
+121, 95, 97, 114, 99, 98, 111, 120, 32, 105, 95, 107, 101, 121, 98,
+111, 120, 101, 100, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102,
+100, 101, 102, 32, 105, 95, 118, 97, 108, 98, 111, 120, 101, 100, 32,
+47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116, 101, 100, 93,
+10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97,
+108, 95, 97, 114, 99, 98, 111, 120, 32, 105, 95, 118, 97, 108, 98,
+111, 120, 101, 100, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105,
+102, 32, 33, 40, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107,
+101, 121, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 95, 115, 116, 114, 32, 124, 124, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 95, 115, 115,
+118, 32, 124, 124, 32, 92, 10, 32, 32, 32, 32, 32, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 95, 99, 108, 97, 115,
+115, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+107, 101, 121, 95, 97, 114, 99, 98, 111, 120, 41, 10, 32, 32, 35, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 105, 95, 105, 115,
+109, 97, 112, 10, 32, 32, 32, 32, 35, 101, 114, 114, 111, 114, 32, 34,
+105, 95, 107, 101, 121, 42, 32, 109, 117, 115, 116, 32, 98, 101, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 102, 111, 114, 32, 109, 97,
+112, 115, 34, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 10, 32, 32,
+35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118,
+97, 108, 95, 115, 116, 114, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 105, 95, 107, 101, 121, 95, 115, 116, 114, 32, 105,
+95, 118, 97, 108, 95, 115, 116, 114, 10, 32, 32, 35, 101, 110, 100,
+105, 102, 10, 32, 32, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 118, 97, 108, 95, 115, 115, 118, 10, 32, 32, 32, 32,
+35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 95, 115,
+115, 118, 32, 105, 95, 118, 97, 108, 95, 115, 115, 118, 10, 32, 32,
+35, 101, 110, 100, 105, 102, 32, 32, 10, 32, 32, 35, 105, 102, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 95, 97,
+114, 99, 98, 111, 120, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 107, 101, 121, 95, 97, 114, 99, 98, 111, 120,
+32, 105, 95, 118, 97, 108, 95, 97, 114, 99, 98, 111, 120, 10, 32, 32,
+35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 95, 99, 108, 97,
+115, 115, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+105, 95, 107, 101, 121, 95, 99, 108, 97, 115, 115, 32, 105, 95, 118,
+97, 108, 95, 99, 108, 97, 115, 115, 10, 32, 32, 35, 101, 110, 100,
+105, 102, 10, 32, 32, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 118, 97, 108, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 105, 95, 107, 101, 121, 32, 105, 95, 118, 97, 108,
+10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 114, 97,
+119, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 114, 97, 119, 32, 105, 95, 118, 97, 108, 114, 97,
+119, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105,
+102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108,
+99, 108, 111, 110, 101, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 107, 101, 121, 99, 108, 111, 110, 101, 32, 105,
+95, 118, 97, 108, 99, 108, 111, 110, 101, 10, 32, 32, 35, 101, 110,
+100, 105, 102, 10, 32, 32, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 10, 32, 32,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121,
+102, 114, 111, 109, 32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 10,
+32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 116,
+111, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 116, 111, 32, 105, 95, 118, 97, 108, 116, 111, 10,
+32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 100,
+114, 111, 112, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 32, 105, 95, 118, 97,
+108, 100, 114, 111, 112, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10,
+35, 101, 110, 100, 105, 102, 10, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 99, 95, 111, 112, 116, 105, 111, 110, 40, 102, 108, 97, 103, 41,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 40, 105, 95, 111, 112,
+116, 41, 32, 38, 32, 40, 102, 108, 97, 103, 41, 41, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 99, 95, 105, 115, 95, 102, 111, 114, 119, 97,
+114, 100, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 49, 60,
+60, 48, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 110,
+111, 95, 97, 116, 111, 109, 105, 99, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 40, 49, 60, 60, 49, 41, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 99, 95, 110, 111, 95, 99, 108, 111, 110, 101, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 49, 60, 60,
+50, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 110, 111,
+95, 101, 109, 112, 108, 97, 99, 101, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 40, 49, 60, 60, 51, 41, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 99, 95, 110, 111, 95, 104, 97, 115, 104, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 49, 60, 60, 52, 41,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 99, 95, 117, 115, 101, 95,
+99, 109, 112, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 40, 49, 60, 60, 53, 41, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+99, 95, 109, 111, 114, 101, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 40, 49, 60, 60, 54, 41, 10, 10, 35,
+105, 102, 32, 99, 95, 111, 112, 116, 105, 111, 110, 40, 99, 95, 105,
+115, 95, 102, 111, 114, 119, 97, 114, 100, 41, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 105, 115, 95, 102, 111, 114,
+119, 97, 114, 100, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102,
+32, 99, 95, 111, 112, 116, 105, 111, 110, 40, 99, 95, 110, 111, 95,
+104, 97, 115, 104, 41, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 110, 111, 95, 104, 97, 115, 104, 10, 35, 101, 110, 100,
+105, 102, 10, 35, 105, 102, 32, 99, 95, 111, 112, 116, 105, 111, 110,
+40, 99, 95, 110, 111, 95, 101, 109, 112, 108, 97, 99, 101, 41, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 110, 111, 95, 101,
+109, 112, 108, 97, 99, 101, 10, 35, 101, 110, 100, 105, 102, 10, 35,
+105, 102, 32, 99, 95, 111, 112, 116, 105, 111, 110, 40, 99, 95, 117,
+115, 101, 95, 99, 109, 112, 41, 32, 124, 124, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 105, 95, 99, 109, 112, 32, 124, 124, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115, 32, 124,
+124, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 95, 105, 95, 105, 115, 109, 97, 112, 32, 124,
+124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 105, 95, 105, 115,
+115, 101, 116, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100,
+32, 95, 105, 95, 105, 115, 112, 113, 117, 101, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 117, 115, 101, 95, 99, 109, 112,
+10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 32, 99, 95, 111,
+112, 116, 105, 111, 110, 40, 99, 95, 110, 111, 95, 99, 108, 111, 110,
+101, 41, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95,
+105, 95, 99, 97, 114, 99, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 110, 111, 95, 99, 108, 111, 110, 101, 10, 35, 101,
+110, 100, 105, 102, 10, 35, 105, 102, 32, 99, 95, 111, 112, 116, 105,
+111, 110, 40, 99, 95, 109, 111, 114, 101, 41, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 109, 111, 114, 101, 10, 35, 101,
+110, 100, 105, 102, 10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 107, 101, 121, 95, 115, 116, 114, 10, 32, 32,
+35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 95, 99,
+108, 97, 115, 115, 32, 99, 115, 116, 114, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 114, 97, 119, 95, 99, 108, 97, 115,
+115, 32, 99, 99, 104, 97, 114, 112, 116, 114, 10, 32, 32, 35, 105,
+102, 110, 100, 101, 102, 32, 105, 95, 116, 97, 103, 10, 32, 32, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 116, 97, 103, 32,
+115, 116, 114, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 35, 101,
+108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+107, 101, 121, 95, 115, 115, 118, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 107, 101, 121, 95, 99, 108, 97, 115, 115, 32,
+99, 115, 116, 114, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+105, 95, 114, 97, 119, 95, 99, 108, 97, 115, 115, 32, 99, 115, 118,
+105, 101, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 102, 114, 111, 109, 32, 99, 115, 116, 114, 95, 102,
+114, 111, 109, 95, 115, 118, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 107, 101, 121, 116, 111, 32, 99, 115, 116, 114, 95,
+115, 118, 10, 32, 32, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95,
+116, 97, 103, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 116, 97, 103, 32, 115, 115, 118, 10, 32, 32, 35, 101,
+110, 100, 105, 102, 10, 35, 101, 108, 105, 102, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 95, 97, 114, 99, 98,
+111, 120, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+107, 101, 121, 95, 99, 108, 97, 115, 115, 32, 105, 95, 107, 101, 121,
+95, 97, 114, 99, 98, 111, 120, 10, 32, 32, 35, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 114, 97, 119, 95, 99, 108, 97, 115, 115, 32,
+99, 95, 74, 79, 73, 78, 40, 105, 95, 107, 101, 121, 95, 97, 114, 99,
+98, 111, 120, 44, 32, 95, 114, 97, 119, 41, 10, 32, 32, 35, 105, 102,
+32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 117, 115, 101, 95,
+99, 109, 112, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 101, 113, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 107,
+101, 121, 95, 97, 114, 99, 98, 111, 120, 44, 32, 95, 114, 97, 119, 95,
+101, 113, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 35, 101,
+110, 100, 105, 102, 10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 114, 97, 119, 95, 99, 108, 97, 115, 115, 10,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121,
+114, 97, 119, 32, 105, 95, 114, 97, 119, 95, 99, 108, 97, 115, 115,
+10, 35, 101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 95, 99, 108, 97, 115, 115, 32, 38, 38, 32, 33,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 114,
+97, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+114, 97, 119, 95, 99, 108, 97, 115, 115, 32, 105, 95, 107, 101, 121,
+10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105, 102, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 95, 99, 108, 97,
+115, 115, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+107, 101, 121, 32, 105, 95, 107, 101, 121, 95, 99, 108, 97, 115, 115,
+10, 32, 32, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101,
+121, 99, 108, 111, 110, 101, 10, 32, 32, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 105, 95, 107, 101, 121, 99, 108, 111, 110, 101, 32,
+99, 95, 74, 79, 73, 78, 40, 105, 95, 107, 101, 121, 44, 32, 95, 99,
+108, 111, 110, 101, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10,
+32, 32, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121,
+100, 114, 111, 112, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 32, 99, 95, 74,
+79, 73, 78, 40, 105, 95, 107, 101, 121, 44, 32, 95, 100, 114, 111,
+112, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105,
+102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107, 101,
+121, 102, 114, 111, 109, 32, 38, 38, 32, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 107, 101, 121, 114, 97, 119, 10, 32, 32, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 102, 114,
+111, 109, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 107, 101, 121, 44,
+32, 95, 102, 114, 111, 109, 41, 10, 32, 32, 35, 101, 110, 100, 105,
+102, 10, 32, 32, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 107, 101, 121, 116, 111, 32, 38, 38, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 114, 97, 119, 10,
+32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107,
+101, 121, 116, 111, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 107, 101,
+121, 44, 32, 95, 116, 111, 114, 97, 119, 41, 10, 32, 32, 35, 101, 110,
+100, 105, 102, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105, 102,
+32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 114, 97, 119, 95,
+99, 108, 97, 115, 115, 10, 32, 32, 35, 105, 102, 32, 33, 40, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 99, 109, 112, 32, 124, 124, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115,
+41, 32, 38, 38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+117, 115, 101, 95, 99, 109, 112, 10, 32, 32, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 99, 109, 112, 32, 99, 95, 74, 79, 73,
+78, 40, 105, 95, 107, 101, 121, 114, 97, 119, 44, 32, 95, 99, 109,
+112, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105,
+102, 32, 33, 40, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 104,
+97, 115, 104, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 110, 111, 95, 104, 97, 115, 104, 41, 10, 32, 32, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 104, 97, 115, 104, 32, 99,
+95, 74, 79, 73, 78, 40, 105, 95, 107, 101, 121, 114, 97, 119, 44, 32,
+95, 104, 97, 115, 104, 41, 10, 32, 32, 35, 101, 110, 100, 105, 102,
+10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105, 102, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 99, 109, 112, 32, 124, 124, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115,
+32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 117,
+115, 101, 95, 99, 109, 112, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 10, 35, 101,
+110, 100, 105, 102, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 101, 113, 32, 124, 124, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 105, 95, 117, 115, 101, 95, 99, 109, 112, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 95, 105, 95, 104, 97, 115,
+95, 101, 113, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 32,
+33, 40, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 104, 97, 115,
+104, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+110, 111, 95, 104, 97, 115, 104, 41, 10, 32, 32, 35, 100, 101, 102,
+105, 110, 101, 32, 105, 95, 104, 97, 115, 104, 32, 99, 95, 100, 101,
+102, 97, 117, 108, 116, 95, 104, 97, 115, 104, 10, 35, 101, 110, 100,
+105, 102, 10, 10, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 107, 101, 121, 10, 32, 32, 35, 101, 114, 114, 111,
+114, 32, 34, 78, 111, 32, 105, 95, 107, 101, 121, 32, 111, 114, 32,
+105, 95, 118, 97, 108, 32, 100, 101, 102, 105, 110, 101, 100, 34, 10,
+35, 101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 114, 97, 119, 32, 94, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 105, 95, 107, 101, 121, 116, 111, 10, 32, 32, 35,
+101, 114, 114, 111, 114, 32, 34, 66, 111, 116, 104, 32, 105, 95, 107,
+101, 121, 114, 97, 119, 47, 105, 95, 118, 97, 108, 114, 97, 119, 32,
+97, 110, 100, 32, 105, 95, 107, 101, 121, 116, 111, 47, 105, 95, 118,
+97, 108, 116, 111, 32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101,
+102, 105, 110, 101, 100, 44, 32, 105, 102, 32, 97, 110, 121, 34, 10,
+35, 101, 108, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 110, 111, 95, 99, 108, 111, 110, 101, 32, 38, 38, 32, 40,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 99,
+108, 111, 110, 101, 32, 94, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 100, 114, 111, 112, 41, 10, 32, 32, 35, 101,
+114, 114, 111, 114, 32, 34, 66, 111, 116, 104, 32, 105, 95, 107, 101,
+121, 99, 108, 111, 110, 101, 47, 105, 95, 118, 97, 108, 99, 108, 111,
+110, 101, 32, 97, 110, 100, 32, 105, 95, 107, 101, 121, 100, 114, 111,
+112, 47, 105, 95, 118, 97, 108, 100, 114, 111, 112, 32, 109, 117, 115,
+116, 32, 98, 101, 32, 100, 101, 102, 105, 110, 101, 100, 44, 32, 105,
+102, 32, 97, 110, 121, 32, 40, 117, 110, 108, 101, 115, 115, 32, 105,
+95, 110, 111, 95, 99, 108, 111, 110, 101, 32, 100, 101, 102, 105, 110,
+101, 100, 41, 46, 34, 10, 35, 101, 108, 105, 102, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 102, 114, 111, 109, 32, 124, 124, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 100, 114, 111, 112,
+10, 32, 32, 35, 101, 114, 114, 111, 114, 32, 34, 105, 95, 102, 114,
+111, 109, 32, 47, 32, 105, 95, 100, 114, 111, 112, 32, 110, 111, 116,
+32, 115, 117, 112, 112, 111, 114, 116, 101, 100, 46, 32, 68, 101, 102,
+105, 110, 101, 32, 105, 95, 107, 101, 121, 102, 114, 111, 109, 47,
+105, 95, 118, 97, 108, 102, 114, 111, 109, 32, 97, 110, 100, 47, 111,
+114, 32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 47, 105, 95, 118,
+97, 108, 100, 114, 111, 112, 32, 105, 110, 115, 116, 101, 97, 100, 34,
+10, 35, 101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32,
+105, 95, 107, 101, 121, 114, 97, 119, 32, 38, 38, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 95, 105, 95, 105, 115, 104, 97, 115, 104, 32,
+38, 38, 32, 33, 40, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+104, 97, 115, 104, 32, 38, 38, 32, 40, 100, 101, 102, 105, 110, 101,
+100, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 32, 124, 124,
+32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 101, 113, 41, 41,
+10, 32, 32, 35, 101, 114, 114, 111, 114, 32, 34, 70, 111, 114, 32, 99,
+109, 97, 112, 47, 99, 115, 101, 116, 44, 32, 98, 111, 116, 104, 32,
+105, 95, 104, 97, 115, 104, 32, 97, 110, 100, 32, 105, 95, 101, 113,
+32, 40, 111, 114, 32, 105, 95, 108, 101, 115, 115, 32, 111, 114, 32,
+105, 95, 99, 109, 112, 41, 32, 109, 117, 115, 116, 32, 98, 101, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 119, 104, 101, 110, 32, 105,
+95, 107, 101, 121, 114, 97, 119, 32, 105, 115, 32, 100, 101, 102, 105,
+110, 101, 100, 46, 34, 10, 35, 101, 108, 105, 102, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 107, 101, 121, 114, 97, 119, 32, 38,
+38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 117, 115, 101,
+95, 99, 109, 112, 32, 38, 38, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 10, 32, 32, 35,
+101, 114, 114, 111, 114, 32, 34, 70, 111, 114, 32, 99, 115, 109, 97,
+112, 47, 99, 115, 115, 101, 116, 47, 99, 112, 113, 117, 101, 44, 32,
+105, 95, 99, 109, 112, 32, 111, 114, 32, 105, 95, 108, 101, 115, 115,
+32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101, 102, 105, 110, 101,
+100, 32, 119, 104, 101, 110, 32, 105, 95, 107, 101, 121, 114, 97, 119,
+32, 105, 115, 32, 100, 101, 102, 105, 110, 101, 100, 46, 34, 10, 35,
+101, 110, 100, 105, 102, 10, 10, 47, 47, 32, 105, 95, 101, 113, 44,
+32, 105, 95, 108, 101, 115, 115, 44, 32, 105, 95, 99, 109, 112, 10,
+35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+101, 113, 32, 38, 38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105,
+95, 99, 109, 112, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32,
+105, 95, 101, 113, 40, 120, 44, 32, 121, 41, 32, 33, 40, 105, 95, 99,
+109, 112, 40, 120, 44, 32, 121, 41, 41, 10, 35, 101, 108, 105, 102,
+32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 101, 113, 32,
+38, 38, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 107,
+101, 121, 114, 97, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 101, 113, 40, 120, 44, 32, 121, 41, 32, 42, 120, 32, 61,
+61, 32, 42, 121, 32, 47, 47, 32, 102, 111, 114, 32, 105, 110, 116,
+101, 103, 114, 97, 108, 32, 116, 121, 112, 101, 115, 44, 32, 101, 108,
+115, 101, 32, 100, 101, 102, 105, 110, 101, 32, 105, 95, 101, 113, 32,
+111, 114, 32, 105, 95, 99, 109, 112, 32, 121, 111, 117, 114, 115, 101,
+108, 102, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 32, 33,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115,
+32, 38, 38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 99,
+109, 112, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+108, 101, 115, 115, 40, 120, 44, 32, 121, 41, 32, 40, 105, 95, 99,
+109, 112, 40, 120, 44, 32, 121, 41, 41, 32, 60, 32, 48, 10, 35, 101,
+108, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+108, 101, 115, 115, 32, 38, 38, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 107, 101, 121, 114, 97, 119, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 108, 101, 115, 115, 40, 120, 44,
+32, 121, 41, 32, 42, 120, 32, 60, 32, 42, 121, 32, 47, 47, 32, 102,
+111, 114, 32, 105, 110, 116, 101, 103, 114, 97, 108, 32, 116, 121,
+112, 101, 115, 44, 32, 101, 108, 115, 101, 32, 100, 101, 102, 105,
+110, 101, 32, 105, 95, 108, 101, 115, 115, 32, 111, 114, 32, 105, 95,
+99, 109, 112, 32, 121, 111, 117, 114, 115, 101, 108, 102, 10, 35, 101,
+110, 100, 105, 102, 10, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 99, 109, 112, 32, 38, 38, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 108, 101, 115, 115, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 99, 109, 112, 40, 120, 44,
+32, 121, 41, 32, 40, 105, 95, 108, 101, 115, 115, 40, 121, 44, 32,
+120, 41, 41, 32, 45, 32, 40, 105, 95, 108, 101, 115, 115, 40, 120, 44,
+32, 121, 41, 41, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 105,
+102, 110, 100, 101, 102, 32, 105, 95, 116, 97, 103, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 116, 97, 103, 32, 105, 95,
+107, 101, 121, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 105, 95, 107, 101, 121, 114, 97, 119, 10, 32, 32,
+35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 107, 101, 121, 114, 97,
+119, 32, 105, 95, 107, 101, 121, 10, 35, 101, 110, 100, 105, 102, 10,
+35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 102,
+114, 111, 109, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 102, 114, 111, 109, 32, 99, 95, 100, 101, 102, 97,
+117, 108, 116, 95, 99, 108, 111, 110, 101, 10, 35, 101, 108, 115, 101,
+10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 104, 97,
+115, 95, 101, 109, 112, 108, 97, 99, 101, 10, 35, 101, 110, 100, 105,
+102, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121,
+116, 111, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+107, 101, 121, 116, 111, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116,
+95, 116, 111, 114, 97, 119, 10, 35, 101, 110, 100, 105, 102, 10, 35,
+105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 99, 108,
+111, 110, 101, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 107, 101, 121, 99, 108, 111, 110, 101, 32, 99, 95, 100, 101, 102,
+97, 117, 108, 116, 95, 99, 108, 111, 110, 101, 10, 35, 101, 110, 100,
+105, 102, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 107, 101,
+121, 100, 114, 111, 112, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 32, 99, 95, 100, 101,
+102, 97, 117, 108, 116, 95, 100, 114, 111, 112, 10, 35, 101, 110, 100,
+105, 102, 10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100,
+32, 95, 105, 95, 105, 115, 109, 97, 112, 32, 47, 47, 32, 45, 45, 45,
+45, 32, 112, 114, 111, 99, 101, 115, 115, 32, 99, 109, 97, 112, 47,
+99, 115, 109, 97, 112, 32, 118, 97, 108, 117, 101, 32, 105, 95, 118,
+97, 108, 44, 32, 46, 46, 46, 32, 45, 45, 45, 45, 10, 10, 35, 105, 102,
+100, 101, 102, 32, 105, 95, 118, 97, 108, 95, 115, 116, 114, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 95,
+99, 108, 97, 115, 115, 32, 99, 115, 116, 114, 10, 32, 32, 35, 100,
+101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 114, 97, 119, 32,
+99, 111, 110, 115, 116, 32, 99, 104, 97, 114, 42, 10, 35, 101, 108,
+105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97,
+108, 95, 115, 115, 118, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101,
+32, 105, 95, 118, 97, 108, 95, 99, 108, 97, 115, 115, 32, 99, 115,
+116, 114, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+118, 97, 108, 114, 97, 119, 32, 99, 115, 118, 105, 101, 119, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 102,
+114, 111, 109, 32, 99, 115, 116, 114, 95, 102, 114, 111, 109, 95, 115,
+118, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118,
+97, 108, 116, 111, 32, 99, 115, 116, 114, 95, 115, 118, 10, 35, 101,
+108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+118, 97, 108, 95, 97, 114, 99, 98, 111, 120, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 95, 99, 108, 97, 115,
+115, 32, 105, 95, 118, 97, 108, 95, 97, 114, 99, 98, 111, 120, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 114,
+97, 119, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 118, 97, 108, 95,
+97, 114, 99, 98, 111, 120, 44, 32, 95, 114, 97, 119, 41, 10, 35, 101,
+110, 100, 105, 102, 10, 10, 35, 105, 102, 100, 101, 102, 32, 105, 95,
+118, 97, 108, 95, 99, 108, 97, 115, 115, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 32, 105, 95, 118, 97,
+108, 95, 99, 108, 97, 115, 115, 10, 32, 32, 35, 105, 102, 110, 100,
+101, 102, 32, 105, 95, 118, 97, 108, 99, 108, 111, 110, 101, 10, 32,
+32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97,
+108, 99, 108, 111, 110, 101, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95,
+118, 97, 108, 44, 32, 95, 99, 108, 111, 110, 101, 41, 10, 32, 32, 35,
+101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 100, 114, 111, 112, 10, 32, 32, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 100, 114,
+111, 112, 32, 99, 95, 74, 79, 73, 78, 40, 105, 95, 118, 97, 108, 44,
+32, 95, 100, 114, 111, 112, 41, 10, 32, 32, 35, 101, 110, 100, 105,
+102, 10, 32, 32, 35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101,
+100, 32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 32, 38, 38, 32,
+100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 114, 97,
+119, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105,
+95, 118, 97, 108, 102, 114, 111, 109, 32, 99, 95, 74, 79, 73, 78, 40,
+105, 95, 118, 97, 108, 44, 32, 95, 102, 114, 111, 109, 41, 10, 32, 32,
+35, 101, 110, 100, 105, 102, 10, 32, 32, 35, 105, 102, 32, 33, 100,
+101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 116, 111, 32,
+38, 38, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97,
+108, 114, 97, 119, 10, 32, 32, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 118, 97, 108, 116, 111, 32, 99, 95, 74, 79, 73, 78,
+40, 105, 95, 118, 97, 108, 44, 32, 95, 116, 111, 114, 97, 119, 41, 10,
+32, 32, 35, 101, 110, 100, 105, 102, 10, 35, 101, 110, 100, 105, 102,
+10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 118, 97, 108,
+10, 32, 32, 35, 101, 114, 114, 111, 114, 32, 34, 105, 95, 118, 97,
+108, 42, 32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 102, 111, 114, 32, 109, 97, 112, 115, 34, 10, 35,
+101, 108, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105,
+95, 118, 97, 108, 114, 97, 119, 32, 94, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 105, 95, 118, 97, 108, 116, 111, 10, 32, 32, 35, 101,
+114, 114, 111, 114, 32, 34, 66, 111, 116, 104, 32, 105, 95, 118, 97,
+108, 114, 97, 119, 32, 97, 110, 100, 32, 105, 95, 118, 97, 108, 116,
+111, 32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101, 102, 105, 110,
+101, 100, 44, 32, 105, 102, 32, 97, 110, 121, 34, 10, 35, 101, 108,
+105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 110,
+111, 95, 99, 108, 111, 110, 101, 32, 38, 38, 32, 40, 100, 101, 102,
+105, 110, 101, 100, 32, 105, 95, 118, 97, 108, 99, 108, 111, 110, 101,
+32, 94, 32, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 118, 97,
+108, 100, 114, 111, 112, 41, 10, 32, 32, 35, 101, 114, 114, 111, 114,
+32, 34, 66, 111, 116, 104, 32, 105, 95, 118, 97, 108, 99, 108, 111,
+110, 101, 32, 97, 110, 100, 32, 105, 95, 118, 97, 108, 100, 114, 111,
+112, 32, 109, 117, 115, 116, 32, 98, 101, 32, 100, 101, 102, 105, 110,
+101, 100, 44, 32, 105, 102, 32, 97, 110, 121, 34, 10, 35, 101, 110,
+100, 105, 102, 10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95,
+118, 97, 108, 114, 97, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110,
+101, 32, 105, 95, 118, 97, 108, 114, 97, 119, 32, 105, 95, 118, 97,
+108, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110, 100, 101,
+102, 32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 102, 114,
+111, 109, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 99, 108,
+111, 110, 101, 10, 35, 101, 108, 115, 101, 10, 32, 32, 35, 100, 101,
+102, 105, 110, 101, 32, 105, 95, 104, 97, 115, 95, 101, 109, 112, 108,
+97, 99, 101, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 105, 95, 118, 97, 108, 116, 111, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 116, 111, 32,
+99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 116, 111, 114, 97, 119,
+10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 99, 108, 111, 110, 101, 10, 32, 32, 35,
+100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 99, 108, 111,
+110, 101, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 99, 108,
+111, 110, 101, 10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 105, 95, 118, 97, 108, 100, 114, 111, 112, 10, 32,
+32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118, 97, 108, 100,
+114, 111, 112, 32, 99, 95, 100, 101, 102, 97, 117, 108, 116, 95, 100,
+114, 111, 112, 10, 35, 101, 110, 100, 105, 102, 10, 10, 35, 101, 110,
+100, 105, 102, 32, 47, 47, 32, 33, 95, 105, 95, 105, 115, 109, 97,
+112, 10, 10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 118, 97,
+108, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 118,
+97, 108, 32, 105, 95, 107, 101, 121, 10, 35, 101, 110, 100, 105, 102,
+10, 35, 105, 102, 110, 100, 101, 102, 32, 105, 95, 118, 97, 108, 114,
+97, 119, 10, 32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95,
+118, 97, 108, 114, 97, 119, 32, 105, 95, 107, 101, 121, 114, 97, 119,
+10, 35, 101, 110, 100, 105, 102, 10, 35, 105, 102, 110, 100, 101, 102,
+32, 105, 95, 104, 97, 115, 95, 101, 109, 112, 108, 97, 99, 101, 10,
+32, 32, 35, 100, 101, 102, 105, 110, 101, 32, 105, 95, 110, 111, 95,
+101, 109, 112, 108, 97, 99, 101, 10, 35, 101, 110, 100, 105, 102, 10,
+35, 101, 110, 100, 105, 102, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78,
+68, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 116,
+101, 109, 112, 108, 97, 116, 101, 46, 104, 10, 10, 35, 105, 102, 110,
+100, 101, 102, 32, 105, 95, 105, 115, 95, 102, 111, 114, 119, 97, 114,
+100, 10, 32, 32, 32, 95, 99, 95, 68, 69, 70, 84, 89, 80, 69, 83, 40,
+95, 99, 95, 99, 118, 101, 99, 95, 116, 121, 112, 101, 115, 44, 32,
+105, 95, 116, 121, 112, 101, 44, 32, 105, 95, 107, 101, 121, 41, 59,
+10, 35, 101, 110, 100, 105, 102, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 105, 95, 107, 101, 121, 114, 97, 119, 32, 95, 109, 95, 114,
+97, 119, 59, 10, 83, 84, 67, 95, 65, 80, 73, 32, 105, 95, 116, 121,
+112, 101, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 105, 110, 105, 116, 41, 40, 118, 111, 105, 100, 41,
+59, 10, 83, 84, 67, 95, 65, 80, 73, 32, 118, 111, 105, 100, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 100, 114, 111, 112, 41, 40, 105, 95, 116, 121, 112, 101, 42,
+32, 115, 101, 108, 102, 41, 59, 10, 83, 84, 67, 95, 65, 80, 73, 32,
+118, 111, 105, 100, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 108, 101, 97, 114, 41, 40,
+105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 41, 59, 10,
+83, 84, 67, 95, 65, 80, 73, 32, 95, 66, 111, 111, 108, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+114, 101, 115, 101, 114, 118, 101, 41, 40, 105, 95, 116, 121, 112,
+101, 42, 32, 115, 101, 108, 102, 44, 32, 105, 110, 116, 112, 116, 114,
+95, 116, 32, 99, 97, 112, 41, 59, 10, 83, 84, 67, 95, 65, 80, 73, 32,
+95, 66, 111, 111, 108, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 101, 115, 105, 122, 101, 41,
+40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32,
+105, 110, 116, 112, 116, 114, 95, 116, 32, 115, 105, 122, 101, 44, 32,
+95, 109, 95, 118, 97, 108, 117, 101, 32, 110, 117, 108, 108, 41, 59,
+10, 83, 84, 67, 95, 65, 80, 73, 32, 95, 109, 95, 105, 116, 101, 114,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 101, 114, 97, 115, 101, 95, 110, 41, 40, 105, 95, 116, 121, 112,
+101, 42, 32, 115, 101, 108, 102, 44, 32, 105, 110, 116, 112, 116, 114,
+95, 116, 32, 105, 100, 120, 44, 32, 105, 110, 116, 112, 116, 114, 95,
+116, 32, 110, 41, 59, 10, 83, 84, 67, 95, 65, 80, 73, 32, 95, 109, 95,
+105, 116, 101, 114, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 105, 110, 115, 101, 114, 116, 95, 117, 110,
+105, 110, 105, 116, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 44, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105,
+100, 120, 44, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 110, 41,
+59, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95,
+105, 95, 104, 97, 115, 95, 101, 113, 32, 124, 124, 32, 100, 101, 102,
+105, 110, 101, 100, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112,
+10, 83, 84, 67, 95, 65, 80, 73, 32, 95, 109, 95, 105, 116, 101, 114,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 102, 105, 110, 100, 95, 105, 110, 41, 40, 95, 109, 95, 105, 116,
+101, 114, 32, 105, 116, 49, 44, 32, 95, 109, 95, 105, 116, 101, 114,
+32, 105, 116, 50, 44, 32, 95, 109, 95, 114, 97, 119, 32, 114, 97, 119,
+41, 59, 10, 35, 101, 110, 100, 105, 102, 10, 83, 84, 67, 95, 73, 78,
+76, 73, 78, 69, 32, 118, 111, 105, 100, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 118, 97, 108, 117, 101,
+95, 100, 114, 111, 112, 41, 40, 95, 109, 95, 118, 97, 108, 117, 101,
+42, 32, 118, 97, 108, 41, 32, 123, 32, 105, 95, 107, 101, 121, 100,
+114, 111, 112, 40, 118, 97, 108, 41, 59, 32, 125, 10, 10, 83, 84, 67,
+95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 118, 97, 108, 117, 101,
+42, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 112, 117, 115,
+104, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102,
+44, 32, 95, 109, 95, 118, 97, 108, 117, 101, 32, 118, 97, 108, 117,
+101, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 105,
+102, 32, 40, 115, 101, 108, 102, 45, 62, 95, 108, 101, 110, 32, 61,
+61, 32, 115, 101, 108, 102, 45, 62, 95, 99, 97, 112, 41, 10, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 105, 102, 32, 40, 33, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 114, 101, 115, 101, 114, 118, 101, 41, 40,
+115, 101, 108, 102, 44, 32, 115, 101, 108, 102, 45, 62, 95, 108, 101,
+110, 42, 50, 32, 43, 32, 52, 41, 41, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 78,
+85, 76, 76, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95,
+109, 95, 118, 97, 108, 117, 101, 32, 42, 118, 32, 61, 32, 115, 101,
+108, 102, 45, 62, 100, 97, 116, 97, 32, 43, 32, 115, 101, 108, 102,
+45, 62, 95, 108, 101, 110, 43, 43, 59, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 42, 118, 32, 61, 32, 118, 97, 108, 117, 101, 59, 10,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 114, 101, 116, 117, 114,
+110, 32, 118, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 125, 10, 10, 35, 105,
+102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 110, 111,
+95, 101, 109, 112, 108, 97, 99, 101, 10, 83, 84, 67, 95, 65, 80, 73,
+32, 95, 109, 95, 105, 116, 101, 114, 10, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 101, 109, 112, 108, 97, 99, 101, 95, 110, 41, 40, 105, 95,
+116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 105, 110, 116,
+112, 116, 114, 95, 116, 32, 105, 100, 120, 44, 32, 99, 111, 110, 115,
+116, 32, 95, 109, 95, 114, 97, 119, 32, 114, 97, 119, 91, 93, 44, 32,
+105, 110, 116, 112, 116, 114, 95, 116, 32, 110, 41, 59, 10, 10, 83,
+84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 118, 97, 108,
+117, 101, 42, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 109, 112,
+108, 97, 99, 101, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 44, 32, 95, 109, 95, 114, 97, 119, 32, 114, 97, 119,
+41, 32, 123, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 95,
+99, 95, 77, 69, 77, 66, 40, 95, 112, 117, 115, 104, 41, 40, 115, 101,
+108, 102, 44, 32, 105, 95, 107, 101, 121, 102, 114, 111, 109, 40, 114,
+97, 119, 41, 41, 59, 10, 125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78,
+69, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 101, 109, 112, 108, 97, 99, 101, 95, 98, 97, 99,
+107, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102,
+44, 32, 95, 109, 95, 114, 97, 119, 32, 114, 97, 119, 41, 32, 123, 10,
+32, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 112, 117, 115, 104, 41, 40, 115, 101, 108, 102,
+44, 32, 105, 95, 107, 101, 121, 102, 114, 111, 109, 40, 114, 97, 119,
+41, 41, 59, 10, 125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32,
+95, 109, 95, 105, 116, 101, 114, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 101, 109, 112, 108, 97, 99, 101, 95, 97, 116, 41, 40, 105, 95,
+116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95,
+105, 116, 101, 114, 32, 105, 116, 44, 32, 95, 109, 95, 114, 97, 119,
+32, 114, 97, 119, 41, 32, 123, 10, 32, 32, 32, 32, 114, 101, 116, 117,
+114, 110, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 109, 112, 108,
+97, 99, 101, 95, 110, 41, 40, 115, 101, 108, 102, 44, 32, 95, 105,
+116, 95, 112, 116, 114, 40, 105, 116, 41, 32, 45, 32, 115, 101, 108,
+102, 45, 62, 100, 97, 116, 97, 44, 32, 38, 114, 97, 119, 44, 32, 49,
+41, 59, 10, 125, 10, 35, 101, 110, 100, 105, 102, 32, 47, 47, 32, 33,
+105, 95, 110, 111, 95, 101, 109, 112, 108, 97, 99, 101, 10, 10, 35,
+105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95, 110,
+111, 95, 99, 108, 111, 110, 101, 10, 83, 84, 67, 95, 65, 80, 73, 32,
+105, 95, 116, 121, 112, 101, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 108, 111, 110, 101, 41, 40,
+105, 95, 116, 121, 112, 101, 32, 99, 120, 41, 59, 10, 83, 84, 67, 95,
+65, 80, 73, 32, 95, 109, 95, 105, 116, 101, 114, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 111, 112, 121,
+95, 110, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108,
+102, 44, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105, 100, 120,
+44, 32, 99, 111, 110, 115, 116, 32, 95, 109, 95, 118, 97, 108, 117,
+101, 32, 97, 114, 114, 91, 93, 44, 32, 105, 110, 116, 112, 116, 114,
+95, 116, 32, 110, 41, 59, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69,
+32, 118, 111, 105, 100, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 112, 117, 116, 95, 110, 41, 40, 105, 95,
+116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111, 110,
+115, 116, 32, 95, 109, 95, 114, 97, 119, 42, 32, 114, 97, 119, 44, 32,
+105, 110, 116, 112, 116, 114, 95, 116, 32, 110, 41, 10, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 123, 32, 119, 104, 105, 108, 101, 32,
+40, 110, 45, 45, 41, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 112, 117,
+115, 104, 41, 40, 115, 101, 108, 102, 44, 32, 105, 95, 107, 101, 121,
+102, 114, 111, 109, 40, 42, 114, 97, 119, 43, 43, 41, 41, 59, 32, 125,
+10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 105, 95, 116, 121,
+112, 101, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 102, 114, 111, 109, 95, 110, 41, 40, 99, 111, 110, 115, 116, 32,
+95, 109, 95, 114, 97, 119, 42, 32, 114, 97, 119, 44, 32, 105, 110,
+116, 112, 116, 114, 95, 116, 32, 110, 41, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 123, 32, 105, 95, 116, 121, 112, 101, 32, 99, 120,
+32, 61, 32, 123, 48, 125, 59, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+112, 117, 116, 95, 110, 41, 40, 38, 99, 120, 44, 32, 114, 97, 119, 44,
+32, 110, 41, 59, 32, 114, 101, 116, 117, 114, 110, 32, 99, 120, 59,
+32, 125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95,
+118, 97, 108, 117, 101, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77,
+66, 40, 95, 118, 97, 108, 117, 101, 95, 99, 108, 111, 110, 101, 41,
+40, 95, 109, 95, 118, 97, 108, 117, 101, 32, 118, 97, 108, 41, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 123, 32, 114, 101, 116, 117,
+114, 110, 32, 105, 95, 107, 101, 121, 99, 108, 111, 110, 101, 40, 118,
+97, 108, 41, 59, 32, 125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69,
+32, 118, 111, 105, 100, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 99, 111, 112, 121, 41, 40, 105, 95, 116,
+121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111, 110, 115,
+116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 111, 116, 104, 101, 114,
+41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 105, 102,
+32, 40, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 32, 61, 61, 32,
+111, 116, 104, 101, 114, 45, 62, 100, 97, 116, 97, 41, 32, 114, 101,
+116, 117, 114, 110, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 108, 101, 97, 114, 41, 40,
+115, 101, 108, 102, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 111, 112, 121, 95,
+110, 41, 40, 115, 101, 108, 102, 44, 32, 48, 44, 32, 111, 116, 104,
+101, 114, 45, 62, 100, 97, 116, 97, 44, 32, 111, 116, 104, 101, 114,
+45, 62, 95, 108, 101, 110, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 125,
+10, 35, 101, 110, 100, 105, 102, 32, 47, 47, 32, 33, 105, 95, 110,
+111, 95, 99, 108, 111, 110, 101, 10, 10, 83, 84, 67, 95, 73, 78, 76,
+73, 78, 69, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 32, 32, 32,
+32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 115, 105, 122, 101, 41, 40,
+99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 41, 32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 115,
+101, 108, 102, 45, 62, 95, 108, 101, 110, 59, 32, 125, 10, 83, 84, 67,
+95, 73, 78, 76, 73, 78, 69, 32, 105, 110, 116, 112, 116, 114, 95, 116,
+32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 97, 112,
+97, 99, 105, 116, 121, 41, 40, 99, 111, 110, 115, 116, 32, 105, 95,
+116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 41, 32, 123, 32, 114,
+101, 116, 117, 114, 110, 32, 115, 101, 108, 102, 45, 62, 95, 99, 97,
+112, 59, 32, 125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95,
+66, 111, 111, 108, 32, 32, 32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 101, 109, 112, 116, 121, 41, 40, 99, 111, 110,
+115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102,
+41, 32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 33, 115, 101, 108,
+102, 45, 62, 95, 108, 101, 110, 59, 32, 125, 10, 83, 84, 67, 95, 73,
+78, 76, 73, 78, 69, 32, 95, 109, 95, 114, 97, 119, 32, 32, 32, 32, 32,
+32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 118, 97, 108, 117, 101,
+95, 116, 111, 114, 97, 119, 41, 40, 99, 111, 110, 115, 116, 32, 95,
+109, 95, 118, 97, 108, 117, 101, 42, 32, 118, 97, 108, 41, 32, 123,
+32, 114, 101, 116, 117, 114, 110, 32, 105, 95, 107, 101, 121, 116,
+111, 40, 118, 97, 108, 41, 59, 32, 125, 10, 83, 84, 67, 95, 73, 78,
+76, 73, 78, 69, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42, 32, 32,
+32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 102, 114, 111, 110, 116,
+41, 40, 99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42,
+32, 115, 101, 108, 102, 41, 32, 123, 32, 114, 101, 116, 117, 114, 110,
+32, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 59, 32, 125, 10, 83,
+84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 118, 97, 108,
+117, 101, 42, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 98,
+97, 99, 107, 41, 40, 99, 111, 110, 115, 116, 32, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 41, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 115,
+101, 108, 102, 45, 62, 100, 97, 116, 97, 32, 43, 32, 115, 101, 108,
+102, 45, 62, 95, 108, 101, 110, 32, 45, 32, 49, 59, 32, 125, 10, 83,
+84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 118, 111, 105, 100, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 112,
+111, 112, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108,
+102, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 123, 32, 99,
+95, 97, 115, 115, 101, 114, 116, 40, 115, 101, 108, 102, 45, 62, 95,
+108, 101, 110, 41, 59, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42,
+32, 112, 32, 61, 32, 38, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97,
+91, 45, 45, 115, 101, 108, 102, 45, 62, 95, 108, 101, 110, 93, 59, 32,
+105, 95, 107, 101, 121, 100, 114, 111, 112, 40, 112, 41, 59, 32, 125,
+10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 118, 97,
+108, 117, 101, 32, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+112, 117, 108, 108, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 123,
+32, 99, 95, 97, 115, 115, 101, 114, 116, 40, 115, 101, 108, 102, 45,
+62, 95, 108, 101, 110, 41, 59, 32, 114, 101, 116, 117, 114, 110, 32,
+115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 91, 45, 45, 115, 101,
+108, 102, 45, 62, 95, 108, 101, 110, 93, 59, 32, 125, 10, 83, 84, 67,
+95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 118, 97, 108, 117, 101,
+42, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 112, 117, 115,
+104, 95, 98, 97, 99, 107, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32,
+115, 101, 108, 102, 44, 32, 95, 109, 95, 118, 97, 108, 117, 101, 32,
+118, 97, 108, 117, 101, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 112, 117, 115, 104, 41, 40, 115, 101, 108, 102, 44,
+32, 118, 97, 108, 117, 101, 41, 59, 32, 125, 10, 83, 84, 67, 95, 73,
+78, 76, 73, 78, 69, 32, 118, 111, 105, 100, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 112, 111, 112, 95, 98,
+97, 99, 107, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101,
+108, 102, 41, 32, 123, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 112,
+111, 112, 41, 40, 115, 101, 108, 102, 41, 59, 32, 125, 10, 10, 83, 84,
+67, 95, 73, 78, 76, 73, 78, 69, 32, 105, 95, 116, 121, 112, 101, 10,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 119, 105, 116, 104, 95, 115, 105,
+122, 101, 41, 40, 99, 111, 110, 115, 116, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 115, 105, 122, 101, 44, 32, 95, 109, 95, 118, 97,
+108, 117, 101, 32, 110, 117, 108, 108, 41, 32, 123, 10, 32, 32, 32,
+32, 105, 95, 116, 121, 112, 101, 32, 99, 120, 32, 61, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 105, 110, 105, 116, 41, 40, 41, 59, 10, 32,
+32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 101, 115, 105,
+122, 101, 41, 40, 38, 99, 120, 44, 32, 115, 105, 122, 101, 44, 32,
+110, 117, 108, 108, 41, 59, 10, 32, 32, 32, 32, 114, 101, 116, 117,
+114, 110, 32, 99, 120, 59, 10, 125, 10, 10, 83, 84, 67, 95, 73, 78,
+76, 73, 78, 69, 32, 105, 95, 116, 121, 112, 101, 10, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 119, 105, 116, 104, 95, 99, 97, 112, 97, 99, 105,
+116, 121, 41, 40, 99, 111, 110, 115, 116, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 99, 97, 112, 41, 32, 123, 10, 32, 32, 32, 32, 105,
+95, 116, 121, 112, 101, 32, 99, 120, 32, 61, 32, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 105, 110, 105, 116, 41, 40, 41, 59, 10, 32, 32, 32,
+32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114, 101, 115, 101, 114, 118,
+101, 41, 40, 38, 99, 120, 44, 32, 99, 97, 112, 41, 59, 10, 32, 32, 32,
+32, 114, 101, 116, 117, 114, 110, 32, 99, 120, 59, 10, 125, 10, 10,
+83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 118, 111, 105, 100, 10,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 115, 104, 114, 105, 110, 107, 95,
+116, 111, 95, 102, 105, 116, 41, 40, 105, 95, 116, 121, 112, 101, 42,
+32, 115, 101, 108, 102, 41, 32, 123, 10, 32, 32, 32, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 114, 101, 115, 101, 114, 118, 101, 41, 40,
+115, 101, 108, 102, 44, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 115,
+105, 122, 101, 41, 40, 115, 101, 108, 102, 41, 41, 59, 10, 125, 10,
+10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 105, 116,
+101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 105, 110, 115, 101,
+114, 116, 95, 110, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 44, 32, 99, 111, 110, 115, 116, 32, 105, 110, 116, 112,
+116, 114, 95, 116, 32, 105, 100, 120, 44, 32, 99, 111, 110, 115, 116,
+32, 95, 109, 95, 118, 97, 108, 117, 101, 32, 97, 114, 114, 91, 93, 44,
+32, 99, 111, 110, 115, 116, 32, 105, 110, 116, 112, 116, 114, 95, 116,
+32, 110, 41, 32, 123, 10, 32, 32, 32, 32, 95, 109, 95, 105, 116, 101,
+114, 32, 105, 116, 32, 61, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+105, 110, 115, 101, 114, 116, 95, 117, 110, 105, 110, 105, 116, 41,
+40, 115, 101, 108, 102, 44, 32, 105, 100, 120, 44, 32, 110, 41, 59,
+10, 32, 32, 32, 32, 105, 102, 32, 40, 105, 116, 46, 114, 101, 102, 41,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 99, 95, 109, 101, 109, 99, 112,
+121, 40, 105, 116, 46, 114, 101, 102, 44, 32, 97, 114, 114, 44, 32,
+110, 42, 99, 95, 115, 105, 122, 101, 111, 102, 32, 42, 97, 114, 114,
+41, 59, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 105,
+116, 59, 10, 125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95,
+109, 95, 105, 116, 101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+105, 110, 115, 101, 114, 116, 95, 97, 116, 41, 40, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 105, 116,
+101, 114, 32, 105, 116, 44, 32, 99, 111, 110, 115, 116, 32, 95, 109,
+95, 118, 97, 108, 117, 101, 32, 118, 97, 108, 117, 101, 41, 32, 123,
+10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 105, 110, 115, 101, 114, 116, 95, 110, 41, 40,
+115, 101, 108, 102, 44, 32, 95, 105, 116, 95, 112, 116, 114, 40, 105,
+116, 41, 32, 45, 32, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 44,
+32, 38, 118, 97, 108, 117, 101, 44, 32, 49, 41, 59, 10, 125, 10, 10,
+83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 105, 116,
+101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 114, 97, 115,
+101, 95, 97, 116, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 44, 32, 95, 109, 95, 105, 116, 101, 114, 32, 105, 116,
+41, 32, 123, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 95,
+99, 95, 77, 69, 77, 66, 40, 95, 101, 114, 97, 115, 101, 95, 110, 41,
+40, 115, 101, 108, 102, 44, 32, 105, 116, 46, 114, 101, 102, 32, 45,
+32, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 44, 32, 49, 41, 59,
+10, 125, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95,
+105, 116, 101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 114,
+97, 115, 101, 95, 114, 97, 110, 103, 101, 41, 40, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95, 105, 116,
+101, 114, 32, 105, 49, 44, 32, 95, 109, 95, 105, 116, 101, 114, 32,
+105, 50, 41, 32, 123, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114,
+110, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 114, 97, 115, 101,
+95, 110, 41, 40, 115, 101, 108, 102, 44, 32, 105, 49, 46, 114, 101,
+102, 32, 45, 32, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 44, 32,
+95, 105, 116, 50, 95, 112, 116, 114, 40, 105, 49, 44, 32, 105, 50, 41,
+32, 45, 32, 105, 49, 46, 114, 101, 102, 41, 59, 10, 125, 10, 10, 83,
+84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 99, 111, 110, 115, 116, 32,
+95, 109, 95, 118, 97, 108, 117, 101, 42, 10, 95, 99, 95, 77, 69, 77,
+66, 40, 95, 97, 116, 41, 40, 99, 111, 110, 115, 116, 32, 105, 95, 116,
+121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111, 110, 115,
+116, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105, 100, 120, 41,
+32, 123, 10, 32, 32, 32, 32, 99, 95, 97, 115, 115, 101, 114, 116, 40,
+105, 100, 120, 32, 60, 32, 115, 101, 108, 102, 45, 62, 95, 108, 101,
+110, 41, 59, 32, 114, 101, 116, 117, 114, 110, 32, 115, 101, 108, 102,
+45, 62, 100, 97, 116, 97, 32, 43, 32, 105, 100, 120, 59, 10, 125, 10,
+83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 118, 97, 108,
+117, 101, 42, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 97, 116, 95,
+109, 117, 116, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101,
+108, 102, 44, 32, 99, 111, 110, 115, 116, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 105, 100, 120, 41, 32, 123, 10, 32, 32, 32, 32, 99,
+95, 97, 115, 115, 101, 114, 116, 40, 105, 100, 120, 32, 60, 32, 115,
+101, 108, 102, 45, 62, 95, 108, 101, 110, 41, 59, 32, 114, 101, 116,
+117, 114, 110, 32, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 32,
+43, 32, 105, 100, 120, 59, 10, 125, 10, 10, 10, 83, 84, 67, 95, 73,
+78, 76, 73, 78, 69, 32, 95, 109, 95, 105, 116, 101, 114, 32, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 98, 101, 103, 105, 110, 41, 40, 99, 111,
+110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108,
+102, 41, 32, 123, 32, 10, 32, 32, 32, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 110, 32, 61, 32, 115, 101, 108, 102, 45, 62, 95,
+108, 101, 110, 59, 32, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114,
+110, 32, 99, 95, 76, 73, 84, 69, 82, 65, 76, 40, 95, 109, 95, 105,
+116, 101, 114, 41, 123, 110, 32, 63, 32, 115, 101, 108, 102, 45, 62,
+100, 97, 116, 97, 32, 58, 32, 78, 85, 76, 76, 44, 32, 115, 101, 108,
+102, 45, 62, 100, 97, 116, 97, 32, 43, 32, 110, 125, 59, 10, 125, 10,
+10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 105, 116,
+101, 114, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 110, 100, 41,
+40, 99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32,
+115, 101, 108, 102, 41, 32, 10, 32, 32, 32, 32, 123, 32, 114, 101,
+116, 117, 114, 110, 32, 99, 95, 76, 73, 84, 69, 82, 65, 76, 40, 95,
+109, 95, 105, 116, 101, 114, 41, 123, 78, 85, 76, 76, 44, 32, 115,
+101, 108, 102, 45, 62, 100, 97, 116, 97, 32, 43, 32, 115, 101, 108,
+102, 45, 62, 95, 108, 101, 110, 125, 59, 32, 125, 10, 10, 83, 84, 67,
+95, 73, 78, 76, 73, 78, 69, 32, 118, 111, 105, 100, 32, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 110, 101, 120, 116, 41, 40, 95, 109, 95, 105,
+116, 101, 114, 42, 32, 105, 116, 41, 32, 10, 32, 32, 32, 32, 123, 32,
+105, 102, 32, 40, 43, 43, 105, 116, 45, 62, 114, 101, 102, 32, 61, 61,
+32, 105, 116, 45, 62, 101, 110, 100, 41, 32, 105, 116, 45, 62, 114,
+101, 102, 32, 61, 32, 78, 85, 76, 76, 59, 32, 125, 10, 10, 83, 84, 67,
+95, 73, 78, 76, 73, 78, 69, 32, 95, 109, 95, 105, 116, 101, 114, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 97, 100, 118, 97, 110, 99, 101,
+41, 40, 95, 109, 95, 105, 116, 101, 114, 32, 105, 116, 44, 32, 115,
+105, 122, 101, 95, 116, 32, 110, 41, 10, 32, 32, 32, 32, 123, 32, 105,
+102, 32, 40, 40, 105, 116, 46, 114, 101, 102, 32, 43, 61, 32, 110, 41,
+32, 62, 61, 32, 105, 116, 46, 101, 110, 100, 41, 32, 105, 116, 46,
+114, 101, 102, 32, 61, 32, 78, 85, 76, 76, 59, 32, 114, 101, 116, 117,
+114, 110, 32, 105, 116, 59, 32, 125, 10, 10, 83, 84, 67, 95, 73, 78,
+76, 73, 78, 69, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 105, 110, 100, 101, 120, 41, 40, 99, 111,
+110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108,
+102, 44, 32, 95, 109, 95, 105, 116, 101, 114, 32, 105, 116, 41, 32,
+10, 32, 32, 32, 32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 40,
+105, 116, 46, 114, 101, 102, 32, 45, 32, 115, 101, 108, 102, 45, 62,
+100, 97, 116, 97, 41, 59, 32, 125, 10, 10, 83, 84, 67, 95, 73, 78, 76,
+73, 78, 69, 32, 118, 111, 105, 100, 32, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 97, 100, 106, 117, 115, 116, 95, 101, 110, 100, 95, 41, 40,
+105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 105,
+110, 116, 112, 116, 114, 95, 116, 32, 110, 41, 10, 32, 32, 32, 32,
+123, 32, 115, 101, 108, 102, 45, 62, 95, 108, 101, 110, 32, 43, 61,
+32, 110, 59, 32, 125, 10, 10, 35, 105, 102, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 95, 105, 95, 104, 97, 115, 95, 101, 113, 32, 124,
+124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 105, 95, 104, 97,
+115, 95, 99, 109, 112, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32,
+95, 109, 95, 105, 116, 101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 102, 105, 110, 100, 41, 40, 99, 111, 110, 115, 116, 32, 105, 95,
+116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95,
+114, 97, 119, 32, 114, 97, 119, 41, 32, 123, 10, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 102,
+105, 110, 100, 95, 105, 110, 41, 40, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 98, 101, 103, 105, 110, 41, 40, 115, 101, 108, 102, 41, 44, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 101, 110, 100, 41, 40, 115, 101,
+108, 102, 41, 44, 32, 114, 97, 119, 41, 59, 10, 125, 10, 10, 83, 84,
+67, 95, 73, 78, 76, 73, 78, 69, 32, 99, 111, 110, 115, 116, 32, 95,
+109, 95, 118, 97, 108, 117, 101, 42, 10, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 103, 101, 116, 41, 40, 99, 111, 110, 115, 116, 32, 105, 95,
+116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 95, 109, 95,
+114, 97, 119, 32, 114, 97, 119, 41, 32, 123, 10, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 102,
+105, 110, 100, 41, 40, 115, 101, 108, 102, 44, 32, 114, 97, 119, 41,
+46, 114, 101, 102, 59, 10, 125, 10, 10, 83, 84, 67, 95, 73, 78, 76,
+73, 78, 69, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42, 10, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 103, 101, 116, 95, 109, 117, 116, 41, 40,
+99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 44, 32, 95, 109, 95, 114, 97, 119, 32, 114, 97, 119,
+41, 10, 32, 32, 32, 32, 123, 32, 114, 101, 116, 117, 114, 110, 32, 40,
+95, 109, 95, 118, 97, 108, 117, 101, 42, 41, 32, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 103, 101, 116, 41, 40, 115, 101, 108, 102, 44, 32,
+114, 97, 119, 41, 59, 32, 125, 10, 10, 83, 84, 67, 95, 73, 78, 76, 73,
+78, 69, 32, 95, 66, 111, 111, 108, 10, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 101, 113, 41, 40, 99, 111, 110, 115, 116, 32, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111, 110, 115, 116,
+32, 105, 95, 116, 121, 112, 101, 42, 32, 111, 116, 104, 101, 114, 41,
+32, 123, 10, 32, 32, 32, 32, 105, 102, 32, 40, 115, 101, 108, 102, 45,
+62, 95, 108, 101, 110, 32, 33, 61, 32, 111, 116, 104, 101, 114, 45,
+62, 95, 108, 101, 110, 41, 32, 114, 101, 116, 117, 114, 110, 32, 48,
+59, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 105, 110, 116, 112,
+116, 114, 95, 116, 32, 105, 32, 61, 32, 48, 59, 32, 105, 32, 60, 32,
+115, 101, 108, 102, 45, 62, 95, 108, 101, 110, 59, 32, 43, 43, 105,
+41, 32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 99, 111, 110, 115,
+116, 32, 95, 109, 95, 114, 97, 119, 32, 95, 114, 120, 32, 61, 32, 105,
+95, 107, 101, 121, 116, 111, 40, 115, 101, 108, 102, 45, 62, 100, 97,
+116, 97, 43, 105, 41, 44, 32, 95, 114, 121, 32, 61, 32, 105, 95, 107,
+101, 121, 116, 111, 40, 111, 116, 104, 101, 114, 45, 62, 100, 97, 116,
+97, 43, 105, 41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 105, 102, 32,
+40, 33, 40, 105, 95, 101, 113, 40, 40, 38, 95, 114, 120, 41, 44, 32,
+40, 38, 95, 114, 121, 41, 41, 41, 41, 32, 114, 101, 116, 117, 114,
+110, 32, 48, 59, 10, 32, 32, 32, 32, 125, 10, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 49, 59, 10, 125, 10, 35, 101, 110, 100,
+105, 102, 10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101, 100,
+32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 10, 83, 84, 67, 95,
+65, 80, 73, 32, 105, 110, 116, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+118, 97, 108, 117, 101, 95, 99, 109, 112, 41, 40, 99, 111, 110, 115,
+116, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42, 32, 120, 44, 32, 99,
+111, 110, 115, 116, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42, 32,
+121, 41, 59, 10, 10, 83, 84, 67, 95, 73, 78, 76, 73, 78, 69, 32, 118,
+111, 105, 100, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 115, 111, 114,
+116, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102,
+41, 32, 123, 10, 32, 32, 32, 32, 113, 115, 111, 114, 116, 40, 115,
+101, 108, 102, 45, 62, 100, 97, 116, 97, 44, 32, 40, 115, 105, 122,
+101, 95, 116, 41, 115, 101, 108, 102, 45, 62, 95, 108, 101, 110, 44,
+32, 115, 105, 122, 101, 111, 102, 40, 95, 109, 95, 118, 97, 108, 117,
+101, 41, 44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 105, 110,
+116, 40, 42, 41, 40, 99, 111, 110, 115, 116, 32, 118, 111, 105, 100,
+42, 44, 32, 99, 111, 110, 115, 116, 32, 118, 111, 105, 100, 42, 41,
+41, 95, 99, 95, 77, 69, 77, 66, 40, 95, 118, 97, 108, 117, 101, 95,
+99, 109, 112, 41, 41, 59, 10, 125, 10, 10, 83, 84, 67, 95, 73, 78, 76,
+73, 78, 69, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42, 10, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 98, 115, 101, 97, 114, 99, 104, 41, 40,
+99, 111, 110, 115, 116, 32, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 44, 32, 95, 109, 95, 118, 97, 108, 117, 101, 32, 107,
+101, 121, 41, 32, 123, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114,
+110, 32, 40, 95, 109, 95, 118, 97, 108, 117, 101, 42, 41, 98, 115,
+101, 97, 114, 99, 104, 40, 38, 107, 101, 121, 44, 32, 115, 101, 108,
+102, 45, 62, 100, 97, 116, 97, 44, 32, 40, 115, 105, 122, 101, 95,
+116, 41, 115, 101, 108, 102, 45, 62, 95, 108, 101, 110, 44, 32, 115,
+105, 122, 101, 111, 102, 40, 95, 109, 95, 118, 97, 108, 117, 101, 41,
+44, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 40, 105,
+110, 116, 40, 42, 41, 40, 99, 111, 110, 115, 116, 32, 118, 111, 105,
+100, 42, 44, 32, 99, 111, 110, 115, 116, 32, 118, 111, 105, 100, 42,
+41, 41, 95, 99, 95, 77, 69, 77, 66, 40, 95, 118, 97, 108, 117, 101,
+95, 99, 109, 112, 41, 41, 59, 10, 125, 10, 35, 101, 110, 100, 105,
+102, 32, 47, 47, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 10,
+10, 47, 42, 32, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 32, 73, 77, 80,
+76, 69, 77, 69, 78, 84, 65, 84, 73, 79, 78, 32, 45, 45, 45, 45, 45,
+45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45, 45,
+45, 45, 45, 32, 42, 47, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 40, 105, 95, 105, 109, 112, 108, 101, 109, 101, 110, 116,
+41, 32, 124, 124, 32, 100, 101, 102, 105, 110, 101, 100, 40, 105, 95,
+115, 116, 97, 116, 105, 99, 41, 10, 10, 83, 84, 67, 95, 68, 69, 70,
+32, 105, 95, 116, 121, 112, 101, 10, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 105, 110, 105, 116, 41, 40, 118, 111, 105, 100, 41, 32, 123, 10,
+32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 99, 95, 76, 73, 84,
+69, 82, 65, 76, 40, 105, 95, 116, 121, 112, 101, 41, 123, 78, 85, 76,
+76, 125, 59, 10, 125, 10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 118,
+111, 105, 100, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 108, 101,
+97, 114, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115, 101, 108,
+102, 41, 32, 123, 10, 32, 32, 32, 32, 105, 102, 32, 40, 115, 101, 108,
+102, 45, 62, 95, 99, 97, 112, 41, 32, 123, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 102, 111, 114, 32, 40, 95, 109, 95, 118, 97, 108, 117, 101,
+32, 42, 112, 32, 61, 32, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97,
+44, 32, 42, 113, 32, 61, 32, 112, 32, 43, 32, 115, 101, 108, 102, 45,
+62, 95, 108, 101, 110, 59, 32, 112, 32, 33, 61, 32, 113, 59, 32, 41,
+32, 123, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 45, 45,
+113, 59, 32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 40, 113, 41,
+59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 125, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 115, 101, 108, 102, 45, 62, 95, 108, 101, 110, 32, 61, 32,
+48, 59, 10, 32, 32, 32, 32, 125, 10, 125, 10, 10, 83, 84, 67, 95, 68,
+69, 70, 32, 118, 111, 105, 100, 10, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 100, 114, 111, 112, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32,
+115, 101, 108, 102, 41, 32, 123, 10, 32, 32, 32, 32, 105, 102, 32, 40,
+115, 101, 108, 102, 45, 62, 95, 99, 97, 112, 32, 61, 61, 32, 48, 41,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 59,
+10, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 108, 101,
+97, 114, 41, 40, 115, 101, 108, 102, 41, 59, 10, 32, 32, 32, 32, 105,
+95, 102, 114, 101, 101, 40, 115, 101, 108, 102, 45, 62, 100, 97, 116,
+97, 44, 32, 115, 101, 108, 102, 45, 62, 95, 99, 97, 112, 42, 99, 95,
+115, 105, 122, 101, 111, 102, 40, 42, 115, 101, 108, 102, 45, 62, 100,
+97, 116, 97, 41, 41, 59, 10, 125, 10, 10, 83, 84, 67, 95, 68, 69, 70,
+32, 95, 66, 111, 111, 108, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+114, 101, 115, 101, 114, 118, 101, 41, 40, 105, 95, 116, 121, 112,
+101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111, 110, 115, 116, 32,
+105, 110, 116, 112, 116, 114, 95, 116, 32, 99, 97, 112, 41, 32, 123,
+10, 32, 32, 32, 32, 105, 102, 32, 40, 99, 97, 112, 32, 62, 32, 115,
+101, 108, 102, 45, 62, 95, 99, 97, 112, 32, 124, 124, 32, 40, 99, 97,
+112, 32, 38, 38, 32, 99, 97, 112, 32, 61, 61, 32, 115, 101, 108, 102,
+45, 62, 95, 108, 101, 110, 41, 41, 32, 123, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42, 32, 100, 32, 61,
+32, 40, 95, 109, 95, 118, 97, 108, 117, 101, 42, 41, 105, 95, 114,
+101, 97, 108, 108, 111, 99, 40, 115, 101, 108, 102, 45, 62, 100, 97,
+116, 97, 44, 32, 115, 101, 108, 102, 45, 62, 95, 99, 97, 112, 42, 99,
+95, 115, 105, 122, 101, 111, 102, 32, 42, 100, 44, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+99, 97, 112, 42, 99, 95, 115, 105, 122, 101, 111, 102, 32, 42, 100,
+41, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 105, 102, 32, 40, 33, 100,
+41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 114, 101, 116,
+117, 114, 110, 32, 48, 59, 10, 32, 32, 32, 32, 32, 32, 32, 32, 115,
+101, 108, 102, 45, 62, 100, 97, 116, 97, 32, 61, 32, 100, 59, 10, 32,
+32, 32, 32, 32, 32, 32, 32, 115, 101, 108, 102, 45, 62, 95, 99, 97,
+112, 32, 61, 32, 99, 97, 112, 59, 10, 32, 32, 32, 32, 125, 10, 32, 32,
+32, 32, 114, 101, 116, 117, 114, 110, 32, 49, 59, 10, 125, 10, 10, 83,
+84, 67, 95, 68, 69, 70, 32, 95, 66, 111, 111, 108, 10, 95, 99, 95, 77,
+69, 77, 66, 40, 95, 114, 101, 115, 105, 122, 101, 41, 40, 105, 95,
+116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111, 110,
+115, 116, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 108, 101,
+110, 44, 32, 95, 109, 95, 118, 97, 108, 117, 101, 32, 110, 117, 108,
+108, 41, 32, 123, 10, 32, 32, 32, 32, 105, 102, 32, 40, 33, 95, 99,
+95, 77, 69, 77, 66, 40, 95, 114, 101, 115, 101, 114, 118, 101, 41, 40,
+115, 101, 108, 102, 44, 32, 108, 101, 110, 41, 41, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 48, 59, 10, 32, 32,
+32, 32, 99, 111, 110, 115, 116, 32, 105, 110, 116, 112, 116, 114, 95,
+116, 32, 110, 32, 61, 32, 115, 101, 108, 102, 45, 62, 95, 108, 101,
+110, 59, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 105, 110, 116,
+112, 116, 114, 95, 116, 32, 105, 32, 61, 32, 108, 101, 110, 59, 32,
+105, 32, 60, 32, 110, 59, 32, 43, 43, 105, 41, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 123, 32, 105, 95, 107, 101, 121, 100, 114, 111, 112, 40,
+40, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 32, 43, 32, 105, 41,
+41, 59, 32, 125, 10, 32, 32, 32, 32, 102, 111, 114, 32, 40, 105, 110,
+116, 112, 116, 114, 95, 116, 32, 105, 32, 61, 32, 110, 59, 32, 105,
+32, 60, 32, 108, 101, 110, 59, 32, 43, 43, 105, 41, 10, 32, 32, 32,
+32, 32, 32, 32, 32, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 91,
+105, 93, 32, 61, 32, 110, 117, 108, 108, 59, 10, 32, 32, 32, 32, 115,
+101, 108, 102, 45, 62, 95, 108, 101, 110, 32, 61, 32, 108, 101, 110,
+59, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 49, 59, 10,
+125, 10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 95, 109, 95, 105, 116,
+101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 105, 110, 115, 101,
+114, 116, 95, 117, 110, 105, 110, 105, 116, 41, 40, 105, 95, 116, 121,
+112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111, 110, 115, 116,
+32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105, 100, 120, 44, 32,
+99, 111, 110, 115, 116, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32,
+110, 41, 32, 123, 10, 32, 32, 32, 32, 105, 102, 32, 40, 115, 101, 108,
+102, 45, 62, 95, 108, 101, 110, 32, 43, 32, 110, 32, 62, 32, 115, 101,
+108, 102, 45, 62, 95, 99, 97, 112, 41, 10, 32, 32, 32, 32, 32, 32, 32,
+32, 105, 102, 32, 40, 33, 95, 99, 95, 77, 69, 77, 66, 40, 95, 114,
+101, 115, 101, 114, 118, 101, 41, 40, 115, 101, 108, 102, 44, 32, 115,
+101, 108, 102, 45, 62, 95, 108, 101, 110, 42, 51, 47, 50, 32, 43, 32,
+110, 41, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 101,
+110, 100, 41, 40, 115, 101, 108, 102, 41, 59, 10, 10, 32, 32, 32, 32,
+95, 109, 95, 118, 97, 108, 117, 101, 42, 32, 112, 111, 115, 32, 61,
+32, 115, 101, 108, 102, 45, 62, 100, 97, 116, 97, 32, 43, 32, 105,
+100, 120, 59, 10, 32, 32, 32, 32, 99, 95, 109, 101, 109, 109, 111,
+118, 101, 40, 112, 111, 115, 32, 43, 32, 110, 44, 32, 112, 111, 115,
+44, 32, 40, 115, 101, 108, 102, 45, 62, 95, 108, 101, 110, 32, 45, 32,
+105, 100, 120, 41, 42, 99, 95, 115, 105, 122, 101, 111, 102, 32, 42,
+112, 111, 115, 41, 59, 10, 32, 32, 32, 32, 115, 101, 108, 102, 45, 62,
+95, 108, 101, 110, 32, 43, 61, 32, 110, 59, 10, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 99, 95, 76, 73, 84, 69, 82, 65, 76, 40,
+95, 109, 95, 105, 116, 101, 114, 41, 123, 112, 111, 115, 44, 32, 115,
+101, 108, 102, 45, 62, 100, 97, 116, 97, 32, 43, 32, 115, 101, 108,
+102, 45, 62, 95, 108, 101, 110, 125, 59, 10, 125, 10, 10, 83, 84, 67,
+95, 68, 69, 70, 32, 95, 109, 95, 105, 116, 101, 114, 10, 95, 99, 95,
+77, 69, 77, 66, 40, 95, 101, 114, 97, 115, 101, 95, 110, 41, 40, 105,
+95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111,
+110, 115, 116, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105,
+100, 120, 44, 32, 99, 111, 110, 115, 116, 32, 105, 110, 116, 112, 116,
+114, 95, 116, 32, 108, 101, 110, 41, 32, 123, 10, 32, 32, 32, 32, 95,
+109, 95, 118, 97, 108, 117, 101, 42, 32, 100, 32, 61, 32, 115, 101,
+108, 102, 45, 62, 100, 97, 116, 97, 32, 43, 32, 105, 100, 120, 44, 32,
+42, 112, 32, 61, 32, 100, 44, 32, 42, 101, 110, 100, 32, 61, 32, 115,
+101, 108, 102, 45, 62, 100, 97, 116, 97, 32, 43, 32, 115, 101, 108,
+102, 45, 62, 95, 108, 101, 110, 59, 10, 32, 32, 32, 32, 102, 111, 114,
+32, 40, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105, 32, 61, 32,
+48, 59, 32, 105, 32, 60, 32, 108, 101, 110, 59, 32, 43, 43, 105, 44,
+32, 43, 43, 112, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 123, 32, 105,
+95, 107, 101, 121, 100, 114, 111, 112, 40, 112, 41, 59, 32, 125, 10,
+32, 32, 32, 32, 99, 95, 109, 101, 109, 109, 111, 118, 101, 40, 100,
+44, 32, 112, 44, 32, 40, 101, 110, 100, 32, 45, 32, 112, 41, 42, 99,
+95, 115, 105, 122, 101, 111, 102, 32, 42, 100, 41, 59, 10, 32, 32, 32,
+32, 115, 101, 108, 102, 45, 62, 95, 108, 101, 110, 32, 45, 61, 32,
+108, 101, 110, 59, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110,
+32, 99, 95, 76, 73, 84, 69, 82, 65, 76, 40, 95, 109, 95, 105, 116,
+101, 114, 41, 123, 112, 32, 61, 61, 32, 101, 110, 100, 32, 63, 32, 78,
+85, 76, 76, 32, 58, 32, 100, 44, 32, 101, 110, 100, 32, 45, 32, 108,
+101, 110, 125, 59, 10, 125, 10, 10, 35, 105, 102, 32, 33, 100, 101,
+102, 105, 110, 101, 100, 32, 105, 95, 110, 111, 95, 99, 108, 111, 110,
+101, 10, 83, 84, 67, 95, 68, 69, 70, 32, 105, 95, 116, 121, 112, 101,
+10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 108, 111, 110, 101, 41,
+40, 105, 95, 116, 121, 112, 101, 32, 99, 120, 41, 32, 123, 10, 32, 32,
+32, 32, 105, 95, 116, 121, 112, 101, 32, 111, 117, 116, 32, 61, 32,
+95, 99, 95, 77, 69, 77, 66, 40, 95, 105, 110, 105, 116, 41, 40, 41,
+59, 10, 32, 32, 32, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 111,
+112, 121, 95, 110, 41, 40, 38, 111, 117, 116, 44, 32, 48, 44, 32, 99,
+120, 46, 100, 97, 116, 97, 44, 32, 99, 120, 46, 95, 108, 101, 110, 41,
+59, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 111, 117,
+116, 59, 10, 125, 10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 95, 109, 95,
+105, 116, 101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95, 99, 111,
+112, 121, 95, 110, 41, 40, 105, 95, 116, 121, 112, 101, 42, 32, 115,
+101, 108, 102, 44, 32, 99, 111, 110, 115, 116, 32, 105, 110, 116, 112,
+116, 114, 95, 116, 32, 105, 100, 120, 44, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 99, 111, 110, 115, 116,
+32, 95, 109, 95, 118, 97, 108, 117, 101, 32, 97, 114, 114, 91, 93, 44,
+32, 99, 111, 110, 115, 116, 32, 105, 110, 116, 112, 116, 114, 95, 116,
+32, 110, 41, 32, 123, 10, 32, 32, 32, 32, 95, 109, 95, 105, 116, 101,
+114, 32, 105, 116, 32, 61, 32, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+105, 110, 115, 101, 114, 116, 95, 117, 110, 105, 110, 105, 116, 41,
+40, 115, 101, 108, 102, 44, 32, 105, 100, 120, 44, 32, 110, 41, 59,
+10, 32, 32, 32, 32, 105, 102, 32, 40, 105, 116, 46, 114, 101, 102, 41,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 102, 111, 114, 32, 40, 95, 109,
+95, 118, 97, 108, 117, 101, 42, 32, 112, 32, 61, 32, 105, 116, 46,
+114, 101, 102, 44, 32, 42, 113, 32, 61, 32, 112, 32, 43, 32, 110, 59,
+32, 112, 32, 33, 61, 32, 113, 59, 32, 43, 43, 97, 114, 114, 41, 10,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 42, 112, 43, 43, 32,
+61, 32, 105, 95, 107, 101, 121, 99, 108, 111, 110, 101, 40, 40, 42,
+97, 114, 114, 41, 41, 59, 10, 32, 32, 32, 32, 114, 101, 116, 117, 114,
+110, 32, 105, 116, 59, 10, 125, 10, 35, 101, 110, 100, 105, 102, 32,
+47, 47, 32, 33, 105, 95, 110, 111, 95, 99, 108, 111, 110, 101, 10, 10,
+35, 105, 102, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 105, 95,
+110, 111, 95, 101, 109, 112, 108, 97, 99, 101, 10, 83, 84, 67, 95, 68,
+69, 70, 32, 95, 109, 95, 105, 116, 101, 114, 10, 95, 99, 95, 77, 69,
+77, 66, 40, 95, 101, 109, 112, 108, 97, 99, 101, 95, 110, 41, 40, 105,
+95, 116, 121, 112, 101, 42, 32, 115, 101, 108, 102, 44, 32, 99, 111,
+110, 115, 116, 32, 105, 110, 116, 112, 116, 114, 95, 116, 32, 105,
+100, 120, 44, 32, 99, 111, 110, 115, 116, 32, 95, 109, 95, 114, 97,
+119, 32, 114, 97, 119, 91, 93, 44, 32, 105, 110, 116, 112, 116, 114,
+95, 116, 32, 110, 41, 32, 123, 10, 32, 32, 32, 32, 95, 109, 95, 105,
+116, 101, 114, 32, 105, 116, 32, 61, 32, 95, 99, 95, 77, 69, 77, 66,
+40, 95, 105, 110, 115, 101, 114, 116, 95, 117, 110, 105, 110, 105,
+116, 41, 40, 115, 101, 108, 102, 44, 32, 105, 100, 120, 44, 32, 110,
+41, 59, 10, 32, 32, 32, 32, 105, 102, 32, 40, 105, 116, 46, 114, 101,
+102, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 102, 111, 114, 32, 40,
+95, 109, 95, 118, 97, 108, 117, 101, 42, 32, 112, 32, 61, 32, 105,
+116, 46, 114, 101, 102, 59, 32, 110, 45, 45, 59, 32, 43, 43, 114, 97,
+119, 44, 32, 43, 43, 112, 41, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 42, 112, 32, 61, 32, 105, 95, 107, 101, 121, 102, 114,
+111, 109, 40, 40, 42, 114, 97, 119, 41, 41, 59, 10, 32, 32, 32, 32,
+114, 101, 116, 117, 114, 110, 32, 105, 116, 59, 10, 125, 10, 35, 101,
+110, 100, 105, 102, 32, 47, 47, 32, 33, 105, 95, 110, 111, 95, 101,
+109, 112, 108, 97, 99, 101, 10, 35, 105, 102, 32, 100, 101, 102, 105,
+110, 101, 100, 32, 95, 105, 95, 104, 97, 115, 95, 101, 113, 32, 124,
+124, 32, 100, 101, 102, 105, 110, 101, 100, 32, 95, 105, 95, 104, 97,
+115, 95, 99, 109, 112, 10, 10, 83, 84, 67, 95, 68, 69, 70, 32, 95,
+109, 95, 105, 116, 101, 114, 10, 95, 99, 95, 77, 69, 77, 66, 40, 95,
+102, 105, 110, 100, 95, 105, 110, 41, 40, 95, 109, 95, 105, 116, 101,
+114, 32, 105, 49, 44, 32, 95, 109, 95, 105, 116, 101, 114, 32, 105,
+50, 44, 32, 95, 109, 95, 114, 97, 119, 32, 114, 97, 119, 41, 32, 123,
+10, 32, 32, 32, 32, 99, 111, 110, 115, 116, 32, 95, 109, 95, 118, 97,
+108, 117, 101, 42, 32, 112, 50, 32, 61, 32, 95, 105, 116, 50, 95, 112,
+116, 114, 40, 105, 49, 44, 32, 105, 50, 41, 59, 10, 32, 32, 32, 32,
+102, 111, 114, 32, 40, 59, 32, 105, 49, 46, 114, 101, 102, 32, 33, 61,
+32, 112, 50, 59, 32, 43, 43, 105, 49, 46, 114, 101, 102, 41, 32, 123,
+10, 32, 32, 32, 32, 32, 32, 32, 32, 99, 111, 110, 115, 116, 32, 95,
+109, 95, 114, 97, 119, 32, 114, 32, 61, 32, 105, 95, 107, 101, 121,
+116, 111, 40, 105, 49, 46, 114, 101, 102, 41, 59, 10, 32, 32, 32, 32,
+32, 32, 32, 32, 105, 102, 32, 40, 105, 95, 101, 113, 40, 40, 38, 114,
+97, 119, 41, 44, 32, 40, 38, 114, 41, 41, 41, 10, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 114, 101, 116, 117, 114, 110, 32, 105, 49,
+59, 10, 32, 32, 32, 32, 125, 10, 32, 32, 32, 32, 105, 50, 46, 114,
+101, 102, 32, 61, 32, 78, 85, 76, 76, 59, 10, 32, 32, 32, 32, 114,
+101, 116, 117, 114, 110, 32, 105, 50, 59, 10, 125, 10, 35, 101, 110,
+100, 105, 102, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110, 101,
+100, 32, 95, 105, 95, 104, 97, 115, 95, 99, 109, 112, 10, 83, 84, 67,
+95, 68, 69, 70, 32, 105, 110, 116, 32, 95, 99, 95, 77, 69, 77, 66, 40,
+95, 118, 97, 108, 117, 101, 95, 99, 109, 112, 41, 40, 99, 111, 110,
+115, 116, 32, 95, 109, 95, 118, 97, 108, 117, 101, 42, 32, 120, 44,
+32, 99, 111, 110, 115, 116, 32, 95, 109, 95, 118, 97, 108, 117, 101,
+42, 32, 121, 41, 32, 123, 10, 32, 32, 32, 32, 99, 111, 110, 115, 116,
+32, 95, 109, 95, 114, 97, 119, 32, 114, 120, 32, 61, 32, 105, 95, 107,
+101, 121, 116, 111, 40, 120, 41, 59, 10, 32, 32, 32, 32, 99, 111, 110,
+115, 116, 32, 95, 109, 95, 114, 97, 119, 32, 114, 121, 32, 61, 32,
+105, 95, 107, 101, 121, 116, 111, 40, 121, 41, 59, 10, 32, 32, 32, 32,
+114, 101, 116, 117, 114, 110, 32, 105, 95, 99, 109, 112, 40, 40, 38,
+114, 120, 41, 44, 32, 40, 38, 114, 121, 41, 41, 59, 10, 125, 10, 35,
+101, 110, 100, 105, 102, 32, 47, 47, 32, 95, 105, 95, 104, 97, 115,
+95, 99, 109, 112, 10, 35, 101, 110, 100, 105, 102, 32, 47, 47, 32,
+105, 95, 105, 109, 112, 108, 101, 109, 101, 110, 116, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 67, 86, 69, 67, 95, 72, 95, 73, 78, 67,
+76, 85, 68, 69, 68, 10, 47, 47, 32, 35, 35, 35, 32, 66, 69, 71, 73,
+78, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 116,
+101, 109, 112, 108, 97, 116, 101, 50, 46, 104, 10, 35, 105, 102, 100,
+101, 102, 32, 105, 95, 109, 111, 114, 101, 10, 35, 117, 110, 100, 101,
+102, 32, 105, 95, 109, 111, 114, 101, 10, 35, 101, 108, 115, 101, 10,
+35, 117, 110, 100, 101, 102, 32, 105, 95, 116, 121, 112, 101, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 116, 97, 103, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 105, 109, 112, 10, 35, 117, 110, 100, 101,
+102, 32, 105, 95, 111, 112, 116, 10, 35, 117, 110, 100, 101, 102, 32,
+105, 95, 108, 101, 115, 115, 10, 35, 117, 110, 100, 101, 102, 32, 105,
+95, 99, 109, 112, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 101,
+113, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 104, 97, 115, 104,
+10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 99, 97, 112, 97, 99,
+105, 116, 121, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 114, 97,
+119, 95, 99, 108, 97, 115, 115, 10, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 10, 35, 117, 110, 100, 101, 102, 32, 105,
+95, 118, 97, 108, 95, 115, 116, 114, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 95, 115, 115, 118, 10, 35, 117, 110, 100,
+101, 102, 32, 105, 95, 118, 97, 108, 95, 97, 114, 99, 98, 111, 120,
+10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 118, 97, 108, 95, 99,
+108, 97, 115, 115, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 118,
+97, 108, 114, 97, 119, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95,
+118, 97, 108, 99, 108, 111, 110, 101, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 118, 97, 108, 102, 114, 111, 109, 10, 35, 117, 110, 100,
+101, 102, 32, 105, 95, 118, 97, 108, 116, 111, 10, 35, 117, 110, 100,
+101, 102, 32, 105, 95, 118, 97, 108, 100, 114, 111, 112, 10, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 107, 101, 121, 95, 115, 116, 114, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 95, 115, 115,
+118, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 95,
+97, 114, 99, 98, 111, 120, 10, 35, 117, 110, 100, 101, 102, 32, 105,
+95, 107, 101, 121, 95, 99, 108, 97, 115, 115, 10, 35, 117, 110, 100,
+101, 102, 32, 105, 95, 107, 101, 121, 114, 97, 119, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 107, 101, 121, 99, 108, 111, 110, 101, 10,
+35, 117, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121, 102, 114,
+111, 109, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121,
+116, 111, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 107, 101, 121,
+100, 114, 111, 112, 10, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95,
+117, 115, 101, 95, 99, 109, 112, 10, 35, 117, 110, 100, 101, 102, 32,
+105, 95, 110, 111, 95, 104, 97, 115, 104, 10, 35, 117, 110, 100, 101,
+102, 32, 105, 95, 110, 111, 95, 99, 108, 111, 110, 101, 10, 35, 117,
+110, 100, 101, 102, 32, 105, 95, 110, 111, 95, 101, 109, 112, 108, 97,
+99, 101, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 105, 115, 95,
+102, 111, 114, 119, 97, 114, 100, 10, 35, 117, 110, 100, 101, 102, 32,
+105, 95, 104, 97, 115, 95, 101, 109, 112, 108, 97, 99, 101, 10, 10,
+35, 117, 110, 100, 101, 102, 32, 95, 105, 95, 104, 97, 115, 95, 99,
+109, 112, 10, 35, 117, 110, 100, 101, 102, 32, 95, 105, 95, 104, 97,
+115, 95, 101, 113, 10, 35, 117, 110, 100, 101, 102, 32, 95, 105, 95,
+112, 114, 101, 102, 105, 120, 10, 35, 117, 110, 100, 101, 102, 32, 95,
+105, 95, 116, 101, 109, 112, 108, 97, 116, 101, 10, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 107, 101, 121, 99, 108, 97, 115, 115, 32,
+47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116, 101, 100, 93,
+10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 118, 97, 108, 99, 108,
+97, 115, 115, 32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97,
+116, 101, 100, 93, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 114,
+97, 119, 99, 108, 97, 115, 115, 32, 47, 47, 32, 91, 100, 101, 112,
+114, 101, 99, 97, 116, 101, 100, 93, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 107, 101, 121, 98, 111, 120, 101, 100, 32, 47, 47, 32,
+91, 100, 101, 112, 114, 101, 99, 97, 116, 101, 100, 93, 10, 35, 117,
+110, 100, 101, 102, 32, 105, 95, 118, 97, 108, 98, 111, 120, 101, 100,
+32, 47, 47, 32, 91, 100, 101, 112, 114, 101, 99, 97, 116, 101, 100,
+93, 10, 35, 101, 110, 100, 105, 102, 10, 47, 47, 32, 35, 35, 35, 32,
+69, 78, 68, 95, 70, 73, 76, 69, 95, 73, 78, 67, 76, 85, 68, 69, 58,
+32, 116, 101, 109, 112, 108, 97, 116, 101, 50, 46, 104, 10, 47, 47,
+32, 35, 35, 35, 32, 66, 69, 71, 73, 78, 95, 70, 73, 76, 69, 95, 73,
+78, 67, 76, 85, 68, 69, 58, 32, 108, 105, 110, 107, 97, 103, 101, 50,
+46, 104, 10, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 97, 108,
+108, 111, 99, 97, 116, 111, 114, 10, 35, 117, 110, 100, 101, 102, 32,
+105, 95, 109, 97, 108, 108, 111, 99, 10, 35, 117, 110, 100, 101, 102,
+32, 105, 95, 99, 97, 108, 108, 111, 99, 10, 35, 117, 110, 100, 101,
+102, 32, 105, 95, 114, 101, 97, 108, 108, 111, 99, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 102, 114, 101, 101, 10, 10, 35, 117, 110,
+100, 101, 102, 32, 105, 95, 115, 116, 97, 116, 105, 99, 10, 35, 117,
+110, 100, 101, 102, 32, 105, 95, 104, 101, 97, 100, 101, 114, 10, 35,
+117, 110, 100, 101, 102, 32, 105, 95, 105, 109, 112, 108, 101, 109,
+101, 110, 116, 10, 35, 117, 110, 100, 101, 102, 32, 105, 95, 105, 109,
+112, 111, 114, 116, 10, 10, 35, 105, 102, 32, 100, 101, 102, 105, 110,
+101, 100, 32, 95, 95, 99, 108, 97, 110, 103, 95, 95, 32, 38, 38, 32,
+33, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 99, 112, 108, 117,
+115, 112, 108, 117, 115, 10, 32, 32, 35, 112, 114, 97, 103, 109, 97,
+32, 99, 108, 97, 110, 103, 32, 100, 105, 97, 103, 110, 111, 115, 116,
+105, 99, 32, 112, 111, 112, 10, 35, 101, 108, 105, 102, 32, 100, 101,
+102, 105, 110, 101, 100, 32, 95, 95, 71, 78, 85, 67, 95, 95, 32, 38,
+38, 32, 33, 100, 101, 102, 105, 110, 101, 100, 32, 95, 95, 99, 112,
+108, 117, 115, 112, 108, 117, 115, 10, 32, 32, 35, 112, 114, 97, 103,
+109, 97, 32, 71, 67, 67, 32, 100, 105, 97, 103, 110, 111, 115, 116,
+105, 99, 32, 112, 111, 112, 10, 35, 101, 110, 100, 105, 102, 10, 47,
+47, 32, 35, 35, 35, 32, 69, 78, 68, 95, 70, 73, 76, 69, 95, 73, 78,
+67, 76, 85, 68, 69, 58, 32, 108, 105, 110, 107, 97, 103, 101, 50, 46,
+104, 10, 47, 47, 32, 35, 35, 35, 32, 69, 78, 68, 95, 70, 73, 76, 69,
+95, 73, 78, 67, 76, 85, 68, 69, 58, 32, 99, 118, 101, 99, 46, 104, 10,
+10, 0, 35, 105, 102, 110, 100, 101, 102, 32, 95, 95, 83, 84, 68, 70,
+76, 79, 65, 84, 95, 72, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95,
+95, 83, 84, 68, 70, 76, 79, 65, 84, 95, 72, 10, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 68, 69, 67, 73, 77, 65, 76, 95, 68, 73, 71, 32, 50,
+49, 10, 35, 100, 101, 102, 105, 110, 101, 32, 70, 76, 84, 95, 69, 86,
+65, 76, 95, 77, 69, 84, 72, 79, 68, 32, 48, 32, 32, 47, 47, 32, 67,
+49, 49, 32, 53, 46, 50, 46, 52, 46, 50, 46, 50, 112, 57, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 70, 76, 84, 95, 82, 65, 68, 73, 88, 32,
+50, 10, 35, 100, 101, 102, 105, 110, 101, 32, 70, 76, 84, 95, 82, 79,
+85, 78, 68, 83, 32, 49, 32, 32, 47, 47, 32, 67, 49, 49, 32, 53, 46,
+50, 46, 52, 46, 50, 46, 50, 112, 56, 58, 32, 116, 111, 32, 110, 101,
+97, 114, 101, 115, 116, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+70, 76, 84, 95, 68, 73, 71, 32, 54, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 70, 76, 84, 95, 69, 80, 83, 73, 76, 79, 78, 32, 48, 120, 49,
+112, 45, 50, 51, 10, 35, 100, 101, 102, 105, 110, 101, 32, 70, 76, 84,
+95, 77, 65, 78, 84, 95, 68, 73, 71, 32, 50, 52, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 70, 76, 84, 95, 77, 65, 88, 32, 48, 120, 49, 46,
+102, 102, 102, 102, 102, 101, 112, 43, 49, 50, 55, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 70, 76, 84, 95, 77, 65, 88, 95, 49, 48, 95,
+69, 88, 80, 32, 51, 56, 10, 35, 100, 101, 102, 105, 110, 101, 32, 70,
+76, 84, 95, 77, 65, 88, 95, 69, 88, 80, 32, 49, 50, 56, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 70, 76, 84, 95, 77, 73, 78, 32, 48, 120,
+49, 112, 45, 49, 50, 54, 10, 35, 100, 101, 102, 105, 110, 101, 32, 70,
+76, 84, 95, 77, 73, 78, 95, 49, 48, 95, 69, 88, 80, 32, 45, 51, 55,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 70, 76, 84, 95, 77, 73, 78,
+95, 69, 88, 80, 32, 45, 49, 50, 53, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 70, 76, 84, 95, 84, 82, 85, 69, 95, 77, 73, 78, 32, 48, 120,
+49, 112, 45, 49, 52, 57, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+68, 66, 76, 95, 68, 73, 71, 32, 49, 53, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 68, 66, 76, 95, 69, 80, 83, 73, 76, 79, 78, 32, 48, 120,
+49, 112, 45, 53, 50, 10, 35, 100, 101, 102, 105, 110, 101, 32, 68, 66,
+76, 95, 77, 65, 78, 84, 95, 68, 73, 71, 32, 53, 51, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 68, 66, 76, 95, 77, 65, 88, 32, 48, 120, 49,
+46, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102,
+112, 43, 49, 48, 50, 51, 10, 35, 100, 101, 102, 105, 110, 101, 32, 68,
+66, 76, 95, 77, 65, 88, 95, 49, 48, 95, 69, 88, 80, 32, 51, 48, 56,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 68, 66, 76, 95, 77, 65, 88,
+95, 69, 88, 80, 32, 49, 48, 50, 52, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 68, 66, 76, 95, 77, 73, 78, 32, 48, 120, 49, 112, 45, 49, 48,
+50, 50, 10, 35, 100, 101, 102, 105, 110, 101, 32, 68, 66, 76, 95, 77,
+73, 78, 95, 49, 48, 95, 69, 88, 80, 32, 45, 51, 48, 55, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 68, 66, 76, 95, 77, 73, 78, 95, 69, 88,
+80, 32, 45, 49, 48, 50, 49, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+68, 66, 76, 95, 84, 82, 85, 69, 95, 77, 73, 78, 32, 48, 120, 48, 46,
+48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48, 49, 112, 45, 49, 48,
+50, 50, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 76, 68, 66, 76,
+95, 68, 73, 71, 32, 49, 53, 10, 35, 100, 101, 102, 105, 110, 101, 32,
+76, 68, 66, 76, 95, 69, 80, 83, 73, 76, 79, 78, 32, 48, 120, 49, 112,
+45, 53, 50, 10, 35, 100, 101, 102, 105, 110, 101, 32, 76, 68, 66, 76,
+95, 77, 65, 78, 84, 95, 68, 73, 71, 32, 53, 51, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 76, 68, 66, 76, 95, 77, 65, 88, 32, 48, 120, 49,
+46, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102, 102,
+112, 43, 49, 48, 50, 51, 10, 35, 100, 101, 102, 105, 110, 101, 32, 76,
+68, 66, 76, 95, 77, 65, 88, 95, 49, 48, 95, 69, 88, 80, 32, 51, 48,
+56, 10, 35, 100, 101, 102, 105, 110, 101, 32, 76, 68, 66, 76, 95, 77,
+65, 88, 95, 69, 88, 80, 32, 49, 48, 50, 52, 10, 35, 100, 101, 102,
+105, 110, 101, 32, 76, 68, 66, 76, 95, 77, 73, 78, 32, 48, 120, 49,
+112, 45, 49, 48, 50, 50, 10, 35, 100, 101, 102, 105, 110, 101, 32, 76,
+68, 66, 76, 95, 77, 73, 78, 95, 49, 48, 95, 69, 88, 80, 32, 45, 51,
+48, 55, 10, 35, 100, 101, 102, 105, 110, 101, 32, 76, 68, 66, 76, 95,
+77, 73, 78, 95, 69, 88, 80, 32, 45, 49, 48, 50, 49, 10, 35, 100, 101,
+102, 105, 110, 101, 32, 76, 68, 66, 76, 95, 84, 82, 85, 69, 95, 77,
+73, 78, 32, 48, 120, 48, 46, 48, 48, 48, 48, 48, 48, 48, 48, 48, 48,
+48, 48, 49, 112, 45, 49, 48, 50, 50, 10, 10, 35, 101, 110, 100, 105,
+102, 10, 0, 35, 105, 102, 110, 100, 101, 102, 32, 95, 95, 83, 84, 68,
+65, 82, 71, 95, 72, 10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 95,
+83, 84, 68, 65, 82, 71, 95, 72, 10, 10, 116, 121, 112, 101, 100, 101,
+102, 32, 115, 116, 114, 117, 99, 116, 32, 123, 10, 32, 32, 117, 110,
+115, 105, 103, 110, 101, 100, 32, 105, 110, 116, 32, 103, 112, 95,
+111, 102, 102, 115, 101, 116, 59, 10, 32, 32, 117, 110, 115, 105, 103,
+110, 101, 100, 32, 105, 110, 116, 32, 102, 112, 95, 111, 102, 102,
+115, 101, 116, 59, 10, 32, 32, 118, 111, 105, 100, 42, 32, 111, 118,
+101, 114, 102, 108, 111, 119, 95, 97, 114, 103, 95, 97, 114, 101, 97,
+59, 10, 32, 32, 118, 111, 105, 100, 42, 32, 114, 101, 103, 95, 115,
+97, 118, 101, 95, 97, 114, 101, 97, 59, 10, 125, 32, 95, 95, 118, 97,
+95, 101, 108, 101, 109, 59, 10, 10, 116, 121, 112, 101, 100, 101, 102,
+32, 95, 95, 118, 97, 95, 101, 108, 101, 109, 32, 118, 97, 95, 108,
+105, 115, 116, 91, 49, 93, 59, 10, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 118, 97, 95, 115, 116, 97, 114, 116, 40, 97, 112, 44, 32,
+108, 97, 115, 116, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+92, 10, 32, 32, 100, 111, 32, 123, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 92, 10, 32, 32, 32, 32, 42, 40, 97, 112, 41,
+32, 61, 32, 42, 40, 95, 95, 118, 97, 95, 101, 108, 101, 109, 42, 41,
+95, 95, 118, 97, 95, 97, 114, 101, 97, 95, 95, 59, 32, 92, 10, 32, 32,
+125, 32, 119, 104, 105, 108, 101, 32, 40, 48, 41, 10, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 118, 97, 95, 101, 110, 100, 40, 97, 112,
+41, 10, 10, 115, 116, 97, 116, 105, 99, 32, 118, 111, 105, 100, 42,
+32, 95, 95, 118, 97, 95, 97, 114, 103, 95, 109, 101, 109, 40, 95, 95,
+118, 97, 95, 101, 108, 101, 109, 42, 32, 97, 112, 44, 32, 105, 110,
+116, 32, 115, 122, 44, 32, 105, 110, 116, 32, 97, 108, 105, 103, 110,
+41, 32, 123, 10, 32, 32, 118, 111, 105, 100, 42, 32, 112, 32, 61, 32,
+97, 112, 45, 62, 111, 118, 101, 114, 102, 108, 111, 119, 95, 97, 114,
+103, 95, 97, 114, 101, 97, 59, 10, 32, 32, 105, 102, 32, 40, 97, 108,
+105, 103, 110, 32, 62, 32, 56, 41, 10, 32, 32, 32, 32, 112, 32, 61,
+32, 40, 112, 32, 43, 32, 49, 53, 41, 32, 47, 32, 49, 54, 32, 42, 32,
+49, 54, 59, 10, 32, 32, 97, 112, 45, 62, 111, 118, 101, 114, 102, 108,
+111, 119, 95, 97, 114, 103, 95, 97, 114, 101, 97, 32, 61, 32, 40, 40,
+117, 110, 115, 105, 103, 110, 101, 100, 32, 108, 111, 110, 103, 41,
+112, 32, 43, 32, 115, 122, 32, 43, 32, 55, 41, 32, 47, 32, 56, 32, 42,
+32, 56, 59, 10, 32, 32, 114, 101, 116, 117, 114, 110, 32, 112, 59, 10,
+125, 10, 10, 115, 116, 97, 116, 105, 99, 32, 118, 111, 105, 100, 42,
+32, 95, 95, 118, 97, 95, 97, 114, 103, 95, 103, 112, 40, 95, 95, 118,
+97, 95, 101, 108, 101, 109, 42, 32, 97, 112, 44, 32, 105, 110, 116,
+32, 115, 122, 44, 32, 105, 110, 116, 32, 97, 108, 105, 103, 110, 41,
+32, 123, 10, 32, 32, 105, 102, 32, 40, 97, 112, 45, 62, 103, 112, 95,
+111, 102, 102, 115, 101, 116, 32, 62, 61, 32, 52, 56, 41, 10, 32, 32,
+32, 32, 114, 101, 116, 117, 114, 110, 32, 95, 95, 118, 97, 95, 97,
+114, 103, 95, 109, 101, 109, 40, 97, 112, 44, 32, 115, 122, 44, 32,
+97, 108, 105, 103, 110, 41, 59, 10, 10, 32, 32, 118, 111, 105, 100,
+42, 32, 114, 32, 61, 32, 97, 112, 45, 62, 114, 101, 103, 95, 115, 97,
+118, 101, 95, 97, 114, 101, 97, 32, 43, 32, 97, 112, 45, 62, 103, 112,
+95, 111, 102, 102, 115, 101, 116, 59, 10, 32, 32, 97, 112, 45, 62,
+103, 112, 95, 111, 102, 102, 115, 101, 116, 32, 43, 61, 32, 56, 59,
+10, 32, 32, 114, 101, 116, 117, 114, 110, 32, 114, 59, 10, 125, 10,
+10, 115, 116, 97, 116, 105, 99, 32, 118, 111, 105, 100, 42, 32, 95,
+95, 118, 97, 95, 97, 114, 103, 95, 102, 112, 40, 95, 95, 118, 97, 95,
+101, 108, 101, 109, 42, 32, 97, 112, 44, 32, 105, 110, 116, 32, 115,
+122, 44, 32, 105, 110, 116, 32, 97, 108, 105, 103, 110, 41, 32, 123,
+10, 32, 32, 105, 102, 32, 40, 97, 112, 45, 62, 102, 112, 95, 111, 102,
+102, 115, 101, 116, 32, 62, 61, 32, 49, 49, 50, 41, 10, 32, 32, 32,
+32, 114, 101, 116, 117, 114, 110, 32, 95, 95, 118, 97, 95, 97, 114,
+103, 95, 109, 101, 109, 40, 97, 112, 44, 32, 115, 122, 44, 32, 97,
+108, 105, 103, 110, 41, 59, 10, 10, 32, 32, 118, 111, 105, 100, 42,
+32, 114, 32, 61, 32, 97, 112, 45, 62, 114, 101, 103, 95, 115, 97, 118,
+101, 95, 97, 114, 101, 97, 32, 43, 32, 97, 112, 45, 62, 102, 112, 95,
+111, 102, 102, 115, 101, 116, 59, 10, 32, 32, 97, 112, 45, 62, 102,
+112, 95, 111, 102, 102, 115, 101, 116, 32, 43, 61, 32, 56, 59, 10, 32,
+32, 114, 101, 116, 117, 114, 110, 32, 114, 59, 10, 125, 10, 10, 35,
+100, 101, 102, 105, 110, 101, 32, 118, 97, 95, 97, 114, 103, 40, 97,
+112, 44, 32, 116, 121, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 92, 10,
+32, 32, 40, 123, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 92, 10, 32,
+32, 32, 32, 105, 110, 116, 32, 107, 108, 97, 115, 115, 32, 61, 32, 95,
+95, 98, 117, 105, 108, 116, 105, 110, 95, 114, 101, 103, 95, 99, 108,
+97, 115, 115, 40, 116, 121, 41, 59, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+92, 10, 32, 32, 32, 32, 42, 40, 116, 121, 42, 41, 40, 107, 108, 97,
+115, 115, 32, 61, 61, 32, 48, 32, 63, 32, 95, 95, 118, 97, 95, 97,
+114, 103, 95, 103, 112, 40, 97, 112, 44, 32, 115, 105, 122, 101, 111,
+102, 40, 116, 121, 41, 44, 32, 95, 65, 108, 105, 103, 110, 111, 102,
+40, 116, 121, 41, 41, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 92, 10, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 58, 32, 107, 108, 97,
+115, 115, 32, 61, 61, 32, 49, 32, 63, 32, 95, 95, 118, 97, 95, 97,
+114, 103, 95, 102, 112, 40, 97, 112, 44, 32, 115, 105, 122, 101, 111,
+102, 40, 116, 121, 41, 44, 32, 95, 65, 108, 105, 103, 110, 111, 102,
+40, 116, 121, 41, 41, 32, 32, 32, 32, 92, 10, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32,
+32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32, 58, 32, 95, 95, 118,
+97, 95, 97, 114, 103, 95, 109, 101, 109, 40, 97, 112, 44, 32, 115,
+105, 122, 101, 111, 102, 40, 116, 121, 41, 44, 32, 95, 65, 108, 105,
+103, 110, 111, 102, 40, 116, 121, 41, 41, 41, 59, 32, 92, 10, 32, 32,
+125, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 118, 97, 95,
+99, 111, 112, 121, 40, 100, 101, 115, 116, 44, 32, 115, 114, 99, 41,
+32, 40, 40, 100, 101, 115, 116, 41, 91, 48, 93, 32, 61, 32, 40, 115,
+114, 99, 41, 91, 48, 93, 41, 10, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 95, 95, 71, 78, 85, 67, 95, 86, 65, 95, 76, 73, 83, 84, 32, 49,
+10, 116, 121, 112, 101, 100, 101, 102, 32, 118, 97, 95, 108, 105, 115,
+116, 32, 95, 95, 103, 110, 117, 99, 95, 118, 97, 95, 108, 105, 115,
+116, 59, 10, 10, 35, 101, 110, 100, 105, 102, 10, 0, 35, 105, 102,
+110, 100, 101, 102, 32, 95, 95, 83, 84, 68, 66, 79, 79, 76, 95, 72,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 95, 83, 84, 68, 66, 79,
+79, 76, 95, 72, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 98, 111,
+111, 108, 32, 95, 66, 111, 111, 108, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 116, 114, 117, 101, 32, 49, 10, 35, 100, 101, 102, 105, 110,
+101, 32, 102, 97, 108, 115, 101, 32, 48, 10, 35, 100, 101, 102, 105,
+110, 101, 32, 95, 95, 98, 111, 111, 108, 95, 116, 114, 117, 101, 95,
+102, 97, 108, 115, 101, 95, 97, 114, 101, 95, 100, 101, 102, 105, 110,
+101, 100, 32, 49, 10, 10, 35, 101, 110, 100, 105, 102, 10, 0, 35, 105,
+102, 110, 100, 101, 102, 32, 95, 95, 83, 84, 68, 68, 69, 70, 95, 72,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 95, 83, 84, 68, 68, 69,
+70, 95, 72, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 78, 85, 76,
+76, 32, 40, 40, 118, 111, 105, 100, 42, 41, 48, 41, 10, 10, 116, 121,
+112, 101, 100, 101, 102, 32, 117, 110, 115, 105, 103, 110, 101, 100,
+32, 108, 111, 110, 103, 32, 115, 105, 122, 101, 95, 116, 59, 10, 116,
+121, 112, 101, 100, 101, 102, 32, 108, 111, 110, 103, 32, 112, 116,
+114, 100, 105, 102, 102, 95, 116, 59, 10, 116, 121, 112, 101, 100,
+101, 102, 32, 117, 110, 115, 105, 103, 110, 101, 100, 32, 105, 110,
+116, 32, 119, 99, 104, 97, 114, 95, 116, 59, 10, 116, 121, 112, 101,
+100, 101, 102, 32, 108, 111, 110, 103, 32, 109, 97, 120, 95, 97, 108,
+105, 103, 110, 95, 116, 59, 10, 10, 35, 100, 101, 102, 105, 110, 101,
+32, 111, 102, 102, 115, 101, 116, 111, 102, 40, 116, 121, 112, 101,
+44, 32, 109, 101, 109, 98, 101, 114, 41, 32, 40, 40, 115, 105, 122,
+101, 95, 116, 41, 32, 38, 32, 40, 40, 40, 116, 121, 112, 101, 42, 41,
+48, 41, 45, 62, 109, 101, 109, 98, 101, 114, 41, 41, 10, 10, 35, 101,
+110, 100, 105, 102, 10, 0, 35, 105, 102, 110, 100, 101, 102, 32, 95,
+95, 83, 84, 68, 78, 79, 82, 69, 84, 85, 82, 78, 95, 72, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 95, 95, 83, 84, 68, 78, 79, 82, 69, 84,
+85, 82, 78, 95, 72, 10, 10, 35, 100, 101, 102, 105, 110, 101, 32, 110,
+111, 114, 101, 116, 117, 114, 110, 32, 95, 78, 111, 114, 101, 116,
+117, 114, 110, 10, 10, 35, 101, 110, 100, 105, 102, 10, 0, 35, 105,
+102, 110, 100, 101, 102, 32, 95, 95, 83, 84, 68, 68, 69, 70, 95, 72,
+10, 35, 100, 101, 102, 105, 110, 101, 32, 95, 95, 83, 84, 68, 68, 69,
+70, 95, 72, 10, 10, 35, 105, 110, 99, 108, 117, 100, 101, 32, 60, 118,
+99, 114, 117, 110, 116, 105, 109, 101, 46, 104, 62, 10, 10, 35, 100,
+101, 102, 105, 110, 101, 32, 111, 102, 102, 115, 101, 116, 111, 102,
+40, 116, 121, 112, 101, 44, 32, 109, 101, 109, 98, 101, 114, 41, 32,
+40, 40, 115, 105, 122, 101, 95, 116, 41, 32, 38, 32, 40, 40, 40, 116,
+121, 112, 101, 42, 41, 48, 41, 45, 62, 109, 101, 109, 98, 101, 114,
+41, 41, 10, 10, 35, 101, 110, 100, 105, 102, 10, 0};
 //
-// END OF ../../src/khash.h
+// END OF compincl.h
 //
 #undef C
 #undef L
@@ -2819,11 +8039,8 @@ static HashEntry* get_or_insert_entry(HashMap* map, char* key, int keylen) {
       return ent;
     }
 
-    if (ent->key == TOMBSTONE) {
-      ent->key = key;
-      ent->keylen = keylen;
-      return ent;
-    }
+    // It is tempting to allow a TOMBSTONE entry to be reused here, but they
+    // cannot be, see: https://github.com/rui314/chibicc/issues/135.
 
     if (ent->key == NULL) {
       ent->key = key;
@@ -2924,9 +8141,6 @@ static void hashmap_clear_manual_key_owned_value_unowned(HashMap* map) {
 #endif
 
 #define L(x) linker_state.link__##x
-
-
-KHASH_SET_INIT_INT64(voidp)
 
 #if X64WIN
 static void Unimplemented(void) {
@@ -3112,6 +8326,7 @@ static void* get_standard_runtime_function(char* name) {
     X(atan);
     X(atan2);
     X(atoi);
+    X(calloc);
     X(ceil);
     X(cos);
     X(cosh);
@@ -3251,11 +8466,6 @@ static void* symbol_lookup(char* name) {
 }
 
 static bool link_all_files(void) {
-  // This is a hack to avoid disabling -Wunused-function, since these are in
-  // khash.h and aren't instantiated.
-  (void)__ac_X31_hash_string;
-  (void)__ac_Wang_hash;
-
   UserContext* uc = user_context;
 
   if (uc->num_files == 0)
@@ -3314,151 +8524,6 @@ static bool link_all_files(void) {
 //
 // START OF ../../src/main.c
 //
-// Notes and todos
-// ---------------
-//
-// Windows x64 .pdata generation:
-//
-//   Need to RtlAddFunctionTable() so that even minimal stackwalking in
-//   Disassembly view is correct in VS. Required for SEH too. cl /Fa emits
-//   without using any helper macros for samples.
-//
-// Break up into small symbol-sized 'sections':
-//
-//   In order to update code without losing global state, need to be able to
-//   replace and relink. Right now, link_dyos() does all the allocation of
-//   global data at the same time as mapping the code in to executable pages.
-//
-//   The simplest fix would be to keep the mappings of globals around and not
-//   reallocate them on updates (one map for global symbols, plus one per
-//   translation unit). The code updating could still be tossing all code, and
-//   relinking everything, but using the old hashmaps for data addresses.
-//
-//   Alternatively, it might be a better direction to break everything up into
-//   symbol-sized chunks (i.e. either a variable or a function indexed by symbol
-//   name). Initial and update become more similar, in that if any symbol is
-//   updated, the old one (if any) gets thrown away, the new one gets mapped in
-//   (whether code or data), and then everything that refers to it is patched.
-//
-//   The main gotchas that come to mind on the second approach are:
-//
-//     - The parser (and DynASM to assign labels) need to be initialized before
-//     processing the whole file; C is just never going to be able to compile a
-//     single function in isolation. So emit_data() and emit_text() need to make
-//     sure that each symbol blob can be ripped out of the generated block, and
-//     any offsets have to be saved relative to the start of that symbol for
-//     emitting fixups. Probably codegen_pclabel() a start/end for each for
-//     rippage/re-offseting.
-//
-//     - Need figure out how to name things. If everything becomes a flat bag of
-//     symbols, we need to make sure that statics from a.c are local to a.c, so
-//     they'll need to be file prefixed.
-//
-//     - Probably wll need to switch to a new format (some kv store or
-//     something), as symbol-per-dyo would be a spamming of files to deal with.
-//
-// Testing for relinking:
-//
-//   Basic relinking is implemented, but there's no test driver that sequences a
-//   bunch of code changes to make sure that the updates can be applied
-//   successfully.
-//
-// khash <-> swisstable:
-//
-//   Look into hashtable libs, khash is used in link.c now and it seems ok, but
-//   the interface isn't that pleasant. Possibly wrap and extern C a few common
-//   instantiations of absl's with a more pleasant interface (and that could
-//   replace hashmap.c too). Need to consider how they would/can integrate with
-//   bumpalloc.
-//
-// Debugger:
-//
-//   Picking either ELF/DWARF or PE/COFF (and dropping .dyo) would probably be
-//   the more practical way to get a better debugging experience, but then,
-//   clang-win would also be a lot better. Tomorrow Corp demo for inspiration of
-//   what needs to be implemented/included. Possibly still go with debug adapter
-//   json thing (with extension messages?) so that an existing well-written UI
-//   can be used.
-//
-// Improved codegen:
-//
-//   Bit of a black hole of effort and probably doesn't matter for a dev-focused
-//   tool. But it would be easier to trace through asm if the data flow was less
-//   hidden. Possibly basic use of otherwise-unused gp registers, possibly some
-//   peephole, or higher level amalgamated instructions for codegen to use that
-//   avoid the common cases of load/push, push/something/pop.
-//
-// Various "C+" language extensions:
-//
-//   Some possibilities:
-//     - an import instead of #include that can be used when not touching system
-//     stuff
-//     - string type with syntax integration
-//     - basic polymophic containers (dict, list, slice, sizedarray)
-//     - range-based for loop (to go with containers)
-//     - range notation
-//
-// rep stosb for local clear:
-//
-//   Especially on Windows where rdi is non-volatile, it seems like quite a lot
-//   of instructions. At the very least we could only do one memset for all
-//   locals to clear out a range.
-//
-// Don't emit __func__, __FUNCTION__ unless used:
-//
-//   Doesn't affect anything other than dyo size, but it bothers me seeing them
-//   in there.
-//
-// Improve dumpdyo:
-//
-//   - Cross-reference the name to which fixups will be bound in disasm
-//   - include dump as string for initializer bytes
-//
-// Implement TLS:
-//
-//   If needed.
-//
-// Implement inline ASM:
-//
-//   If needed.
-//
-// .dyo cache:
-//
-//   Based on compiler binary, "environment", and the contents of the .c file,
-//   make a hash-based cache of dyos so that recompile can only build the
-//   required files and relink while passing the whole module/program still.
-//   Since there's no -D or other flags, "enviroment" could either be a hash of
-//   all the files in the include search path, or alternatively hash after
-//   preprocessing, or probably track all files include and include all of the
-//   includes in the hash. Not overly important if total compile/link times
-//   remain fast.
-//
-// In-memory dyo:
-//
-//   Alternatively to caching, maybe just save to a memory structure. Might be a
-//   little faster for direct use, could still have a dump-dyo-from-mem for
-//   debugging purposes. Goes more with an always-live compiler host hooked to
-//   target.
-//
-// Consider merging some of the record types in dyo:
-//
-//     kTypeImport is (offset-to-fix, string-to-reference)
-//     kTypeCodeReferenceToGlobal is (offset-to-fix, string-to-reference)
-//     kTypeInitializerDataRelocation is (string-to-reference, addend)
-//
-//   The only difference between the first two is that one does GetProcAddress()
-//   or similar, and the other looks in the export tables for other dyos. But we
-//   might want data imported from host too.
-//
-//   The third is different in that the address to fix up is implicit because
-//   it's in a sequence of data segment initializers, but just having all
-//   imports be:
-//
-//      (offset-to-fix, string-to-reference, addend)
-//
-//   might be nicer.
-//
-//
 
 #if X64WIN
 #include <direct.h>
@@ -3472,13 +8537,13 @@ static void print_tokens(Token* tok) {
   int line = 1;
   for (; tok->kind != TK_EOF; tok = tok->next) {
     if (line > 1 && tok->at_bol)
-      logout("\n");
+      printf("\n");
     if (tok->has_space && !tok->at_bol)
-      logout(" ");
-    logout("%.*s", tok->len, tok->loc);
+      printf(" ");
+    printf("%.*s", tok->len, tok->loc);
     line++;
   }
-  logout("\n");
+  printf("\n");
 }
 #endif
 
@@ -3503,6 +8568,13 @@ static bool default_load_file_fn(const char* path, char** contents, size_t* size
 }
 
 DyibiccContext* dyibicc_set_environment(DyibiccEnviromentData* env_data) {
+  // Set this up with a temporary value early, mostly so we can ABORT() below
+  // with output if necessary.
+  UserContext tmp_user_context = {0};
+  tmp_user_context.output_function = default_output_fn;
+  tmp_user_context.load_file_contents = default_load_file_fn;
+  user_context = &tmp_user_context;
+
   alloc_init(AL_Temp);
 
   // Clone env_data into allocated ctx
@@ -3516,24 +8588,34 @@ DyibiccContext* dyibicc_set_environment(DyibiccEnviromentData* env_data) {
 
   StringArray sys_inc_paths = {0};
 #if X64WIN
-  strarray_push(&sys_inc_paths, format(AL_Temp, "%s/win", env_data->dyibicc_include_dir), AL_Temp);
-  strarray_push(&sys_inc_paths, format(AL_Temp, "%s/all", env_data->dyibicc_include_dir), AL_Temp);
+  strarray_push(&sys_inc_paths, "__include__/win", AL_Temp);
+  strarray_push(&sys_inc_paths, "__include__/all", AL_Temp);
+
+#define GET_ENV_VAR(x)                          \
+  char* env_##x = getenv(#x);                   \
+  if (!env_##x) {                               \
+    ABORT("environment variable " #x " unset"); \
+  }
+
+  GET_ENV_VAR(WindowsSdkDir);
+  GET_ENV_VAR(WindowsSdkLibVersion);
+  GET_ENV_VAR(VcToolsInstallDir);
+#undef GET_ENV_VAR
 
   strarray_push(&sys_inc_paths,
-                "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22621.0\\ucrt", AL_Temp);
-  strarray_push(&sys_inc_paths,
-                "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22621.0\\um", AL_Temp);
-  strarray_push(&sys_inc_paths,
-                "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.22621.0\\shared",
+                format(AL_Temp, "%sInclude\\%sucrt", env_WindowsSdkDir, env_WindowsSdkLibVersion),
                 AL_Temp);
   strarray_push(&sys_inc_paths,
-                "C:\\Program Files\\Microsoft Visual "
-                "Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.34.31933\\include",
+                format(AL_Temp, "%sInclude\\%sum", env_WindowsSdkDir, env_WindowsSdkLibVersion),
                 AL_Temp);
+  strarray_push(&sys_inc_paths,
+                format(AL_Temp, "%sInclude\\%sshared", env_WindowsSdkDir, env_WindowsSdkLibVersion),
+                AL_Temp);
+  strarray_push(&sys_inc_paths, format(AL_Temp, "%sinclude", env_VcToolsInstallDir), AL_Temp);
+
 #else
-  strarray_push(&sys_inc_paths, format(AL_Temp, "%s/linux", env_data->dyibicc_include_dir),
-                AL_Temp);
-  strarray_push(&sys_inc_paths, format(AL_Temp, "%s/all", env_data->dyibicc_include_dir), AL_Temp);
+  strarray_push(&sys_inc_paths, "__include__/linux", AL_Temp);
+  strarray_push(&sys_inc_paths, "__include__/all", AL_Temp);
 
   strarray_push(&sys_inc_paths, "/usr/local/include", AL_Temp);
   strarray_push(&sys_inc_paths, "/usr/include/x86_64-linux-gnu", AL_Temp);
@@ -3576,6 +8658,7 @@ DyibiccContext* dyibicc_set_environment(DyibiccEnviromentData* env_data) {
     data->output_function = default_output_fn;
   }
   data->use_ansi_codes = env_data->use_ansi_codes;
+  data->generate_debug_symbols = env_data->generate_debug_symbols;
 
   char* d = (char*)(&data[1]);
 
@@ -3691,6 +8774,7 @@ bool dyibicc_update(DyibiccContext* context, char* filename, char* contents) {
         if (!tok)
           error("%s: %s", C(base_file), strerror(errno));
         tok = preprocess(tok);
+        tok = add_container_instantiations(tok);
 
         codegen_init();  // Initializes dynasm so that parse() can assign labels.
 
@@ -3844,7 +8928,7 @@ static Member* get_struct_member(Type* ty, Token* tok);
 static Type* struct_decl(Token** rest, Token* tok);
 static Type* union_decl(Token** rest, Token* tok);
 static Node* postfix(Token** rest, Token* tok);
-static Node* funcall(Token** rest, Token* tok, Node* node);
+static Node* funcall(Token** rest, Token* tok, Node* node, Node* injected_self);
 static Node* unary(Token** rest, Token* tok);
 static Node* primary(Token** rest, Token* tok);
 static Token* parse_typedef(Token* tok, Type* basety);
@@ -3939,7 +9023,7 @@ static Node* new_vla_ptr(Obj* var, Token* tok) {
 
 static Node* new_reflect_type_ptr(_ReflectType* rty, Token* tok) {
   Node* node = new_node(ND_REFLECT_TYPE_PTR, tok);
-  node->rty = (uintptr_t)rty;
+  node->reflect_ty = (uintptr_t)rty;
   return node;
 }
 
@@ -6427,6 +11511,8 @@ static void struct_members(Token** rest, Token* tok, Type* ty) {
 }
 
 // attribute = ("__attribute__" "(" "(" "packed" ")" ")")*
+//           = ("__attribute__" "(" "(" "aligned" "(" N ")" ")" ")")*
+//           = ("__attribute__" "(" "(" "methodcall" "(" prefix ")" ")" ")")*
 static Token* attribute_list(Token* tok, Type* ty) {
   while (consume(&tok, tok, "__attribute__")) {
     tok = skip(tok, "(");
@@ -6441,6 +11527,13 @@ static Token* attribute_list(Token* tok, Type* ty) {
 
       if (consume(&tok, tok, "packed")) {
         ty->is_packed = true;
+        continue;
+      }
+
+      if (consume(&tok, tok, "methodcall")) {
+        tok = skip(tok, "(");
+        ty->methodcall_prefix = tok;
+        tok = skip(tok->next, ")");
         continue;
       }
 
@@ -6603,7 +11696,7 @@ static Member* get_struct_member(Type* ty, Token* tok) {
 static Node* struct_ref(Node* node, Token* tok) {
   add_type(node);
   if (node->ty->kind != TY_STRUCT && node->ty->kind != TY_UNION)
-    error_tok(node->tok, "not a struct nor a union");
+    error_tok(node->tok, "neither a struct nor a union");
 
   Type* ty = node->ty;
 
@@ -6618,6 +11711,33 @@ static Node* struct_ref(Node* node, Token* tok) {
     ty = mem->ty;
   }
   return node;
+}
+
+static Node* methodcall_ref(Token** rest, Token* tok, Node* node) {
+  add_type(node);
+  if (node->ty->kind == TY_PTR) {
+    node = new_unary(ND_DEREF, node, tok);
+    return methodcall_ref(rest, tok, node);
+  }
+
+  add_type(node);
+  if (node->ty->kind != TY_STRUCT && node->ty->kind != TY_UNION)
+    error_tok(node->tok, "neither a struct nor a union");
+  if (!node->ty->methodcall_prefix)
+    error_tok(node->tok, "not an __attribute__((methodcall(prefix))) type");
+
+  Token* built_prefix = tokenize(
+      new_file(tok->file->name, format(AL_Compile, "%.*s%.*s", node->ty->methodcall_prefix->len,
+                                       node->ty->methodcall_prefix->loc, tok->len, tok->loc)));
+  built_prefix->line_no = tok->line_no;
+
+  Token* unused;
+  Node* funcnode = primary(&unused, built_prefix);
+
+  Node* self = new_unary(ND_ADDR, node, tok);
+
+  *rest = tok->next->next;
+  return funcall(rest, tok->next->next, funcnode, self);
 }
 
 // Convert A++ to `(typeof A)((A += 1) - 1)`
@@ -6661,7 +11781,7 @@ static Node* postfix(Token** rest, Token* tok) {
 
   for (;;) {
     if (equal(tok, "(")) {
-      node = funcall(&tok, tok->next, node);
+      node = funcall(&tok, tok->next, node, NULL);
       continue;
     }
 
@@ -6677,6 +11797,12 @@ static Node* postfix(Token** rest, Token* tok) {
     if (equal(tok, ".")) {
       node = struct_ref(node, tok->next);
       tok = tok->next->next;
+      continue;
+    }
+
+    if (equal(tok, "..")) {
+      // v..func(...) is short for methodcall_prefix##func(&v, ...)
+      node = methodcall_ref(&tok, tok->next, node);
       continue;
     }
 
@@ -6710,7 +11836,7 @@ static Node* postfix(Token** rest, Token* tok) {
 }
 
 // funcall = (assign ("," assign)*)? ")"
-static Node* funcall(Token** rest, Token* tok, Node* fn) {
+static Node* funcall(Token** rest, Token* tok, Node* fn, Node* injected_self) {
   add_type(fn);
 
   if (fn->ty->kind != TY_FUNC && (fn->ty->kind != TY_PTR || fn->ty->base->kind != TY_FUNC))
@@ -6722,11 +11848,25 @@ static Node* funcall(Token** rest, Token* tok, Node* fn) {
   Node head = {0};
   Node* cur = &head;
 
-  while (!equal(tok, ")")) {
-    if (cur != &head)
-      tok = skip(tok, ",");
+  while (!equal(tok, ")") || injected_self) {
+    if (cur != &head) {
+      if (injected_self) {
+        injected_self = NULL;
+        if (equal(tok, ")"))
+          break;
+      } else {
+        tok = skip(tok, ",");
+      }
+    }
 
-    Node* arg = assign(&tok, tok);
+    Node* arg;
+
+    if (injected_self) {
+      arg = injected_self;
+      // cleared on next loop, instead of skipping comma above.
+    } else {
+      arg = assign(&tok, tok);
+    }
     add_type(arg);
 
     if (!param_ty && !ty->is_variadic)
@@ -7554,6 +12694,7 @@ static Obj* parse(Token* tok) {
 // https://github.com/rui314/chibicc/wiki/cpp.algo.pdf
 
 
+
 #define C(x) compiler_state.preprocess__##x
 
 typedef struct MacroParam MacroParam;
@@ -7570,9 +12711,10 @@ struct MacroArg {
   Token* tok;
 };
 
-typedef Token* macro_handler_fn(Token*);
-
 typedef struct Macro Macro;
+
+typedef Token* macro_handler_fn(Macro* mac, Token*);
+
 struct Macro {
   char* name;
   bool is_objlike;  // Object-like or function-like
@@ -7580,6 +12722,7 @@ struct Macro {
   char* va_args_name;
   Token* body;
   macro_handler_fn* handler;
+  bool handler_advances;
 };
 
 // `#if` can be nested, so we use a stack to manage nested `#if`s.
@@ -7888,7 +13031,7 @@ static MacroParam* read_macro_params(Token** rest, Token* tok, char** va_args_na
   return head.next;
 }
 
-static void read_macro_definition(Token** rest, Token* tok) {
+static Macro* read_macro_definition(Token** rest, Token* tok) {
   if (tok->kind != TK_IDENT)
     error_tok(tok, "macro name must be an identifier");
   char* name = bumpstrndup(tok->loc, tok->len, AL_Compile);
@@ -7902,9 +13045,10 @@ static void read_macro_definition(Token** rest, Token* tok) {
     Macro* m = add_macro(name, false, copy_line(rest, tok));
     m->params = params;
     m->va_args_name = va_args_name;
+    return m;
   } else {
     // Object-like macro
-    add_macro(name, true, copy_line(rest, tok));
+    return add_macro(name, true, copy_line(rest, tok));
   }
 }
 
@@ -8148,8 +13292,23 @@ static Token* subst(Token* tok, MacroArg* args) {
   return head.next;
 }
 
+static bool file_exists_in_builtins(char* path) {
+  if (C(builtin_includes_map).capacity == 0) {
+    for (size_t i = 0; i < sizeof(compiler_includes) / sizeof(compiler_includes[0]); ++i) {
+      hashmap_put(&C(builtin_includes_map), compiler_includes[i].path,
+                  (void*)&compiler_include_blob[compiler_includes[i].offset]);
+    }
+  }
+
+  return hashmap_get(&C(builtin_includes_map), path) != NULL;
+}
+
 static bool file_exists(char* path) {
   struct stat st;
+
+  if (file_exists_in_builtins(path))
+    return true;
+
   return !stat(path, &st);
 }
 
@@ -8165,8 +13324,10 @@ static bool expand_macro(Token** rest, Token* tok) {
 
   // Built-in dynamic macro application such as __LINE__
   if (m->handler) {
-    *rest = m->handler(tok);
-    (*rest)->next = tok->next;
+    *rest = m->handler(m, tok);
+    if (!m->handler_advances) {
+      (*rest)->next = tok->next;
+    }
     return true;
   }
 
@@ -8332,7 +13493,13 @@ static Token* include_file(Token* tok, char* path, Token* filename_tok) {
   if (guard_name && hashmap_get(&C(macros), guard_name))
     return tok;
 
-  Token* tok2 = tokenize_file(path);
+  Token* tok2;
+  char* builtin_include_contents = hashmap_get(&C(builtin_includes_map), path);
+  if (builtin_include_contents) {
+    tok2 = tokenize_filecontents(path, builtin_include_contents);
+  } else {
+    tok2 = tokenize_file(path);
+  }
   if (!tok2)
     error_tok(filename_tok, "%s: cannot open file: %s", path, strerror(errno));
 
@@ -8533,10 +13700,12 @@ static void undef_macro(char* name) {
   hashmap_delete(&C(macros), name);
 }
 
-static void define_function_macro(char* buf) {
+static void define_function_macro(char* buf, macro_handler_fn* fn) {
   Token* tok = tokenize(new_file("<built-in>", buf));
   Token* rest = tok;
-  read_macro_definition(&rest, tok);
+  Macro* m = read_macro_definition(&rest, tok);
+  m->handler = fn;
+  m->handler_advances = true;
 }
 
 static Macro* add_builtin(char* name, macro_handler_fn* fn) {
@@ -8545,13 +13714,15 @@ static Macro* add_builtin(char* name, macro_handler_fn* fn) {
   return m;
 }
 
-static Token* file_macro(Token* tmpl) {
+static Token* file_macro(Macro* m, Token* tmpl) {
+  (void)m;
   while (tmpl->origin)
     tmpl = tmpl->origin;
   return new_str_token(tmpl->file->display_name, tmpl);
 }
 
-static Token* line_macro(Token* tmpl) {
+static Token* line_macro(Macro* m, Token* tmpl) {
+  (void)m;
   while (tmpl->origin)
     tmpl = tmpl->origin;
   int i = tmpl->line_no + tmpl->file->line_delta;
@@ -8559,18 +13730,21 @@ static Token* line_macro(Token* tmpl) {
 }
 
 // __COUNTER__ is expanded to serial values starting from 0.
-static Token* counter_macro(Token* tmpl) {
+static Token* counter_macro(Macro* m, Token* tmpl) {
+  (void)m;
   return new_num_token(C(counter_macro_i)++, tmpl);
 }
 
 // __TIMESTAMP__ is expanded to a string describing the last
 // modification time of the current file. E.g.
 // "Fri Jul 24 01:32:50 2020"
-static Token* timestamp_macro(Token* tmpl) {
+static Token* timestamp_macro(Macro* m, Token* tmpl) {
+  (void)m;
   return new_str_token("Mon May 02 01:23:45 1977", tmpl);
 }
 
-static Token* base_file_macro(Token* tmpl) {
+static Token* base_file_macro(Macro* m, Token* tmpl) {
+  (void)m;
   return new_str_token(compiler_state.main__base_file, tmpl);
 }
 
@@ -8584,6 +13758,97 @@ static char* format_date(struct tm* tm) {
 static char* format_time(struct tm* tm) {
   (void)tm;
   return "\"01:23:45\"";
+}
+
+static void append_to_container_tokens(Token* to_add) {
+  // Must be maintained in order that the files were instantiated because (e.g.)
+  // header guards will cause different structs to be defined, and they might be
+  // later referenced by a reinclude.
+  tokenptrarray_push(&C(container_tokens), to_add, AL_Compile);
+}
+
+static char* format_container_type_as_ident(Token* ma) {
+  if (ma->kind == TK_EOF) {
+    return "";
+  } else if (ma->kind == TK_IDENT) {
+    return format(AL_Compile, "%.*s%s", ma->len, ma->loc, format_container_type_as_ident(ma->next));
+  } else if (ma->kind == TK_PUNCT) {
+    assert(ma->loc[0] == '*' && ma->len == 1);
+    return format(AL_Compile, "$STAR$%s", format_container_type_as_ident(ma->next));
+  } else {
+    unreachable();
+  }
+}
+
+static char* format_container_type_as_template_arg(Token* ma) {
+  if (ma->kind == TK_EOF) {
+    return "";
+  } else if (ma->kind == TK_IDENT) {
+    return format(AL_Compile, "%.*s%s", ma->len, ma->loc,
+                  format_container_type_as_template_arg(ma->next));
+  } else if (ma->kind == TK_PUNCT) {
+    assert(ma->loc[0] == '*' && ma->len == 1);
+    return format(AL_Compile, "*%s", format_container_type_as_template_arg(ma->next));
+  } else {
+    unreachable();
+  }
+}
+
+static Token* container_vec_setup(Macro* m, Token* tok) {
+  Token* rparen;
+  MacroArg* args = read_macro_args(&rparen, tok, m->params, m->va_args_name);
+
+  char* key_as_arg = format_container_type_as_template_arg(args->tok);
+  char* key_as_ident = format_container_type_as_ident(args->tok);
+
+  char* key = format(AL_Compile, "type:vec,arg:%s", key_as_ident);
+  if (!hashmap_get(&C(container_included), key)) {
+    append_to_container_tokens(preprocess(
+        tokenize(new_file(tok->file->name, format(AL_Compile,
+                                                  "#define __dyibicc_internal_include__ 1\n"
+                                                  "#define i_key %s\n"
+                                                  "#define i_type _Vec$%s\n"
+                                                  "#include <_vec.h>\n"
+                                                  "#undef __dyibicc_internal_include__\n",
+                                                  key_as_arg, key_as_ident)))));
+
+    hashmap_put(&C(container_included), key, (void*)1);
+  }
+
+  Token* ret = tokenize(new_file(tok->file->name, format(AL_Compile, "_Vec$%s", key_as_ident)));
+  ret->next = rparen->next;
+  return ret;
+}
+
+static Token* container_map_setup(Macro* m, Token* tok) {
+  Token* rparen;
+  MacroArg* args = read_macro_args(&rparen, tok, m->params, m->va_args_name);
+
+  char* key_as_arg = format_container_type_as_template_arg(args->tok);
+  char* key_as_ident = format_container_type_as_ident(args->tok);
+  char* val_as_arg = format_container_type_as_template_arg(args->next->tok);
+  char* val_as_ident = format_container_type_as_ident(args->next->tok);
+
+  char* key = format(AL_Compile, "type:map,arg:%s,arg:%s", key_as_ident, val_as_ident);
+
+  if (!hashmap_get(&C(container_included), key)) {
+    append_to_container_tokens(preprocess(tokenize(
+        new_file(tok->file->name, format(AL_Compile,
+                                         "#define __dyibicc_internal_include__ 1\n"
+                                         "#define i_key %s\n"
+                                         "#define i_val %s\n"
+                                         "#define i_type _Map$%s$%s\n"
+                                         "#include <_map.h>\n"
+                                         "#undef __dyibicc_internal_include__\n",
+                                         key_as_arg, val_as_arg, key_as_ident, val_as_ident)))));
+
+    hashmap_put(&C(container_included), key, (void*)1);
+  }
+
+  Token* ret = tokenize(
+      new_file(tok->file->name, format(AL_Compile, "_Map$%s$%s", key_as_ident, val_as_ident)));
+  ret->next = rparen->next;
+  return ret;
 }
 
 static void init_macros(void) {
@@ -8647,8 +13912,8 @@ static void init_macros(void) {
   define_macro("_NO_CRT_STDIO_INLINE", "1");
   define_macro("_CRT_DECLARE_NONSTDC_NAMES", "1");
   define_macro("__WINT_TYPE__", "unsigned short");
-  define_function_macro("__pragma(_)\n");
-  define_function_macro("__declspec(_)\n");
+  define_function_macro("__pragma(_)\n", NULL);
+  define_function_macro("__declspec(_)\n", NULL);
 #else
   define_macro("__SIZEOF_LONG__", "8");
   define_macro("__SIZEOF_LONG_DOUBLE__", "16");
@@ -8660,7 +13925,6 @@ static void init_macros(void) {
   define_macro("__linux", "1");
   define_macro("__linux__", "1");
   define_macro("__gnu_linux__", "1");
-  (void)define_function_macro;
 #endif
 
   add_builtin("__FILE__", file_macro);
@@ -8668,6 +13932,9 @@ static void init_macros(void) {
   add_builtin("__COUNTER__", counter_macro);
   add_builtin("__TIMESTAMP__", timestamp_macro);
   add_builtin("__BASE_FILE__", base_file_macro);
+
+  define_function_macro("$vec(T)", container_vec_setup);
+  define_function_macro("$map(K,V)", container_map_setup);
 
   time_t now = time(NULL);
   struct tm* tm = localtime(&now);
@@ -8777,6 +14044,20 @@ static Token* preprocess(Token* tok) {
     t->line_no += t->line_delta;
   return tok;
 }
+
+static Token* add_container_instantiations(Token* tok) {
+  // Reverse order is important. They were appended as included, so we need to
+  // maintain that order here.
+  for (int i = C(container_tokens).len - 1; i >= 0; --i) {
+    Token* to_add = C(container_tokens).data[i];
+    Token* cur = to_add;
+    while (cur->next->kind != TK_EOF)
+      cur = cur->next;
+    cur->next = tok;
+    tok = to_add;
+  }
+  return tok;
+}
 //
 // END OF ../../src/preprocess.c
 //
@@ -8862,8 +14143,8 @@ static int from_hex(char c) {
 // Read a punctuator token from p and returns its length.
 static int read_punct(char* p) {
   static char* kw[] = {
-      "<<=", ">>=", "...", "==", "!=", "<=", ">=", "->", "+=", "-=", "*=", "/=",
-      "++",  "--",  "%=",  "&=", "|=", "^=", "&&", "||", "<<", ">>", "##",
+      "<<=", ">>=", "...", "..", "==", "!=", "<=", ">=", "->", "+=", "-=", "*=",
+      "/=",  "++",  "--", "%=",  "&=", "|=", "^=", "&&", "||", "<<", ">>", "##",
   };
 
   for (size_t i = 0; i < sizeof(kw) / sizeof(*kw); i++)
@@ -9131,6 +14412,14 @@ static bool convert_pp_int(Token* tok) {
       startswith(p, "uLL") || startswith(p, "ull")) {
     p += 3;
     l = u = true;
+#if X64WIN
+  } else if (startswith(p, "i64")) {
+    p += 3;
+    l = true;
+  } else if (startswith(p, "ui64")) {
+    p += 4;
+    l = u = true;
+#endif
   } else if (!strncasecmp(p, "lu", 2) || !strncasecmp(p, "ul", 2)) {
     p += 2;
     l = u = true;
@@ -9512,6 +14801,8 @@ Token* tokenize_filecontents(char* path, char* p) {
   convert_universal_chars(p);
 
   File* file = new_file(path, p);
+  file->file_no = C(all_tokenized_files).len;
+  fileptrarray_push(&C(all_tokenized_files), file, AL_Compile);
   return tokenize(file);
 }
 
@@ -9824,6 +15115,59 @@ static void strintarray_push(StringIntArray* arr, StringInt item, AllocLifetime 
   arr->data[arr->len++] = item;
 }
 
+static void fileptrarray_push(FilePtrArray* arr, File* item, AllocLifetime lifetime) {
+  if (!arr->data) {
+    arr->data = bumpcalloc(8, sizeof(File*), lifetime);
+    arr->capacity = 8;
+  }
+
+  if (arr->capacity == arr->len) {
+    arr->data = bumplamerealloc(arr->data, sizeof(File*) * arr->capacity,
+                                sizeof(File*) * arr->capacity * 2, lifetime);
+    arr->capacity *= 2;
+    for (int i = arr->len; i < arr->capacity; i++)
+      arr->data[i] = NULL;
+  }
+
+  arr->data[arr->len++] = item;
+}
+
+static void tokenptrarray_push(TokenPtrArray* arr, Token* item, AllocLifetime lifetime) {
+  if (!arr->data) {
+    arr->data = bumpcalloc(8, sizeof(Token*), lifetime);
+    arr->capacity = 8;
+  }
+
+  if (arr->capacity == arr->len) {
+    arr->data = bumplamerealloc(arr->data, sizeof(Token*) * arr->capacity,
+                                sizeof(Token*) * arr->capacity * 2, lifetime);
+    arr->capacity *= 2;
+    for (int i = arr->len; i < arr->capacity; i++)
+      arr->data[i] = NULL;
+  }
+
+  arr->data[arr->len++] = item;
+}
+
+#if X64WIN
+static void intintintarray_push(IntIntIntArray* arr, IntIntInt item, AllocLifetime lifetime) {
+  if (!arr->data) {
+    arr->data = bumpcalloc(8, sizeof(IntIntInt), lifetime);
+    arr->capacity = 8;
+  }
+
+  if (arr->capacity == arr->len) {
+    arr->data = bumplamerealloc(arr->data, sizeof(IntIntInt) * arr->capacity,
+                                sizeof(IntIntInt) * arr->capacity * 2, lifetime);
+    arr->capacity *= 2;
+    for (int i = arr->len; i < arr->capacity; i++)
+      arr->data[i] = (IntIntInt){-1, -1, -1};
+  }
+
+  arr->data[arr->len++] = item;
+}
+#endif
+
 // Returns the contents of a given file. Doesn't support '-' for reading from
 // stdin.
 static char* read_file_wrap_user(char* path, AllocLifetime lifetime) {
@@ -9953,6 +15297,11 @@ static void error_internal(char* file, int line, char* msg) {
 
 #if X64WIN
 static void register_function_table_data(UserContext* ctx, int func_count, char* base_addr) {
+  if (ctx->generate_debug_symbols) {
+    // We don't use RtlAddFunctionTable/RtlDeleteFunctionTable if using a pdb
+    // dll, as the tables are already in the .pdata/.xdata section.
+    return;
+  }
   if (!RtlAddFunctionTable((RUNTIME_FUNCTION*)ctx->function_table_data, func_count,
                            (DWORD64)base_addr)) {
     error("failed to RtlAddFunctionTable");
@@ -9961,16 +15310,2281 @@ static void register_function_table_data(UserContext* ctx, int func_count, char*
 
 static void unregister_and_free_function_table_data(UserContext* ctx) {
   if (ctx->function_table_data) {
-    if (!RtlDeleteFunctionTable((RUNTIME_FUNCTION*)ctx->function_table_data)) {
-      error("failed to RtlDeleteFunctionTable");
+    // We don't use RtlAddFunctionTable/RtlDeleteFunctionTable if using a pdb
+    // dll, as the tables are already in the .pdata/.xdata section.
+    if (!ctx->generate_debug_symbols) {
+      if (!RtlDeleteFunctionTable((RUNTIME_FUNCTION*)ctx->function_table_data)) {
+        error("failed to RtlDeleteFunctionTable");
+      }
     }
     free(ctx->function_table_data);
     ctx->function_table_data = NULL;
   }
 }
+
+static char* get_temp_pdb_filename(AllocLifetime lifetime) {
+  char name_template[1024] = "dyibicc-XXXXXX";
+  if (_mktemp_s(name_template, strlen(name_template) + 1) < 0) {
+    error("failed to _mktemp_s");
+  }
+  strcat(name_template, ".pdb");
+  return bumpstrdup(name_template, lifetime);
+}
+
+#define DYN_BASIC_PDB_IMPLEMENTATION
+
 #endif
 //
 // END OF ../../src/util.c
+//
+#undef C
+#undef L
+#undef VOID
+//
+// START OF ../../src/dyn_basic_pdb.h
+//
+#ifndef INCLUDED_DYN_BASIC_PDB_H
+#define INCLUDED_DYN_BASIC_PDB_H
+
+// In exactly *one* C file:
+//
+//   #define DYN_BASIC_PDB_IMPLEMENTATION
+//   #include "dyn_basic_pdb.h"
+//
+// then include and use dyn_basic_pdb.h in other files as usual.
+//
+// See dbp_example/dyn_basic_pdb_example.c for sample usage.
+//
+// This implementation only outputs function symbols and line mappings, not full
+// type information, though it could be extended to do so with a bunch more
+// futzing around.
+//
+// Only one module is supported (equivalent to one .obj file), because in my
+// jit's implementation, all code is generated into a single code segment.
+//
+// Normally, a .pdb is referenced by another PE (exe/dll) or .dmp, and that's
+// how VS locates and decides to load the PDB. Because there's no PE in the case
+// of a JIT, in addition to writing a viable pdb, dbp_ready_to_execute() also
+// does some goofy hacking to encourage the VS IDE to find and load the
+// generated .pdb.
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#include <stddef.h>
+
+typedef struct DbpContext DbpContext;
+typedef struct DbpFunctionSymbol DbpFunctionSymbol;
+typedef struct DbpExceptionTables DbpExceptionTables;
+
+// Allocates |image_size| bytes for JITing code into. |image_size| must be an
+// even multiple of PAGE_SIZE (== 4096). |output_pdb_name| names the .pdb that
+// will be generated, and the stub dll is based on the pdb name. The base
+// address for generating code into can be retrieved by calling
+// dbp_get_image_base().
+DbpContext* dbp_create(size_t image_size, const char* output_pdb_name);
+
+// Gets the base of the image, length is |image_size| as passed to dbp_create().
+void* dbp_get_image_base(DbpContext* dbp);
+
+// Create a global symbol |name| with the given |filename|. Visual Studio tends
+// to work better if |filename| is an absolute path, but it's not required, and
+// |filename| is used as-is. |address| should be relative to the base returned
+// by dbp_get_image_base(). |length| is in bytes.
+DbpFunctionSymbol* dbp_add_function_symbol(DbpContext* ctx,
+                                           const char* name,
+                                           const char* filename,
+                                           unsigned int address,
+                                           unsigned int length);
+
+// Add a single debug line mapping to a function. |address| is the first of the
+// instructions for the line of code, and should be relative to the base address
+// as retrieved by dbp_get_image_base(). |line| is the one-based file line
+// number in the source code.
+void dbp_add_line_mapping(DbpContext* ctx,
+                          DbpFunctionSymbol* fs,
+                          unsigned int address,
+                          unsigned int line);
+
+// Called when all line information has been written to generate and load the
+// .pdb.
+//
+// exception_tables can be NULL, but stack traces and exceptions will not work
+// correctly (see RtlAddFunctionTable() on MSDN for more information). If
+// provided, .pdata and UNWIND_INFO will be included in the synthetic DLL, and
+// will be equivalent to calling RtlAddFunctionTable(). However, when the
+// addresses for a dynamically provided table with RtlAddFunctionTable() overlap
+// with the address space for a DLL, the static information in the DLL takes
+// precedence and the dynamic information is ignored.
+int dbp_ready_to_execute(DbpContext* ctx, DbpExceptionTables* exception_tables);
+
+// Free |ctx| and all associated memory, including the stub dll and image.
+void dbp_free(DbpContext* ctx);
+
+// This is stored in CodeView records, default is "dyn_basic_pdb writer 1.0.0.0" if not set.
+void dbp_set_compiler_information(DbpContext* ctx,
+                                  const char* compiler_version_string,
+                                  unsigned short major,
+                                  unsigned short minor,
+                                  unsigned short build,
+                                  unsigned short qfe);
+
+// Same as winnt.h RUNTIME_FUNCTION, we just want to avoid including windows.h
+// in the interface header.
+typedef struct DbpRUNTIME_FUNCTION {
+  unsigned int begin_address;
+  unsigned int end_address;
+  unsigned int unwind_data;
+} DbpRUNTIME_FUNCTION;
+
+// pdata entries will be written to a .pdata section in the dll, with the RVA of
+// .unwind_data fixed up to be relative to where unwind_info is stored.
+// unwind_data==0 should correspond to &unwind_info[0].
+struct DbpExceptionTables {
+  DbpRUNTIME_FUNCTION* pdata;
+  size_t num_pdata_entries;
+
+  unsigned char* unwind_info;
+  size_t unwind_info_byte_length;
+};
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif
+
+#endif  // INCLUDED_DYN_BASIC_PDB_H
+
+#ifdef DYN_BASIC_PDB_IMPLEMENTATION
+
+#define _CRT_SECURE_NO_WARNINGS
+#pragma warning(disable : 4201)  // non-standard extension: nameless struct/union
+#pragma warning(disable : 4668)  // 'X' is not defined as a preprocessor macro, replacing with '0'
+                                 // for '#if/#elif'
+#pragma warning(disable : 4820)  // 'X' bytes padding added after data member 'Y'
+#pragma warning(disable : 5045)  // Compiler will insert Spectre mitigation for memory load if
+                                 // /Qspectre switch specified
+#pragma comment(lib, "rpcrt4")
+
+#ifdef __clang__
+#pragma clang diagnostic ignored "-Wcast-align"
+#pragma clang diagnostic ignored "-Wdeclaration-after-statement"
+#pragma clang diagnostic ignored "-Wimplicit-fallthrough"
+#pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
+#endif
+
+#include <Windows.h>
+#include <assert.h>
+#include <malloc.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+typedef unsigned int u32;
+typedef signed int i32;
+typedef unsigned short u16;
+typedef unsigned long long u64;
+
+typedef struct StreamData StreamData;
+typedef struct SuperBlock SuperBlock;
+typedef struct NmtAlikeHashTable NmtAlikeHashTable;
+
+struct DbpContext {
+  char* base_addr;    // This is the VirtualAlloc base
+  void* image_addr;   // and this is the address returned to the user,
+  size_t image_size;  // The user has this much accessible, and the allocation is 0x1000 larger.
+  char* output_pdb_name;
+  char* output_dll_name;
+  HMODULE dll_module;
+
+  DbpFunctionSymbol** func_syms;
+  size_t func_syms_len;
+  size_t func_syms_cap;
+
+  UUID unique_id;
+
+  NmtAlikeHashTable* names_nmt;
+
+  char* compiler_version_string;
+  u16 version_major;
+  u16 version_minor;
+  u16 version_build;
+  u16 version_qfe;
+
+  HANDLE file;
+  char* data;
+  size_t file_size;
+
+  SuperBlock* superblock;
+
+  StreamData** stream_data;
+  size_t stream_data_len;
+  size_t stream_data_cap;
+
+  u32 next_potential_block;
+  u32 padding;
+};
+
+typedef struct LineInfo {
+  unsigned int address;
+  unsigned int line;
+} LineInfo;
+
+struct DbpFunctionSymbol {
+  char* name;
+  char* filename;
+  unsigned int address;             // Offset into image_addr where function is.
+  unsigned int length;              // Number of bytes long.
+  unsigned int module_info_offset;  // Location into modi where the full symbol info can be found.
+
+  LineInfo* lines;
+  size_t lines_len;
+  size_t lines_cap;
+};
+
+#define PUSH_BACK(vec, item)                            \
+  do {                                                  \
+    if (!vec) {                                         \
+      vec = calloc(8, sizeof(*vec));                    \
+      vec##_len = 0;                                    \
+      vec##_cap = 8;                                    \
+    }                                                   \
+                                                        \
+    if (vec##_cap == vec##_len) {                       \
+      vec = realloc(vec, sizeof(*vec) * vec##_cap * 2); \
+      vec##_cap *= 2;                                   \
+    }                                                   \
+                                                        \
+    vec[vec##_len++] = item;                            \
+  } while (0)
+
+DbpContext* dbp_create(size_t image_size, const char* output_pdb_name) {
+  DbpContext* ctx = calloc(1, sizeof(DbpContext));
+  // Allocate with an extra page for the DLL header.
+  char* base_addr =
+      VirtualAlloc(NULL, image_size + 0x1000, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  ctx->base_addr = base_addr;
+  ctx->image_addr = base_addr + 0x1000;
+  ctx->image_size = image_size;
+  char full_pdb_name[MAX_PATH];
+  GetFullPathName(output_pdb_name, sizeof(full_pdb_name), full_pdb_name, NULL);
+  ctx->output_pdb_name = _strdup(full_pdb_name);
+  size_t len = strlen(full_pdb_name);
+  static char suffix[] = ".synthetic.dll";
+  ctx->output_dll_name = malloc(len + sizeof(suffix));
+  memcpy(ctx->output_dll_name, full_pdb_name, len);
+  memcpy(ctx->output_dll_name + len, suffix, sizeof(suffix));
+  if (UuidCreate(&ctx->unique_id) != RPC_S_OK) {
+    fprintf(stderr, "UuidCreate failed\n");
+    return NULL;
+  }
+  dbp_set_compiler_information(ctx, "dyn_basic_pdb writer 1.0.0.0", 1, 0, 0, 0);
+  return ctx;
+}
+
+void* dbp_get_image_base(DbpContext* ctx) {
+  return ctx->image_addr;
+}
+
+DbpFunctionSymbol* dbp_add_function_symbol(DbpContext* ctx,
+                                           const char* name,
+                                           const char* filename,
+                                           unsigned int address,
+                                           unsigned int length) {
+  DbpFunctionSymbol* fs = calloc(1, sizeof(*fs));
+  fs->name = _strdup(name);
+  fs->filename = _strdup(filename);
+  fs->address = address;
+  fs->length = length;
+  PUSH_BACK(ctx->func_syms, fs);
+  return fs;
+}
+
+void dbp_set_compiler_information(DbpContext* ctx,
+                                  const char* compiler_version_string,
+                                  unsigned short major,
+                                  unsigned short minor,
+                                  unsigned short build,
+                                  unsigned short qfe) {
+  if (ctx->compiler_version_string)
+    free(ctx->compiler_version_string);
+  ctx->compiler_version_string = _strdup(compiler_version_string);
+  ctx->version_major = major;
+  ctx->version_minor = minor;
+  ctx->version_build = build;
+  ctx->version_qfe = qfe;
+}
+
+void dbp_add_line_mapping(DbpContext* ctx,
+                          DbpFunctionSymbol* sym,
+                          unsigned int address,
+                          unsigned int line) {
+  (void)ctx;
+  assert(address >= sym->address);
+  LineInfo line_info = {.address = address, .line = line};
+  PUSH_BACK(sym->lines, line_info);
+}
+
+static const char big_hdr_magic[0x1e] = "Microsoft C/C++ MSF 7.00\r\n\x1a\x44\x53";
+
+#define ENSURE(x, want)                                                               \
+  do {                                                                                \
+    if (want != x) {                                                                  \
+      fprintf(stderr, "%s:%d: failed %s wasn't %s\n", __FILE__, __LINE__, #x, #want); \
+      return 0;                                                                       \
+    }                                                                                 \
+  } while (0)
+
+#define ENSURE_NE(x, bad)                                                         \
+  do {                                                                            \
+    if (bad == x) {                                                               \
+      fprintf(stderr, "%s:%d: failed %s was %s\n", __FILE__, __LINE__, #x, #bad); \
+      return 0;                                                                   \
+    }                                                                             \
+  } while (0)
+
+struct SuperBlock {
+  char file_magic[0x1e];
+  char padding[2];
+  u32 block_size;
+  u32 free_block_map_block;
+  u32 num_blocks;
+  u32 num_directory_bytes;
+  u32 unknown;
+  u32 block_map_addr;
+};
+
+#define STUB_RDATA_SIZE 4096
+
+#define BLOCK_SIZE 4096
+#define DEFAULT_NUM_BLOCKS 256
+#define PAGE_TO_WORD(pn) (pn >> 6)
+#define PAGE_MASK(pn) (1ULL << (pn & ((sizeof(u64) * CHAR_BIT) - 1)))
+static const char synthetic_obj_name[] = "dyn_basic_pdb-synthetic-for-jit.obj";
+
+static void mark_block_used(DbpContext* ctx, u32 pn) {
+  u64* map2 = (u64*)&ctx->data[BLOCK_SIZE * 2];
+  map2[PAGE_TO_WORD(pn)] &= ~PAGE_MASK(pn);
+}
+
+static int block_is_free(DbpContext* ctx, u32 pn) {
+  u64* map2 = (u64*)&ctx->data[BLOCK_SIZE * 2];
+  return !!(map2[PAGE_TO_WORD(pn)] & PAGE_MASK(pn));
+}
+
+static void* get_block_ptr(DbpContext* ctx, u32 i) {
+  return &ctx->data[BLOCK_SIZE * i];
+}
+
+static u32 alloc_block(DbpContext* ctx) {
+  for (;;) {
+    if (block_is_free(ctx, ctx->next_potential_block)) {
+      mark_block_used(ctx, ctx->next_potential_block);
+      return ctx->next_potential_block++;
+    }
+    ctx->next_potential_block++;
+  }
+}
+
+struct StreamData {
+  u32 stream_index;
+
+  u32 data_length;
+
+  char* cur_write;
+
+  u32* blocks;
+  size_t blocks_len;
+  size_t blocks_cap;
+};
+
+static void stream_write_block(DbpContext* ctx, StreamData* stream, const void* data, size_t len) {
+  if (!stream->cur_write) {
+    u32 block_id = alloc_block(ctx);
+    PUSH_BACK(stream->blocks, block_id);
+    stream->cur_write = get_block_ptr(ctx, block_id);
+  }
+
+  u32 cur_block_filled = stream->data_length % BLOCK_SIZE;
+  u32 max_remaining_this_block = BLOCK_SIZE - cur_block_filled;
+  if (max_remaining_this_block >= len) {
+    memcpy(stream->cur_write, data, len);
+    stream->cur_write += len;
+    stream->data_length += (u32)len;
+    if (max_remaining_this_block == len) {
+      stream->cur_write = NULL;
+    }
+  } else {
+    memcpy(stream->cur_write, data, max_remaining_this_block);
+    stream->cur_write += max_remaining_this_block;
+    stream->data_length += max_remaining_this_block;
+    stream->cur_write = NULL;
+    stream_write_block(ctx, stream, (const char*)data + max_remaining_this_block,
+                       len - max_remaining_this_block);
+  }
+}
+
+static void stream_ensure_init(DbpContext* ctx, StreamData* stream) {
+  // Hack for fixup capture if the block pointer hasn't been allocated yet
+  // before the macro wants to capture it.
+  unsigned char none;
+  stream_write_block(ctx, stream, &none, 0);
+}
+
+#define SW_BLOCK(x, len) stream_write_block(ctx, stream, x, len)
+#define SW_U32(x)                                   \
+  do {                                              \
+    u32 _ = (x);                                    \
+    stream_write_block(ctx, stream, &_, sizeof(_)); \
+  } while (0)
+#define SW_I32(x)                                   \
+  do {                                              \
+    i32 _ = (x);                                    \
+    stream_write_block(ctx, stream, &_, sizeof(_)); \
+  } while (0)
+#define SW_U16(x)                                   \
+  do {                                              \
+    u16 _ = (x);                                    \
+    stream_write_block(ctx, stream, &_, sizeof(_)); \
+  } while (0)
+#define SW_ALIGN(to)                        \
+  do {                                      \
+    while (stream->data_length % to != 0) { \
+      SW_BLOCK("", 1);                      \
+    }                                       \
+  } while (0)
+
+typedef char* SwFixup;
+#define SW_CAPTURE_FIXUP(strukt, field) \
+  (stream_ensure_init(ctx, stream), stream->cur_write + offsetof(strukt, field))
+
+#define SW_WRITE_FIXUP_FOR_LOCATION_U32(swfixup) \
+  do {                                           \
+    *(u32*)swfixup = stream->data_length;        \
+  } while (0)
+
+typedef u32 SwDelta;
+#define SW_CAPTURE_DELTA_START() (stream->data_length)
+
+#define SW_WRITE_DELTA_FIXUP(swfixup, delta)      \
+  do {                                            \
+    *(u32*)swfixup = stream->data_length - delta; \
+  } while (0)
+
+static void write_superblock(DbpContext* ctx) {
+  SuperBlock* sb = (SuperBlock*)ctx->data;
+  ctx->superblock = sb;
+  memcpy(sb->file_magic, big_hdr_magic, sizeof(big_hdr_magic));
+  sb->padding[0] = '\0';
+  sb->padding[1] = '\0';
+  sb->block_size = BLOCK_SIZE;
+  sb->free_block_map_block = 2;  // We never use map 1.
+  sb->num_blocks = DEFAULT_NUM_BLOCKS;
+  // num_directory_bytes filled in later once we've written everything else.
+  sb->unknown = 0;
+  sb->block_map_addr = 3;
+
+  // Mark all pages as free, then mark the first four in use:
+  // 0 is super block, 1 is FPM1, 2 is FPM2, 3 is the block map.
+  memset(&ctx->data[BLOCK_SIZE], 0xff, BLOCK_SIZE * 2);
+  for (u32 i = 0; i <= 3; ++i)
+    mark_block_used(ctx, i);
+}
+
+static StreamData* add_stream(DbpContext* ctx) {
+  StreamData* stream = calloc(1, sizeof(StreamData));
+  stream->stream_index = (u32)ctx->stream_data_len;
+  PUSH_BACK(ctx->stream_data, stream);
+  return stream;
+}
+
+static u32 align_to(u32 val, u32 align) {
+  return (val + align - 1) / align * align;
+}
+
+typedef struct PdbStreamHeader {
+  u32 Version;
+  u32 Signature;
+  u32 Age;
+  UUID UniqueId;
+} PdbStreamHeader;
+
+static int write_pdb_info_stream(DbpContext* ctx, StreamData* stream, u32 names_stream) {
+  PdbStreamHeader psh = {
+      .Version = 20000404, /* VC70 */
+      .Signature = (u32)time(NULL),
+      .Age = 1,
+  };
+  memcpy(&psh.UniqueId, &ctx->unique_id, sizeof(UUID));
+  SW_BLOCK(&psh, sizeof(psh));
+
+  // Named Stream Map.
+
+  // The LLVM docs are something that would be nice to refer to here:
+  //
+  //   https://llvm.org/docs/PDB/HashTable.html
+  //
+  // But unfortunately, this specific page is quite misleading (unlike the rest
+  // of the PDB docs which are quite helpful). The microsoft-pdb repo is,
+  // uh, "dense", but has the benefit of being correct by definition:
+  //
+  // https://github.com/microsoft/microsoft-pdb/blob/082c5290e5aff028ae84e43affa8be717aa7af73/PDB/include/nmtni.h#L77-L95
+  // https://github.com/microsoft/microsoft-pdb/blob/082c5290e5aff028ae84e43affa8be717aa7af73/PDB/include/map.h#L474-L508
+  //
+  // Someone naturally already figured this out, as LLVM writes the correct
+  // data, just the docs are wrong. (LLVM's patch for docs setup seems a bit
+  // convoluted which is why I'm whining in a buried comment instead of just
+  // fixing it...)
+
+  // Starts with the string buffer (which we pad to % 4, even though that's not
+  // actually required). We don't bother with actually building and updating a
+  // map as the only named stream we need is /names (TBD: possibly /LinkInfo?).
+  static const char string_data[] = "/names\0";
+  SW_U32(sizeof(string_data));
+  SW_BLOCK(string_data, sizeof(string_data));
+
+  // Then hash size, and capacity.
+  SW_U32(1);  // Size
+  SW_U32(1);  // Capacity
+  // Then two bit vectors, first for "present":
+  SW_U32(0x01);  // Present length (1 word follows)
+  SW_U32(0x01);  // 0b0000`0001    (only bucket occupied)
+  // Then for "deleted" (we don't write any).
+  SW_U32(0);
+  // Now, the maps: mapping "/names" at offset 0 above to given names stream.
+  SW_U32(0);
+  SW_U32(names_stream);
+  // This is "niMac", which is the last index allocated. We don't need it.
+  SW_U32(0);
+
+  // Finally, feature codes, which indicate that we're somewhat modern.
+  SW_U32(20140508); /* VC140 */
+
+  return 1;
+}
+
+typedef struct TpiStreamHeader {
+  u32 version;
+  u32 header_size;
+  u32 type_index_begin;
+  u32 type_index_end;
+  u32 type_record_bytes;
+
+  u16 hash_stream_index;
+  u16 hash_aux_stream_index;
+  u32 hash_key_size;
+  u32 num_hash_buckets;
+
+  i32 hash_value_buffer_offset;
+  u32 hash_value_buffer_length;
+
+  i32 index_offset_buffer_offset;
+  u32 index_offset_buffer_length;
+
+  i32 hash_adj_buffer_offset;
+  u32 hash_adj_buffer_length;
+} TpiStreamHeader;
+
+static int write_empty_tpi_ipi_stream(DbpContext* ctx, StreamData* stream) {
+  // This is an "empty" TPI/IPI stream, we do not emit any user-defined types
+  // currently.
+  TpiStreamHeader tsh = {
+      .version = 20040203, /* V80 */
+      .header_size = sizeof(TpiStreamHeader),
+      .type_index_begin = 0x1000,
+      .type_index_end = 0x1000,
+      .type_record_bytes = 0,
+      .hash_stream_index = 0xffff,
+      .hash_aux_stream_index = 0xffff,
+      .hash_key_size = 4,
+      .num_hash_buckets = 0x3ffff,
+      .hash_value_buffer_offset = 0,
+      .hash_value_buffer_length = 0,
+      .index_offset_buffer_offset = 0,
+      .index_offset_buffer_length = 0,
+      .hash_adj_buffer_offset = 0,
+      .hash_adj_buffer_length = 0,
+  };
+  SW_BLOCK(&tsh, sizeof(tsh));
+  return 1;
+}
+
+// Copied from:
+// https://github.com/microsoft/microsoft-pdb/blob/082c5290e5aff028ae84e43affa8be717aa7af73/PDB/include/misc.h#L15
+// with minor type adaptations. It needs to match that implementation to make
+// serialized hashes match up.
+static u32 calc_hash(char* pb, size_t cb) {
+  u32 ulHash = 0;
+
+  // hash leading dwords using Duff's Device
+  size_t cl = cb >> 2;
+  u32* pul = (u32*)pb;
+  u32* pulMac = pul + cl;
+  size_t dcul = cl & 7;
+
+  switch (dcul) {
+    do {
+      dcul = 8;
+      ulHash ^= pul[7];
+      case 7:
+        ulHash ^= pul[6];
+      case 6:
+        ulHash ^= pul[5];
+      case 5:
+        ulHash ^= pul[4];
+      case 4:
+        ulHash ^= pul[3];
+      case 3:
+        ulHash ^= pul[2];
+      case 2:
+        ulHash ^= pul[1];
+      case 1:
+        ulHash ^= pul[0];
+      case 0:;
+    } while ((pul += dcul) < pulMac);
+  }
+
+  pb = (char*)(pul);
+
+  // hash possible odd word
+  if (cb & 2) {
+    ulHash ^= *(unsigned short*)pb;
+    pb = (char*)((unsigned short*)(pb) + 1);
+  }
+
+  // hash possible odd byte
+  if (cb & 1) {
+    ulHash ^= (u32) * (pb++);
+  }
+
+  const u32 toLowerMask = 0x20202020;
+  ulHash |= toLowerMask;
+  ulHash ^= (ulHash >> 11);
+
+  return (ulHash ^ (ulHash >> 16));
+}
+
+// A hash table that emulates the microsoft-pdb nmt.h as required by the /names
+// stream.
+typedef struct NmtAlikeHashTable {
+  char* strings;  // This is a "\0bunch\0of\0strings\0" always starting with \0,
+                  // so that 0 is an invalid index.
+  size_t strings_len;
+  size_t strings_cap;
+
+  u32* hash;  // hash[hashed_value % hash_len] = name_index, which is an index
+              // into strings to get the actual value.
+  size_t hash_len;
+
+  u32 num_names;
+} NmtAlikeHashTable;
+
+#define NMT_INVALID (0u)
+
+static NmtAlikeHashTable* nmtalike_create(void) {
+  NmtAlikeHashTable* ret = calloc(1, sizeof(NmtAlikeHashTable));
+  PUSH_BACK(ret->strings, '\0');
+  ret->hash = calloc(1, sizeof(u32));
+  ret->hash_len = 1;
+  return ret;
+}
+
+static char* nmtalike__string_for_name_index(NmtAlikeHashTable* nmt, u32 name_index) {
+  if (name_index >= nmt->strings_len)
+    return NULL;
+  return &nmt->strings[name_index];
+}
+
+// If |str| already exists, return 1 with *out_name_index set to its name_index.
+// Else, return 0 and *out_slot is where a new name_index should be stored for
+// |str|.
+static void nmtalike__find(NmtAlikeHashTable* nmt, char* str, u32* out_name_index, u32* out_slot) {
+  assert(nmt->strings_len > 0);
+  assert(nmt->hash_len > 0);
+
+  size_t len = strlen(str);
+  u32 slot = calc_hash(str, len) % nmt->hash_len;
+  u32 name_index = NMT_INVALID;
+  for (;;) {
+    name_index = nmt->hash[slot];
+    if (name_index == NMT_INVALID)
+      break;
+
+    if (strcmp(str, nmtalike__string_for_name_index(nmt, name_index)) == 0)
+      break;
+
+    ++slot;
+    if (slot >= nmt->hash_len)
+      slot = 0;
+  }
+
+  *out_slot = slot;
+  *out_name_index = name_index;
+}
+
+// Returns new name index.
+static u32 nmtalike__append_to_string_buffer(NmtAlikeHashTable* nmt, char* str) {
+  size_t len = strlen(str) + 1;
+
+  while (nmt->strings_cap < nmt->strings_len + len) {
+    nmt->strings = realloc(nmt->strings, sizeof(*nmt->strings) * nmt->strings_cap * 2);
+    nmt->strings_cap *= 2;
+  }
+
+  char* start = &nmt->strings[nmt->strings_len];
+  memcpy(start, str, len);
+  nmt->strings_len += len;
+  return (u32)(start - nmt->strings);
+}
+
+static void nmtalike__rehash(NmtAlikeHashTable* nmt, u32 new_count) {
+  size_t new_hash_byte_len = sizeof(u32) * new_count;
+  u32* new_hash = malloc(new_hash_byte_len);
+  size_t new_hash_len = new_count;
+
+  memset(new_hash, 0, new_hash_byte_len);
+
+  for (u32 i = 0; i < nmt->hash_len; ++i) {
+    u32 name_index = nmt->hash[i];
+    if (name_index != NMT_INVALID) {
+      char* str = nmtalike__string_for_name_index(nmt, name_index);
+      u32 j = calc_hash(str, strlen(str)) % new_count;
+      for (;;) {
+        if (new_hash[j] == NMT_INVALID)
+          break;
+        ++j;
+        if (j == new_count)
+          j = 0;
+      }
+      new_hash[j] = name_index;
+    }
+  }
+
+  free(nmt->hash);
+  nmt->hash = new_hash;
+  nmt->hash_len = new_hash_len;
+}
+
+static void nmtalike__grow(NmtAlikeHashTable* nmt) {
+  ++nmt->num_names;
+
+  // These growth factors have to match so that the buckets line up as expected
+  // when serialized.
+  if (nmt->hash_len * 3 / 4 < nmt->num_names) {
+    nmtalike__rehash(nmt, (u32)(nmt->hash_len * 3 / 2 + 1));
+  }
+}
+
+static u32 nmtalike_add_string(NmtAlikeHashTable* nmt, char* str) {
+  u32 name_index = NMT_INVALID;
+  u32 insert_location;
+  nmtalike__find(nmt, str, &name_index, &insert_location);
+  if (name_index != NMT_INVALID)
+    return name_index;
+
+  name_index = nmtalike__append_to_string_buffer(nmt, str);
+  nmt->hash[insert_location] = name_index;
+  nmtalike__grow(nmt);
+  return name_index;
+}
+
+static u32 nmtalike_name_index_for_string(NmtAlikeHashTable* nmt, char* str) {
+  u32 name_index = NMT_INVALID;
+  u32 slot_unused;
+  nmtalike__find(nmt, str, &name_index, &slot_unused);
+  return name_index;  // either NMT_INVALID or the slot
+}
+
+typedef struct NmtAlikeEnum {
+  NmtAlikeHashTable* nmt;
+  u32 i;
+} NmtAlikeEnum;
+
+static NmtAlikeEnum nmtalike_enum_begin(NmtAlikeHashTable* nmt) {
+  return (NmtAlikeEnum){.nmt = nmt, .i = (u32)-1};
+}
+
+static int nmtalike_enum_next(NmtAlikeEnum* it) {
+  while (++it->i < it->nmt->hash_len) {
+    if (it->nmt->hash[it->i] != NMT_INVALID)
+      return 1;
+  }
+  return 0;
+}
+
+static void nmtalike_enum_get(NmtAlikeEnum* it, u32* name_index, char** str) {
+  *name_index = it->nmt->hash[it->i];
+  *str = nmtalike__string_for_name_index(it->nmt, *name_index);
+}
+
+static int write_names_stream(DbpContext* ctx, StreamData* stream) {
+  NmtAlikeHashTable* nmt = ctx->names_nmt = nmtalike_create();
+
+  for (size_t i = 0; i < ctx->func_syms_len; ++i) {
+    nmtalike_add_string(nmt, ctx->func_syms[i]->filename);
+  }
+
+  // "/names" is:
+  //
+  // header
+  // string bufer
+  // hash table
+  // number of names in the table
+  //
+  // Most of the 'magic' is in NmtAlikeHashTable, specifically in how it's
+  // grown.
+
+  SW_U32(0xeffeeffe);               // Header
+  SW_U32(1);                        // verLongHash
+  SW_U32((u32)(nmt->strings_len));  // Size of string buffer
+  SW_BLOCK(nmt->strings, nmt->strings_len);
+
+  SW_U32((u32)(nmt->hash_len));                      // Number of buckets
+  SW_BLOCK(nmt->hash, nmt->hash_len * sizeof(u32));  // Hash buckets
+
+  SW_U32(nmt->num_names);  // Number of names in the hash
+
+  return 1;
+}
+
+typedef struct DbiStreamHeader {
+  i32 version_signature;
+  u32 version_header;
+  u32 age;
+  u16 global_stream_index;
+  u16 build_number;
+  u16 public_stream_index;
+  u16 pdb_dll_version;
+  u16 sym_record_stream;
+  u16 pdb_dll_rbld;
+  i32 mod_info_size;
+  i32 section_contribution_size;
+  i32 section_map_size;
+  i32 source_info_size;
+  i32 type_server_map_size;
+  u32 mfc_type_server_index;
+  i32 optional_dbg_header_size;
+  i32 ec_substream_size;
+  u16 flags;
+  u16 machine;
+  u32 padding;
+} DbiStreamHeader;
+
+// Part of ModInfo
+typedef struct SectionContribEntry {
+  u16 section;
+  char padding1[2];
+  i32 offset;
+  i32 size;
+  u32 characteristics;
+  u16 module_index;
+  char padding2[2];
+  u32 data_crc;
+  u32 reloc_crc;
+} SectionContribEntry;
+
+typedef struct ModInfo {
+  u32 unused1;
+  SectionContribEntry section_contr;
+  u16 flags;
+  u16 module_sym_stream;
+  u32 sym_byte_size;
+  u32 c11_byte_size;
+  u32 c13_byte_size;
+  u16 source_file_count;
+  char padding[2];
+  u32 unused2;
+  u32 source_file_name_index;
+  u32 pdb_file_path_name_index;
+  // char module_name[];
+  // char obj_file_name[];
+} ModInfo;
+
+typedef struct SectionMapHeader {
+  u16 count;      // Number of segment descriptors
+  u16 log_count;  // Number of logical segment descriptors
+} SectionMapHeader;
+
+typedef struct SectionMapEntry {
+  u16 flags;  // See the SectionMapEntryFlags enum below.
+  u16 ovl;    // Logical overlay number
+  u16 group;  // Group index into descriptor array.
+  u16 frame;
+  u16 section_name;  // Byte index of segment / group name in string table, or 0xFFFF.
+  u16 class_name;    // Byte index of class in string table, or 0xFFFF.
+  u32 offset;        // Byte offset of the logical segment within physical segment. If group is set
+                     // in flags, this is the offset of the group.
+  u32 section_length;  // Byte count of the segment or group.
+} SectionMapEntry;
+
+enum SectionMapEntryFlags {
+  SMEF_Read = 1 << 0,               // Segment is readable.
+  SMEF_Write = 1 << 1,              // Segment is writable.
+  SMEF_Execute = 1 << 2,            // Segment is executable.
+  SMEF_AddressIs32Bit = 1 << 3,     // Descriptor describes a 32-bit linear address.
+  SMEF_IsSelector = 1 << 8,         // Frame represents a selector.
+  SMEF_IsAbsoluteAddress = 1 << 9,  // Frame represents an absolute address.
+  SMEF_IsGroup = 1 << 10            // If set, descriptor represents a group.
+};
+
+typedef struct FileInfoSubstreamHeader {
+  u16 num_modules;
+  u16 num_source_files;
+
+  // u16 mod_indices[num_modules];
+  // u16 mod_file_counts[num_modules];
+  // u32 file_name_offsets[num_source_files];
+  // char names_buffer[][num_source_files];
+} FileInfoSubstreamHeader;
+
+typedef struct GsiData {
+  u32 global_symbol_stream;
+  u32 public_symbol_stream;
+  u32 sym_record_stream;
+} GsiData;
+
+typedef struct DbiWriteData {
+  GsiData gsi_data;
+  u32 section_header_stream;
+  u32 module_sym_stream;
+  u32 module_symbols_byte_size;
+  u32 module_c13_byte_size;
+  u32 num_source_files;
+
+  SwFixup fixup_mod_info_size;
+  SwFixup fixup_section_contribution_size;
+  SwFixup fixup_section_map_size;
+  SwFixup fixup_source_info_size;
+  SwFixup fixup_optional_dbg_header_size;
+  SwFixup fixup_ec_substream_size;
+} DbiWriteData;
+
+static void write_dbi_stream_header(DbpContext* ctx, StreamData* stream, DbiWriteData* dwd) {
+  DbiStreamHeader dsh = {
+      .version_signature = -1,
+      .version_header = 19990903, /* V70 */
+      .age = 1,
+      .global_stream_index = (u16)dwd->gsi_data.global_symbol_stream,
+      .build_number = 0x8eb, /* 14.11 "new format" */
+      .public_stream_index = (u16)dwd->gsi_data.public_symbol_stream,
+      .pdb_dll_version = 0,
+      .sym_record_stream = (u16)dwd->gsi_data.sym_record_stream,
+      .pdb_dll_rbld = 0,
+      .type_server_map_size = 0,
+      .mfc_type_server_index = 0,
+      .flags = 0,
+      .machine = 0x8664, /* x64 */
+      .padding = 0,
+  };
+
+  dwd->fixup_mod_info_size = SW_CAPTURE_FIXUP(DbiStreamHeader, mod_info_size);
+  dwd->fixup_section_contribution_size =
+      SW_CAPTURE_FIXUP(DbiStreamHeader, section_contribution_size);
+  dwd->fixup_section_map_size = SW_CAPTURE_FIXUP(DbiStreamHeader, section_map_size);
+  dwd->fixup_source_info_size = SW_CAPTURE_FIXUP(DbiStreamHeader, source_info_size);
+  dwd->fixup_optional_dbg_header_size = SW_CAPTURE_FIXUP(DbiStreamHeader, optional_dbg_header_size);
+  dwd->fixup_ec_substream_size = SW_CAPTURE_FIXUP(DbiStreamHeader, ec_substream_size);
+  SW_BLOCK(&dsh, sizeof(dsh));
+}
+
+static void write_dbi_stream_modinfo(DbpContext* ctx, StreamData* stream, DbiWriteData* dwd) {
+  SwDelta block_start = SW_CAPTURE_DELTA_START();
+
+  // Module Info Substream. We output a single module with a single section for
+  // the whole jit blob.
+  ModInfo mod = {
+      .unused1 = 0,
+      .section_contr =
+          {
+              .section = 1,
+              .padding1 = {0, 0},
+              .offset = 0,
+              .size = (i32)ctx->image_size,
+              .characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_ALIGN_16BYTES |
+                                 IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
+              .module_index = 0,
+              .padding2 = {0, 0},
+              .data_crc = 0,
+              .reloc_crc = 0,
+          },
+      .flags = 0,
+      .module_sym_stream = (u16)dwd->module_sym_stream,
+      .sym_byte_size = dwd->module_symbols_byte_size,
+      .c11_byte_size = 0,
+      .c13_byte_size = dwd->module_c13_byte_size,
+      .source_file_count = (u16)dwd->num_source_files,
+      .padding = {0, 0},
+      .unused2 = 0,
+      .source_file_name_index = 0,
+      .pdb_file_path_name_index = 0,
+  };
+  SW_BLOCK(&mod, sizeof(mod));
+  // Intentionally twice for two index fields.
+  SW_BLOCK(synthetic_obj_name, sizeof(synthetic_obj_name));
+  SW_BLOCK(synthetic_obj_name, sizeof(synthetic_obj_name));
+  SW_ALIGN(4);
+  SW_WRITE_DELTA_FIXUP(dwd->fixup_mod_info_size, block_start);
+}
+
+static void write_dbi_stream_section_contribution(DbpContext* ctx,
+                                                  StreamData* stream,
+                                                  DbiWriteData* dwd) {
+  SwDelta block_start = SW_CAPTURE_DELTA_START();
+
+  // We only write a single section, one big for .text.
+  SW_U32(0xf12eba2d);  // Ver60
+  SectionContribEntry text_section = {
+      .section = 1,
+      .padding1 = {0, 0},
+      .offset = 0,
+      .size = (i32)ctx->image_size,
+      .characteristics =
+          IMAGE_SCN_CNT_CODE | IMAGE_SCN_ALIGN_16BYTES | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
+      .module_index = 0,
+      .padding2 = {0, 0},
+      .data_crc = 0,
+      .reloc_crc = 0,
+  };
+  SW_BLOCK(&text_section, sizeof(text_section));
+  SW_WRITE_DELTA_FIXUP(dwd->fixup_section_contribution_size, block_start);
+}
+
+static void write_dbi_stream_section_map(DbpContext* ctx, StreamData* stream, DbiWriteData* dwd) {
+  // This pretends to look sensible, but it doesn't make a lot of sense to me at
+  // the moment. A single SectionMapEntry for just .text that maps causes all
+  // functions to not have an RVA, and so line numbers don't get found. (Don't)
+  // ask me how many hours of trial-and-error that took to figure out!
+  //
+  // Making a second section seems to make it work. We make it .rdata and one
+  // page large, which matches the fake dll that we write later.
+
+  SwDelta block_start = SW_CAPTURE_DELTA_START();
+
+  SectionMapHeader header = {.count = 2, .log_count = 2};
+  SW_BLOCK(&header, sizeof(header));
+
+  SectionMapEntry text = {
+      .flags = SMEF_Read | SMEF_Execute | SMEF_AddressIs32Bit | SMEF_IsSelector,
+      .ovl = 0,               // ?
+      .group = 0,             // ?
+      .frame = 1,             // 1-based section number
+      .section_name = 0xfff,  // ?
+      .class_name = 0xffff,   // ?
+      .offset = 0,            // This seems to be added to the RVA, but defaults to 0x1000.
+      .section_length = (u32)ctx->image_size,
+  };
+  SW_BLOCK(&text, sizeof(text));
+
+  SectionMapEntry rdata = {
+      .flags = SMEF_Read | SMEF_AddressIs32Bit,
+      .ovl = 0,               // ?
+      .group = 0,             // ?
+      .frame = 2,             // 1-based section number
+      .section_name = 0xfff,  // ?
+      .class_name = 0xffff,   // ?
+      .offset = 0,            // This seems to be added to the RVA.
+      .section_length = STUB_RDATA_SIZE,
+  };
+  SW_BLOCK(&rdata, sizeof(rdata));
+
+  SW_WRITE_DELTA_FIXUP(dwd->fixup_section_map_size, block_start);
+}
+
+static void write_dbi_stream_file_info(DbpContext* ctx, StreamData* stream, DbiWriteData* dwd) {
+  SwDelta block_start = SW_CAPTURE_DELTA_START();
+
+  // File Info Substream
+  FileInfoSubstreamHeader fish = {
+      .num_modules = 1,       // This is always 1 for us.
+      .num_source_files = 0,  // This is unused.
+  };
+  SW_BLOCK(&fish, sizeof(fish));
+
+  SW_U16(0);                               // [mod_indices], unused.
+  SW_U16((u16)ctx->names_nmt->num_names);  // [num_source_files]
+
+  // First, write array of offset to files.
+  NmtAlikeEnum it = nmtalike_enum_begin(ctx->names_nmt);
+  while (nmtalike_enum_next(&it)) {
+    u32 name_index;
+    char* str;
+    nmtalike_enum_get(&it, &name_index, &str);
+    SW_U32(name_index);
+  }
+
+  // Then the strings buffer.
+  SW_BLOCK(ctx->names_nmt->strings, ctx->names_nmt->strings_len);
+
+  SW_ALIGN(4);
+  SW_WRITE_DELTA_FIXUP(dwd->fixup_source_info_size, block_start);
+}
+
+static void write_dbi_stream_ec_substream(DbpContext* ctx, StreamData* stream, DbiWriteData* dwd) {
+  SwDelta block_start = SW_CAPTURE_DELTA_START();
+
+  // llvm-pdbutil tries to load a pdb name from the ECSubstream. Emit a single
+  // nul byte, as we only refer to index 0. (This is an NMT if it needs to be
+  // fully written with more data.)
+  static unsigned char empty_nmt[] = {
+      0xfe, 0xef, 0xfe, 0xef,  // Header
+      0x01, 0x00, 0x00, 0x00,  // verLongHash
+      0x01, 0x00, 0x00, 0x00,  // Size
+      0x00,                    // Single \0 string.
+      0x01, 0x00, 0x00, 0x00,  // One element in array
+      0x00, 0x00, 0x00, 0x00,  // Entry 0 which is ""
+      0x00, 0x00, 0x00, 0x00,  // Number of names in hash table
+                               // Doesn't include initial nul which is always in the table.
+  };
+  SW_BLOCK(&empty_nmt, sizeof(empty_nmt));
+
+  // I don't think this one's supposed to be aligned /shruggie.
+
+  SW_WRITE_DELTA_FIXUP(dwd->fixup_ec_substream_size, block_start);
+}
+
+static void write_dbi_stream_optional_dbg_header(DbpContext* ctx,
+                                                 StreamData* stream,
+                                                 DbiWriteData* dwd) {
+  SwDelta block_start = SW_CAPTURE_DELTA_START();
+
+  // Index 5 points to the section header stream, which is theoretically
+  // optional, but llvm-pdbutil doesn't like it if it's not there, so I'm
+  // guessing that various microsoft things don't either. The stream it points
+  // at is empty, but that seems to be sufficient.
+  for (int i = 0; i < 5; ++i)
+    SW_U16(0xffff);
+  SW_U16((u16)dwd->section_header_stream);
+  for (int i = 0; i < 5; ++i)
+    SW_U16(0xffff);
+
+  SW_WRITE_DELTA_FIXUP(dwd->fixup_optional_dbg_header_size, block_start);
+}
+
+static int write_dbi_stream(DbpContext* ctx, StreamData* stream, DbiWriteData* dwd) {
+  write_dbi_stream_header(ctx, stream, dwd);
+  write_dbi_stream_modinfo(ctx, stream, dwd);
+  write_dbi_stream_section_contribution(ctx, stream, dwd);
+  write_dbi_stream_section_map(ctx, stream, dwd);
+  write_dbi_stream_file_info(ctx, stream, dwd);
+  // No type server map.
+  // No MFC type server map.
+  write_dbi_stream_ec_substream(ctx, stream, dwd);
+  write_dbi_stream_optional_dbg_header(ctx, stream, dwd);
+
+  return 1;
+}
+
+#define IPHR_HASH 4096
+
+typedef struct HashSym {
+  char* name;
+  u32 offset;
+  u32 hash_bucket;  // Must be % IPHR_HASH
+} HashSym;
+
+typedef struct HRFile {
+  u32 off;
+  u32 cref;
+} HRFile;
+
+typedef struct GsiHashBuilder {
+  HashSym* sym;
+  size_t sym_len;
+  size_t sym_cap;
+
+  HRFile* hash_records;
+  size_t hash_records_len;
+
+  u32* hash_buckets;
+  size_t hash_buckets_len;
+  size_t hash_buckets_cap;
+
+  u32 hash_bitmap[(IPHR_HASH + 32) / 32];
+} GsiHashBuilder;
+
+typedef struct GsiBuilder {
+  StreamData* public_hash_stream;
+  StreamData* global_hash_stream;
+  StreamData* sym_record_stream;
+
+  GsiHashBuilder publics;
+  GsiHashBuilder globals;
+} GsiBuilder;
+
+// The CodeView structs are all smooshed.
+#pragma pack(push, 1)
+
+#define CV_SYM_HEADER \
+  u16 record_len;     \
+  u16 record_type
+
+typedef enum CV_S_PUB32_FLAGS {
+  CVSPF_None = 0x00,
+  CVSPF_Code = 0x01,
+  CVSPF_Function = 0x02,
+  CVSPF_Managed = 0x04,
+  CVSPF_MSIL = 0x08,
+} CV_S_PUB32_FLAGS;
+
+typedef struct CV_S_PUB32 {
+  CV_SYM_HEADER;
+  u32 flags;
+  u32 offset_into_codeseg;
+  u16 segment;
+  // unsigned char name[];
+} CV_S_PUB32;
+
+typedef struct CV_S_PROCREF {
+  CV_SYM_HEADER;
+  u32 sum_name;
+  u32 offset_into_module_data;
+  u16 segment;
+  // unsigned char name[];
+} CV_S_PROCREF;
+
+typedef struct CV_S_OBJNAME {
+  CV_SYM_HEADER;
+  u32 signature;
+  // unsigned char name[];
+} CV_S_OBJNAME;
+
+typedef struct CV_S_COMPILE3 {
+  CV_SYM_HEADER;
+
+  struct {
+    u32 language : 8;         // language index
+    u32 ec : 1;               // compiled for E/C
+    u32 no_dbg_info : 1;      // not compiled with debug info
+    u32 ltcg : 1;             // compiled with LTCG
+    u32 no_data_align : 1;    // compiled with -Bzalign
+    u32 managed_present : 1;  // managed code/data present
+    u32 security_checks : 1;  // compiled with /GS
+    u32 hot_patch : 1;        // compiled with /hotpatch
+    u32 cvtcil : 1;           // converted with CVTCIL
+    u32 msil_module : 1;      // MSIL netmodule
+    u32 sdl : 1;              // compiled with /sdl
+    u32 pgo : 1;              // compiled with /ltcg:pgo or pgu
+    u32 exp : 1;              // .exp module
+    u32 pad : 12;             // reserved, must be 0
+  } flags;
+  u16 machine;
+  u16 ver_fe_major;
+  u16 ver_fe_minor;
+  u16 ver_fe_build;
+  u16 ver_fe_qfe;
+  u16 ver_be_major;
+  u16 ver_be_minor;
+  u16 ver_be_build;
+  u16 ver_be_qfe;
+
+  // unsigned char version[];
+} CV_S_COMPILE3;
+
+typedef struct CV_S_PROCFLAGS {
+  union {
+    unsigned char all;
+    struct {
+      unsigned char CV_PFLAG_NOFPO : 1;       // frame pointer present
+      unsigned char CV_PFLAG_INT : 1;         // interrupt return
+      unsigned char CV_PFLAG_FAR : 1;         // far return
+      unsigned char CV_PFLAG_NEVER : 1;       // function does not return
+      unsigned char CV_PFLAG_NOTREACHED : 1;  // label isn't fallen into
+      unsigned char CV_PFLAG_CUST_CALL : 1;   // custom calling convention
+      unsigned char CV_PFLAG_NOINLINE : 1;    // function marked as noinline
+      unsigned char CV_PFLAG_OPTDBGINFO : 1;  // function has debug information for optimized code
+    };
+  };
+} CV_S_PROCFLAGS;
+
+typedef struct CV_S_GPROC32 {
+  CV_SYM_HEADER;
+
+  u32 parent;
+  u32 end;
+  u32 next;
+  u32 len;
+  u32 dbg_start;
+  u32 dbg_end;
+  u32 type_index;
+  u32 offset;
+  u16 seg;
+  CV_S_PROCFLAGS flags;  // Proc flags
+
+  // unsigned char name[];
+} CV_S_GPROC32;
+
+typedef enum CV_LineFlags {
+  CF_LF_None = 0,
+  CF_LF_HaveColumns = 1,
+} CV_LineFlags;
+
+typedef struct CV_LineFragmentHeader {
+  u32 reloc_offset;
+  u16 reloc_segment;
+  u16 flags;  // CV_LineFlags
+  u32 code_size;
+} CV_LineFragmentHeader;
+
+typedef struct CV_LineBlockFragmentHeader {
+  u32 checksum_block_offset;  // Offset of file_checksum entry in file checksums buffer. The
+                              // checksum entry then contains another offset into the string table
+                              // of the actual name.
+  u32 num_lines;
+  u32 block_size;
+  // CV_LineNumberEntry lines[num_lines];
+  // Columns array goes here too, but we don't currently support that.
+} CV_LineBlockFragmentHeader;
+
+typedef struct CV_LineNumberEntry {
+  u32 offset;               // Offset to start of code bytes for line number.
+  u32 line_num_start : 24;  // Line where statement/expression starts.
+  u32 delta_line_end : 7;   // Delta to line where statement ends (optional).
+  u32 is_statement : 1;     // true if statement, false if expression.
+} CV_LineNumberEntry;
+
+typedef struct CV_S_NODATA {
+  CV_SYM_HEADER;
+} CV_S_NODATA;
+
+typedef enum CV_FileChecksumKind {
+  CV_FCSK_None,
+  CV_FCSK_MD5,
+  CV_FCSK_SHA1,
+  CV_FCSK_SHA256,
+} CV_FileChecksumKind;
+
+typedef struct CV_FileChecksumEntryHeader {
+  u32 filename_offset;
+  unsigned char checksum_size;
+  unsigned char checksum_kind;
+} CV_FileChecksumEntryHeader;
+
+typedef enum CV_DebugSubsectionKind {
+  CV_DSF_Symbols = 0xf1,
+  CV_DSF_Lines = 0xf2,
+  CV_DSF_StringTable = 0xf3,
+  CV_DSF_FileChecksums = 0xf4,
+  // There are also others that we don't need.
+} CV_DebugSubsectionKind;
+
+typedef struct CV_DebugSubsectionHeader {
+  u32 kind;    // CV_DebugSubsectionKind enum
+  u32 length;  // includes data after, but not this struct.
+} CV_DebugSubsectionHeader;
+
+#define SW_CV_SYM_TRAILING_NAME(sym, name)                                                    \
+  do {                                                                                        \
+    u16 name_len = (u16)strlen(name) + 1; /* trailing \0 seems required in (most?) records */ \
+    u16 record_len = (u16)align_to((u32)name_len + sizeof(sym), 4) -                          \
+                     sizeof(u16) /* length field not included in length count */;             \
+    sym.record_len = record_len;                                                              \
+    assert(sym.record_type);                                                                  \
+    SW_BLOCK(&sym, sizeof(sym));                                                              \
+    SW_BLOCK(name, name_len);                                                                 \
+    SW_ALIGN(4);                                                                              \
+  } while (0)
+
+#define SW_CV_SYM(sym)                                            \
+  do {                                                            \
+    u16 record_len = (u16)align_to(sizeof(sym), 4) - sizeof(u16); \
+    sym.record_len = record_len;                                  \
+    assert(sym.record_type);                                      \
+    SW_BLOCK(&sym, sizeof(sym));                                  \
+    /* No need to align because we should already be. */          \
+  } while (0)
+
+#pragma pack(pop)
+
+static void gsi_builder_add_public(DbpContext* ctx,
+                                   GsiBuilder* builder,
+                                   CV_S_PUB32_FLAGS flags,
+                                   u32 offset_into_codeseg,
+                                   char* name) {
+  StreamData* stream = builder->sym_record_stream;
+
+  HashSym sym = {_strdup(name), stream->data_length, calc_hash(name, strlen(name)) % IPHR_HASH};
+  PUSH_BACK(builder->publics.sym, sym);
+
+  CV_S_PUB32 pub = {
+      .record_type = 0x110e,
+      .flags = (u32)flags,
+      .offset_into_codeseg = offset_into_codeseg,
+      .segment = 1  // segment is always 1 for us
+  };
+  SW_CV_SYM_TRAILING_NAME(pub, name);
+}
+
+static void gsi_builder_add_procref(DbpContext* ctx,
+                                    GsiBuilder* builder,
+                                    u32 offset_into_module_data,
+                                    char* name) {
+  StreamData* stream = builder->sym_record_stream;
+
+  HashSym sym = {_strdup(name), stream->data_length, calc_hash(name, strlen(name)) % IPHR_HASH};
+  PUSH_BACK(builder->globals.sym, sym);
+
+  CV_S_PROCREF procref = {
+      .record_type = 0x1125,
+      .sum_name = 0,
+      .offset_into_module_data = offset_into_module_data,
+      .segment = 1,  // segment is always 1 for us
+  };
+  SW_CV_SYM_TRAILING_NAME(procref, name);
+}
+
+static int is_ascii_string(char* s) {
+  for (unsigned char* p = (unsigned char*)s; *p; ++p) {
+    if (*p >= 0x80)
+      return 0;
+  }
+  return 1;
+}
+
+static int gsi_record_cmp(char* s1, char* s2) {
+  // Not-at-all-Accidentally Quadratic, but rather Wantonly. :/
+  size_t ls = strlen(s1);
+  size_t rs = strlen(s2);
+  if (ls != rs) {
+    return (ls > rs) - (ls < rs);
+  }
+
+  // Non-ascii: memcmp.
+  if (!is_ascii_string(s1) || !is_ascii_string(s2)) {
+    return memcmp(s1, s2, ls);
+  }
+
+  // Otherwise case-insensitive (so random!).
+  return _memicmp(s1, s2, ls);
+}
+
+// TODO: use a better sort impl
+static HashSym* g_cur_hash_bucket_sort_syms = NULL;
+
+// See caseInsensitiveComparePchPchCchCch() in microsoft-pdb gsi.cpp.
+static int gsi_bucket_cmp(const void* a, const void* b) {
+  const HRFile* hra = (const HRFile*)a;
+  const HRFile* hrb = (const HRFile*)b;
+  HashSym* left = &g_cur_hash_bucket_sort_syms[hra->off];
+  HashSym* right = &g_cur_hash_bucket_sort_syms[hrb->off];
+  assert(left->hash_bucket == right->hash_bucket);
+  int cmp = gsi_record_cmp(left->name, right->name);
+  if (cmp != 0) {
+    return cmp < 0;
+  }
+  return left->offset < right->offset;
+}
+
+static void gsi_hash_builder_finish(GsiHashBuilder* hb) {
+  // Figure out the exact bucket layout in the very arbitrary way that somebody
+  // happened to decide on 30 years ago. The number of buckets in the
+  // microsoft-pdb implementation is constant at IPHR_HASH afaict.
+
+  // Figure out where each bucket starts.
+  u32 bucket_starts[IPHR_HASH] = {0};
+  {
+    u32 num_mapped_to_bucket[IPHR_HASH] = {0};
+    for (size_t i = 0; i < hb->sym_len; ++i) {
+      ++num_mapped_to_bucket[hb->sym[i].hash_bucket];
+    }
+
+    u32 total = 0;
+    for (size_t i = 0; i < IPHR_HASH; ++i) {
+      bucket_starts[i] = total;
+      total += num_mapped_to_bucket[i];
+    }
+  }
+
+  // Put symbols into the table in bucket order, updating the bucket starts as
+  // we go.
+  u32 bucket_cursors[IPHR_HASH];
+  memcpy(bucket_cursors, bucket_starts, sizeof(bucket_cursors));
+
+  size_t num_syms = hb->sym_len;
+
+  hb->hash_records = calloc(num_syms, sizeof(HRFile));
+  hb->hash_records_len = num_syms;
+
+  for (size_t i = 0; i < num_syms; ++i) {
+    u32 hash_idx = bucket_cursors[hb->sym[i].hash_bucket]++;
+    hb->hash_records[hash_idx].off = (u32)i;
+    hb->hash_records[hash_idx].cref = 1;
+  }
+
+  g_cur_hash_bucket_sort_syms = hb->sym;
+  // Sort each *bucket* (approximately) by the memcmp of the symbol's name. This
+  // has to match microsoft-pdb, and it's bonkers. LLVM's implementation was
+  // more helpful than microsoft-pdb's gsi.cpp for this one, and these hashes
+  // aren't documented at all (in English) as of this writing as far as I know.
+  for (size_t i = 0; i < IPHR_HASH; ++i) {
+    size_t count = bucket_cursors[i] - bucket_starts[i];
+    if (count > 0) {
+      HRFile* begin = hb->hash_records + bucket_starts[i];
+      qsort(begin, count, sizeof(HRFile), gsi_bucket_cmp);
+
+      // Replace the indices with the stream offsets of each global, biased by 1
+      // because 0 is treated specially.
+      for (size_t j = 0; j < count; ++j) {
+        begin[j].off = hb->sym[begin[j].off].offset + 1;
+      }
+    }
+  }
+  g_cur_hash_bucket_sort_syms = NULL;
+
+  // Update the hash bitmap for each used bucket.
+  for (u32 i = 0; i < sizeof(hb->hash_bitmap) / sizeof(hb->hash_bitmap[0]); ++i) {
+    u32 word = 0;
+    for (u32 j = 0; j < 32; ++j) {
+      u32 bucket_idx = i * 32 + j;
+      if (bucket_idx >= IPHR_HASH || bucket_starts[bucket_idx] == bucket_cursors[bucket_idx]) {
+        continue;
+      }
+      word |= 1u << j;
+
+      // Calculate what the offset of the first hash record int he chain would
+      // be if it contained 32bit pointers: HROffsetCalc in microsoft-pdb gsi.h.
+      u32 size_of_hr_offset_calc = 12;
+      u32 chain_start_off = bucket_starts[bucket_idx] * size_of_hr_offset_calc;
+      PUSH_BACK(hb->hash_buckets, chain_start_off);
+    }
+    hb->hash_bitmap[i] = word;
+  }
+}
+
+static void gsi_hash_builder_write(DbpContext* ctx, GsiHashBuilder* hb, StreamData* stream) {
+  SW_U32(0xffffffff);             // HdrSignature
+  SW_U32(0xeffe0000 + 19990810);  // GSIHashSCImpv70
+  SW_U32((u32)(hb->hash_records_len * sizeof(HRFile)));
+  SW_U32((u32)(sizeof(hb->hash_bitmap) + hb->hash_buckets_len * sizeof(u32)));
+
+  SW_BLOCK(hb->hash_records, hb->hash_records_len * sizeof(HRFile));
+  SW_BLOCK(hb->hash_bitmap, sizeof(hb->hash_bitmap));
+  SW_BLOCK(hb->hash_buckets, hb->hash_buckets_len * sizeof(u32));
+}
+
+static HashSym* g_cur_addr_map_sort_syms = NULL;
+static int addr_map_cmp(const void* a, const void* b) {
+  const u32* left_idx = (const u32*)a;
+  const u32* right_idx = (const u32*)b;
+  HashSym* left = &g_cur_addr_map_sort_syms[*left_idx];
+  HashSym* right = &g_cur_addr_map_sort_syms[*right_idx];
+  // Compare segment first, if we had one, but it's always 1.
+  if (left->offset != right->offset)
+    return left->offset < right->offset;
+  return strcmp(left->name, right->name);
+}
+
+static void gsi_write_publics_stream(DbpContext* ctx, GsiHashBuilder* hb, StreamData* stream) {
+  // microsoft-pdb PSGSIHDR first, then the hash table in the same format as
+  // "globals" (gsi_hash_builder_write).
+  u32 size_of_hash = (u32)(16 + (hb->hash_records_len * sizeof(HRFile)) + sizeof(hb->hash_bitmap) +
+                           (hb->hash_buckets_len * sizeof(u32)));
+  SW_U32(size_of_hash);                      // cbSymHash
+  SW_U32((u32)(hb->sym_len * sizeof(u32)));  // cbAddrMap
+  SW_U32(0);                                 // nThunks
+  SW_U32(0);                                 // cbSizeOfThunk
+  SW_U16(0);                                 // isectTunkTable
+  SW_U16(0);                                 // padding
+  SW_U32(0);                                 // offThunkTable
+  SW_U32(0);                                 // nSects
+
+  size_t before_hash_len = stream->data_length;
+
+  gsi_hash_builder_write(ctx, hb, stream);
+
+  size_t after_hash_len = stream->data_length;
+  assert(after_hash_len - before_hash_len == size_of_hash &&
+         "hash size calc doesn't match gsi_hash_builder_write");
+  (void)before_hash_len;
+  (void)after_hash_len;
+
+  u32* addr_map = _alloca(sizeof(u32) * hb->sym_len);
+  for (u32 i = 0; i < hb->sym_len; ++i)
+    addr_map[i] = i;
+  g_cur_addr_map_sort_syms = hb->sym;
+  qsort(addr_map, hb->sym_len, sizeof(u32), addr_map_cmp);
+  g_cur_addr_map_sort_syms = NULL;
+
+  // Rewrite public symbol indices into symbol offsets.
+  for (size_t i = 0; i < hb->sym_len; ++i) {
+    addr_map[i] = hb->sym[addr_map[i]].offset;
+  }
+
+  SW_BLOCK(addr_map, hb->sym_len * sizeof(u32));
+}
+
+static void free_gsi_hash_builder(GsiHashBuilder* hb) {
+  for (size_t i = 0; i < hb->sym_len; ++i) {
+    free(hb->sym[i].name);
+  }
+  free(hb->sym);
+  free(hb->hash_records);
+  free(hb->hash_buckets);
+}
+
+static GsiData gsi_builder_finish(DbpContext* ctx, GsiBuilder* gsi) {
+  gsi_hash_builder_finish(&gsi->publics);
+  gsi_hash_builder_finish(&gsi->globals);
+
+  gsi->global_hash_stream = add_stream(ctx);
+  gsi_hash_builder_write(ctx, &gsi->globals, gsi->global_hash_stream);
+
+  gsi->public_hash_stream = add_stream(ctx);
+  gsi_write_publics_stream(ctx, &gsi->publics, gsi->public_hash_stream);
+
+  GsiData result = {.global_symbol_stream = gsi->global_hash_stream->stream_index,
+                    .public_symbol_stream = gsi->public_hash_stream->stream_index,
+                    .sym_record_stream = gsi->sym_record_stream->stream_index};
+
+  free_gsi_hash_builder(&gsi->publics);
+  free_gsi_hash_builder(&gsi->globals);
+  free(gsi);
+
+  return result;
+}
+
+static GsiData build_gsi_data(DbpContext* ctx) {
+  GsiBuilder* gsi = calloc(1, sizeof(GsiBuilder));
+  gsi->sym_record_stream = add_stream(ctx);
+
+  for (size_t i = 0; i < ctx->func_syms_len; ++i) {
+    DbpFunctionSymbol* fs = ctx->func_syms[i];
+
+    assert(fs->module_info_offset > 0 && "didn't write modi yet?");
+    gsi_builder_add_procref(ctx, gsi, fs->module_info_offset, fs->name);
+
+    gsi_builder_add_public(ctx, gsi, CVSPF_Function, fs->address, fs->name);
+  }
+
+  return gsi_builder_finish(ctx, gsi);
+}
+
+typedef struct ModuleData {
+  StreamData* stream;
+  u32 symbols_byte_size;
+  u32 c13_byte_size;
+} ModuleData;
+
+typedef struct DebugLinesBlock {
+  u32 checksum_buffer_offset;
+  CV_LineNumberEntry* lines;
+  size_t lines_len;
+  size_t lines_cap;
+} DebugLinesBlock;
+
+typedef struct DebugLines {
+  DebugLinesBlock* blocks;
+  size_t blocks_len;
+  size_t blocks_cap;
+
+  u32 reloc_offset;
+  u32 code_size;
+} DebugLines;
+
+static ModuleData write_module_stream(DbpContext* ctx) {
+  StreamData* stream = add_stream(ctx);
+  ModuleData module_data = {stream, 0, 0};
+
+  u32 symbol_start = stream->data_length;
+
+  SW_U32(4);  // Signature
+
+  //
+  // Symbols
+  //
+  CV_S_OBJNAME objname = {.record_type = 0x1101, .signature = 0};
+  SW_CV_SYM_TRAILING_NAME(objname, synthetic_obj_name);
+
+  CV_S_COMPILE3 compile3 = {
+      .record_type = 0x113c,
+      .flags = {.language = 0x00 /* CV_CFL_C */},
+      .machine = 0xd0,  // x64
+      .ver_fe_major = ctx->version_major,
+      .ver_fe_minor = ctx->version_minor,
+      .ver_fe_build = ctx->version_build,
+      .ver_fe_qfe = ctx->version_qfe,
+      .ver_be_major = ctx->version_major,
+      .ver_be_minor = ctx->version_minor,
+      .ver_be_build = ctx->version_build,
+      .ver_be_qfe = ctx->version_qfe,
+  };
+  SW_CV_SYM_TRAILING_NAME(compile3, ctx->compiler_version_string);
+
+  for (size_t i = 0; i < ctx->func_syms_len; ++i) {
+    DbpFunctionSymbol* fs = ctx->func_syms[i];
+
+    fs->module_info_offset = stream->data_length;
+
+    CV_S_GPROC32 gproc32 = {
+        .record_type = 0x1110,
+        .parent = 0,
+        .end = ~0U,
+        .next = 0,
+        .len = fs->length,
+        .dbg_start = fs->address,   // not sure about these fields
+        .dbg_end = fs->length - 1,  // not sure about these fields
+        .type_index = 0x1001,       // hrm, first UDT, undefined but we're not writing types.
+        .offset = fs->address,      /* address of proc */
+        .seg = 1,
+        .flags = {0},
+    };
+    SwFixup end_fixup = SW_CAPTURE_FIXUP(CV_S_GPROC32, end);
+    SW_CV_SYM_TRAILING_NAME(gproc32, fs->name);
+
+    CV_S_NODATA end = {.record_type = 0x0006};
+    SW_WRITE_FIXUP_FOR_LOCATION_U32(end_fixup);
+    SW_CV_SYM(end);
+  }
+
+  // TODO: could add all global data here too, but without types it's probably
+  // pretty pointless.
+
+  module_data.symbols_byte_size = stream->data_length - symbol_start;
+
+  //
+  // C13LineInfo
+  //
+  u32 c13_start = stream->data_length;
+
+  // Need filename to offset-into-checksums block map. Record the name_index for
+  // each string here, and find the index of name_index in this array. Then the
+  // location where it's found in this array is the offset (times a constant
+  // sizeof).
+  u32* name_index_to_checksum_offset = _alloca(sizeof(u32) * ctx->names_nmt->num_names);
+
+  // Checksums
+  {
+    // Write a block of checksums, except we actually write "None" checksums, so
+    // it's just a table of indices pointed to by name_index above, that in turn
+    // points to the offset into the /names NMT for the actual file name.
+    size_t len = align_to((u32)sizeof(CV_FileChecksumEntryHeader), 4) * ctx->names_nmt->num_names;
+    CV_DebugSubsectionHeader checksums_subsection_header = {.kind = CV_DSF_FileChecksums,
+                                                            .length = align_to((u32)len, 4)};
+    SW_BLOCK(&checksums_subsection_header, sizeof(checksums_subsection_header));
+
+    // The layout of this section has to match how name_index_to_checksum_offset
+    // is used above.
+    NmtAlikeEnum it = nmtalike_enum_begin(ctx->names_nmt);
+    size_t i = 0;
+    while (nmtalike_enum_next(&it)) {
+      u32 name_index;
+      char* str;
+      nmtalike_enum_get(&it, &name_index, &str);
+
+      name_index_to_checksum_offset[i++] = name_index;
+
+      CV_FileChecksumEntryHeader header = {
+          .filename_offset = name_index, .checksum_size = 0, .checksum_kind = CV_FCSK_None};
+      SW_BLOCK(&header, sizeof(header));
+      SW_ALIGN(4);
+    }
+  }
+
+  // Lines
+  {
+    size_t len = sizeof(CV_LineFragmentHeader);
+    for (size_t i = 0; i < ctx->func_syms_len; ++i) {
+      DbpFunctionSymbol* fs = ctx->func_syms[i];
+      len += sizeof(CV_LineBlockFragmentHeader);
+      len += fs->lines_len * sizeof(CV_LineNumberEntry);
+    }
+
+    CV_DebugSubsectionHeader lines_subsection_header = {.kind = CV_DSF_Lines, .length = (u32)len};
+    SW_BLOCK(&lines_subsection_header, sizeof(lines_subsection_header));
+
+    CV_LineFragmentHeader header = {.code_size = (u32)ctx->image_size,
+                                    .flags = CF_LF_None,
+                                    .reloc_segment = 1,
+                                    .reloc_offset = 0};
+    SW_BLOCK(&header, sizeof(header));
+
+    for (size_t i = 0; i < ctx->func_syms_len; ++i) {
+      DbpFunctionSymbol* fs = ctx->func_syms[i];
+
+      CV_LineBlockFragmentHeader block_header;
+      block_header.num_lines = (u32)fs->lines_len;
+      block_header.block_size = sizeof(CV_LineBlockFragmentHeader);
+      block_header.block_size += block_header.num_lines * sizeof(CV_LineNumberEntry);
+      u32 name_index = nmtalike_name_index_for_string(ctx->names_nmt, fs->filename);
+      u32 offset = ~0u;
+      for (size_t j = 0; j < ctx->names_nmt->num_names; ++j) {
+        if (name_index_to_checksum_offset[j] == name_index) {
+          offset = (u32)(align_to((u32)sizeof(CV_FileChecksumEntryHeader), 4) * j);
+          break;
+        }
+      }
+      assert(offset != ~0u && "didn't find filename");
+      block_header.checksum_block_offset = offset;
+      SW_BLOCK(&block_header, sizeof(block_header));
+
+      for (size_t j = 0; j < fs->lines_len; ++j) {
+        CV_LineNumberEntry line_entry = {.offset = fs->lines[j].address,
+                                         .line_num_start = fs->lines[j].line,
+                                         .delta_line_end = 0,
+                                         .is_statement = 1};
+        SW_BLOCK(&line_entry, sizeof(line_entry));
+      }
+    }
+  }
+
+  module_data.c13_byte_size = stream->data_length - c13_start;
+
+  //
+  // GlobalRefs, don't know, don't write it.
+  //
+  SW_U32(0);  // GlobalRefsSize
+
+  return module_data;
+}
+
+static int write_directory(DbpContext* ctx) {
+  u32 directory_page = alloc_block(ctx);
+
+  u32* block_map = get_block_ptr(ctx, ctx->superblock->block_map_addr);
+  *block_map = directory_page;
+
+  u32* start = get_block_ptr(ctx, directory_page);
+  u32* dir = start;
+
+  // Starts with number of streams.
+  *dir++ = (u32)ctx->stream_data_len;
+
+  // Then, the number of blocks in each stream.
+  for (size_t i = 0; i < ctx->stream_data_len; ++i) {
+    *dir++ = ctx->stream_data[i]->data_length;
+    ENSURE((ctx->stream_data[i]->data_length + BLOCK_SIZE - 1) / BLOCK_SIZE,
+           ctx->stream_data[i]->blocks_len);
+  }
+
+  // Then the list of blocks for each stream.
+  for (size_t i = 0; i < ctx->stream_data_len; ++i) {
+    for (size_t j = 0; j < ctx->stream_data[i]->blocks_len; ++j) {
+      *dir++ = ctx->stream_data[i]->blocks[j];
+    }
+  }
+
+  // And finally, update the super block with the number of bytes in the
+  // directory.
+  ctx->superblock->num_directory_bytes = (u32)((u32)(dir - start) * sizeof(u32));
+
+  // This can't easily use StreamData because it's the directory of streams. It
+  // would take a larger pdb that we expect to be writing here to overflow the
+  // first block (especially since we don't write types), so just assert that we
+  // didn't grow too large for now.
+  if (ctx->superblock->num_directory_bytes > BLOCK_SIZE) {
+    fprintf(stderr, "%s:%d: directory grew beyond BLOCK_SIZE\n", __FILE__, __LINE__);
+    return 0;
+  }
+
+  return 1;
+}
+
+static int create_file_map(DbpContext* ctx) {
+  ctx->file = CreateFile(ctx->output_pdb_name, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, NULL);
+  ENSURE_NE(ctx->file, INVALID_HANDLE_VALUE);
+
+  ctx->file_size = BLOCK_SIZE * DEFAULT_NUM_BLOCKS;  // TODO: grow mapping as necessary
+  ENSURE(SetFilePointer(ctx->file, (LONG)ctx->file_size, NULL, FILE_BEGIN), ctx->file_size);
+
+  ENSURE(1, SetEndOfFile(ctx->file));
+
+  HANDLE map_object = CreateFileMapping(ctx->file, NULL, PAGE_READWRITE, 0, 0, NULL);
+  ENSURE_NE(map_object, NULL);
+
+  ctx->data = MapViewOfFileEx(map_object, FILE_MAP_ALL_ACCESS, 0, 0, 0, NULL);
+  ENSURE_NE(ctx->data, NULL);
+
+  ENSURE(CloseHandle(map_object), 1);
+
+  return 1;
+}
+
+typedef struct RsdsDataHeader {
+  unsigned char magic[4];
+  UUID unique_id;
+  u32 age;
+  // unsigned char name[]
+} RsdsDataHeader;
+
+static void file_fill_to_next_page(FILE* f, unsigned char with) {
+  long long align_count = ftell(f);
+  while (align_count % 0x200 != 0) {
+    fwrite(&with, sizeof(with), 1, f);
+    ++align_count;
+  }
+}
+
+static int write_stub_dll(DbpContext* ctx, DbpExceptionTables* exception_tables) {
+  FILE* f;
+  if (fopen_s(&f, ctx->output_dll_name, "wb") != 0) {
+    fprintf(stderr, "couldn't open %s\n", ctx->output_dll_name);
+    return 0;
+  }
+  DWORD timedate = (DWORD)time(NULL);
+  static unsigned char dos_stub_and_pe_magic[172] = {
+      0x4d, 0x5a, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00,
+      0x00, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+      0xa8, 0x00, 0x00, 0x00, 0x0e, 0x1f, 0xba, 0x0e, 0x00, 0xb4, 0x09, 0xcd, 0x21, 0xb8, 0x01,
+      0x4c, 0xcd, 0x21, 0x54, 0x68, 0x69, 0x73, 0x20, 0x70, 0x72, 0x6f, 0x67, 0x72, 0x61, 0x6d,
+      0x20, 0x63, 0x61, 0x6e, 0x6e, 0x6f, 0x74, 0x20, 0x62, 0x65, 0x20, 0x72, 0x75, 0x6e, 0x20,
+      0x69, 0x6e, 0x20, 0x44, 0x4f, 0x53, 0x20, 0x6d, 0x6f, 0x64, 0x65, 0x2e, 0x0d, 0x0d, 0x0a,
+      0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x61, 0x46, 0x33, 0xdf, 0x25, 0x27, 0x5d,
+      0x8c, 0x25, 0x27, 0x5d, 0x8c, 0x25, 0x27, 0x5d, 0x8c, 0xe4, 0x5b, 0x59, 0x8d, 0x24, 0x27,
+      0x5d, 0x8c, 0xe4, 0x5b, 0x5f, 0x8d, 0x24, 0x27, 0x5d, 0x8c, 0x52, 0x69, 0x63, 0x68, 0x25,
+      0x27, 0x5d, 0x8c, 'P',  'E',  '\0', '\0',
+  };
+  // PE pointer is a 0x3c, points at 0xa8, IMAGE_FILE_HEADER starts there.
+  fwrite(dos_stub_and_pe_magic, sizeof(dos_stub_and_pe_magic), 1, f);
+  IMAGE_FILE_HEADER image_file_header = {
+      .Machine = IMAGE_FILE_MACHINE_AMD64,
+      .NumberOfSections = 2 + (exception_tables ? 2 : 0),
+      .TimeDateStamp = timedate,
+      .PointerToSymbolTable = 0,
+      .NumberOfSymbols = 0,
+      .SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64),
+      .Characteristics = IMAGE_FILE_RELOCS_STRIPPED | IMAGE_FILE_EXECUTABLE_IMAGE |
+                         IMAGE_FILE_LARGE_ADDRESS_AWARE | IMAGE_FILE_DLL,
+  };
+
+  DWORD pdata_length =
+      exception_tables ? (DWORD)(exception_tables->num_pdata_entries * sizeof(DbpRUNTIME_FUNCTION))
+                       : 0;
+  DWORD pdata_length_page_aligned = align_to(pdata_length, 0x1000);
+  DWORD pdata_length_file_aligned = align_to(pdata_length, 0x200);
+
+  DWORD xdata_length = exception_tables ? (DWORD)exception_tables->unwind_info_byte_length : 0;
+  DWORD xdata_length_page_aligned = align_to(xdata_length, 0x1000);
+  DWORD xdata_length_file_aligned = align_to(xdata_length, 0x200);
+
+  DWORD code_start = 0x1000;
+  DWORD rdata_virtual_start = (DWORD)(code_start + ctx->image_size);
+  DWORD pdata_virtual_start = rdata_virtual_start + STUB_RDATA_SIZE;
+  DWORD xdata_virtual_start = pdata_virtual_start + pdata_length_page_aligned;
+  fwrite(&image_file_header, sizeof(image_file_header), 1, f);
+  IMAGE_OPTIONAL_HEADER64 opt_header = {
+      .Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC,
+      .MajorLinkerVersion = 14,  // Matches DBI stream.
+      .MinorLinkerVersion = 11,
+      .SizeOfCode = 0x200,
+      .SizeOfInitializedData = 0x200,
+      .SizeOfUninitializedData = 0,
+      .AddressOfEntryPoint = 0,
+      .BaseOfCode = 0x1000,
+      .ImageBase = (ULONGLONG)ctx->base_addr,
+      .SectionAlignment = 0x1000,
+      .FileAlignment = 0x200,
+      .MajorOperatingSystemVersion = 6,
+      .MinorOperatingSystemVersion = 0,
+      .MajorImageVersion = 6,
+      .MinorImageVersion = 0,
+      .MajorSubsystemVersion = 6,
+      .MinorSubsystemVersion = 0,
+      .Win32VersionValue = 0,
+      // The documentation makes this seem like the size of the file, but I
+      // think it's actually the virtual space occupied to the end of the
+      // sections when loaded.
+      .SizeOfImage = xdata_virtual_start + xdata_length_page_aligned,  // xdata is the last section.
+      .SizeOfHeaders = 0x400,  // Address of where the section data starts.
+      .CheckSum = 0,
+      .Subsystem = IMAGE_SUBSYSTEM_WINDOWS_GUI,
+      .DllCharacteristics =
+          IMAGE_DLLCHARACTERISTICS_NX_COMPAT | IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA,
+      .SizeOfStackReserve = 0x100000,
+      .SizeOfStackCommit = 0x1000,
+      .SizeOfHeapReserve = 0x100000,
+      .SizeOfHeapCommit = 0x1000,
+      .LoaderFlags = 0,
+      .NumberOfRvaAndSizes = 0x10,
+      .DataDirectory =
+          {
+              {0, 0},
+              {0, 0},
+              {0, 0},
+              {exception_tables ? pdata_virtual_start : 0, (DWORD)pdata_length},
+              {0, 0},
+              {0, 0},
+              {rdata_virtual_start, sizeof(IMAGE_DEBUG_DIRECTORY)},
+              {0, 0},
+              {0, 0},
+              {0, 0},
+              {0, 0},
+              {0, 0},
+              {0, 0},
+              {0, 0},
+              {0, 0},
+              {0, 0},
+          },
+  };
+  fwrite(&opt_header, sizeof(opt_header), 1, f);
+
+  //
+  // .text header
+  //
+  IMAGE_SECTION_HEADER text = {
+      .Name = ".text\0\0",
+      .Misc = {.VirtualSize = (DWORD)ctx->image_size},
+      .VirtualAddress = code_start,
+      .SizeOfRawData = 0x200,     // This is the size of the block of .text in the dll.
+      .PointerToRawData = 0x400,  // Aligned address in file.
+      .PointerToRelocations = 0,
+      .PointerToLinenumbers = 0,
+      .NumberOfRelocations = 0,
+      .NumberOfLinenumbers = 0,
+      .Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ,
+  };
+  fwrite(&text, sizeof(text), 1, f);
+
+  //
+  // .rdata header
+  //
+  RsdsDataHeader rsds_header = {
+      .magic =
+          {
+              'R',
+              'S',
+              'D',
+              'S',
+          },
+      .age = 1,
+  };
+  memcpy(&rsds_header.unique_id, &ctx->unique_id, sizeof(UUID));
+  size_t name_len = strlen(ctx->output_pdb_name);
+  DWORD rsds_len = (DWORD)(sizeof(rsds_header) + name_len + 1);
+
+  IMAGE_SECTION_HEADER rdata = {
+      .Name = ".rdata\0",
+      .Misc = {.VirtualSize = (DWORD)(rsds_len + sizeof(IMAGE_DEBUG_DIRECTORY))},
+      .VirtualAddress = rdata_virtual_start,
+      .SizeOfRawData = 0x200,
+      .PointerToRawData = 0x600,
+      .PointerToRelocations = 0,
+      .PointerToLinenumbers = 0,
+      .NumberOfRelocations = 0,
+      .NumberOfLinenumbers = 0,
+      .Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+  };
+  fwrite(&rdata, sizeof(rdata), 1, f);
+
+  if (exception_tables) {
+    //
+    // .pdata header
+    //
+    IMAGE_SECTION_HEADER pdata = {
+        .Name = ".pdata\0",
+        .Misc = {.VirtualSize = (DWORD)pdata_length},
+        .VirtualAddress = pdata_virtual_start,
+        .SizeOfRawData = pdata_length_file_aligned,
+        .PointerToRawData = 0x800,  // Aligned address in file.
+        .PointerToRelocations = 0,
+        .PointerToLinenumbers = 0,
+        .NumberOfRelocations = 0,
+        .NumberOfLinenumbers = 0,
+        .Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+    };
+    fwrite(&pdata, sizeof(pdata), 1, f);
+
+    //
+    // .xdata header
+    //
+    IMAGE_SECTION_HEADER xdata = {
+        .Name = ".xdata\0",
+        .Misc = {.VirtualSize = (DWORD)xdata_length},
+        .VirtualAddress = xdata_virtual_start,
+        .SizeOfRawData = xdata_length_file_aligned,
+        .PointerToRawData = 0xa00,  // Aligned address in file.
+        .PointerToRelocations = 0,
+        .PointerToLinenumbers = 0,
+        .NumberOfRelocations = 0,
+        .NumberOfLinenumbers = 0,
+        .Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ,
+    };
+    fwrite(&xdata, sizeof(xdata), 1, f);
+  } else {
+    unsigned char zero = 0;
+    fwrite(&zero, 1, 1, f);
+  }
+
+  file_fill_to_next_page(f, 0);
+  assert(ftell(f) == 0x400);
+
+  //
+  // contents of .text
+  //
+
+  unsigned char int3 = 0xcc;
+  fwrite(&int3, sizeof(int3), 1, f);
+  file_fill_to_next_page(f, int3);
+  assert(ftell(f) == 0x600);
+
+  //
+  // contents of .rdata
+  //
+  long long rdata_file_start = ftell(f);
+
+  // Now the .rdata data which points to the pdb.
+  IMAGE_DEBUG_DIRECTORY debug_dir = {
+      .Characteristics = 0,
+      .TimeDateStamp = timedate,
+      .MajorVersion = 0,
+      .MinorVersion = 0,
+      .Type = IMAGE_DEBUG_TYPE_CODEVIEW,
+      .SizeOfData = rsds_len,
+      .AddressOfRawData = rdata_virtual_start + 0x1c,
+      .PointerToRawData = (DWORD)(rdata_file_start + (long)sizeof(IMAGE_DEBUG_DIRECTORY)),
+  };
+  fwrite(&debug_dir, sizeof(debug_dir), 1, f);
+  fwrite(&rsds_header, sizeof(rsds_header), 1, f);
+  fwrite(ctx->output_pdb_name, 1, name_len + 1, f);
+
+  file_fill_to_next_page(f, 0);
+  assert(ftell(f) == 0x800);
+
+  if (exception_tables) {
+    //
+    // contents of .pdata
+    //
+    for (size_t i = 0; i < exception_tables->num_pdata_entries; ++i) {
+      exception_tables->pdata[i].begin_address += code_start;         // Fixup to .text RVA.
+      exception_tables->pdata[i].end_address += code_start;           // Fixup to .text RVA.
+      exception_tables->pdata[i].unwind_data += xdata_virtual_start;  // Fixup to .xdata RVA.
+    }
+    fwrite(exception_tables->pdata, sizeof(DbpRUNTIME_FUNCTION),
+           exception_tables->num_pdata_entries, f);
+    file_fill_to_next_page(f, 0);
+
+    //
+    // contents of .xdata
+    //
+    fwrite(exception_tables->unwind_info, 1, exception_tables->unwind_info_byte_length, f);
+    file_fill_to_next_page(f, 0);
+  }
+
+  fclose(f);
+
+  return 1;
+}
+
+static int force_symbol_load(DbpContext* ctx, DbpExceptionTables* exception_tables) {
+  // Write stub dll with target address/size and fixed base address.
+  ENSURE(write_stub_dll(ctx, exception_tables), 1);
+
+  // Save current code block and then VirtualFree() it.
+  void* tmp = malloc(ctx->image_size);
+  memcpy(tmp, ctx->image_addr, ctx->image_size);
+  VirtualFree(ctx->base_addr, 0, MEM_RELEASE);
+
+  // There's a race here with other threads, but... I think that's the least of
+  // our problems.
+  ctx->dll_module = LoadLibraryEx(ctx->output_dll_name, NULL, DONT_RESOLVE_DLL_REFERENCES);
+
+  // Make DLL writable and slam jitted code back into same location.
+  DWORD old_protect;
+  ENSURE(VirtualProtect(ctx->image_addr, ctx->image_size, PAGE_READWRITE, &old_protect), 1);
+
+  memcpy(ctx->image_addr, tmp, ctx->image_size);
+  free(tmp);
+
+  ENSURE(VirtualProtect(ctx->image_addr, ctx->image_size, PAGE_EXECUTE_READ, &old_protect), 1);
+
+  return 1;
+}
+
+int dbp_ready_to_execute(DbpContext* ctx, DbpExceptionTables* exception_tables) {
+  if (!create_file_map(ctx))
+    return 0;
+
+  write_superblock(ctx);
+
+  // Stream 0: "Old MSF Directory", empty.
+  add_stream(ctx);
+
+  // Stream 1: PDB Info Stream.
+  StreamData* stream1 = add_stream(ctx);
+
+  // Stream 2: TPI Stream.
+  StreamData* stream2 = add_stream(ctx);
+  ENSURE(1, write_empty_tpi_ipi_stream(ctx, stream2));
+
+  // Stream 3: DBI Stream.
+  StreamData* stream3 = add_stream(ctx);
+
+  // Stream 4: IPI Stream.
+  StreamData* stream4 = add_stream(ctx);
+  ENSURE(write_empty_tpi_ipi_stream(ctx, stream4), 1);
+
+  // "/names": named, so stream index doesn't matter.
+  StreamData* names_stream = add_stream(ctx);
+  ENSURE(write_names_stream(ctx, names_stream), 1);
+
+  // Names must be written before module, because the line info refers to the
+  // source files names (by offset into /names).
+  ModuleData module_data = write_module_stream(ctx);
+
+  // And the module stream must be written before the GSI stream because the
+  // global procrefs contain the offset into the module data to locate the
+  // actual function symbol.
+  GsiData gsi_data = build_gsi_data(ctx);
+
+  // Section Headers; empty. Referred to by DBI in 'optional' dbg headers, and
+  // llvm-pdbutil wants it to exist, but handles an empty stream reasonably.
+  StreamData* section_headers = add_stream(ctx);
+
+  DbiWriteData dwd = {
+      .gsi_data = gsi_data,
+      .section_header_stream = section_headers->stream_index,
+      .module_sym_stream = module_data.stream->stream_index,
+      .module_symbols_byte_size = module_data.symbols_byte_size,
+      .module_c13_byte_size = module_data.c13_byte_size,
+      .num_source_files = 1,
+  };
+  ENSURE(write_dbi_stream(ctx, stream3, &dwd), 1);
+  ENSURE(write_pdb_info_stream(ctx, stream1, names_stream->stream_index), 1);
+
+  ENSURE(write_directory(ctx), 1);
+
+  ENSURE(FlushViewOfFile(ctx->data, ctx->file_size), 1);
+  ENSURE(UnmapViewOfFile(ctx->data), 1);
+  CloseHandle(ctx->file);
+
+  ENSURE(force_symbol_load(ctx, exception_tables), 1);
+
+  return 1;
+}
+
+void dbp_free(DbpContext* ctx) {
+  FreeLibrary(ctx->dll_module);
+
+  for (size_t i = 0; i < ctx->func_syms_len; ++i) {
+    free(ctx->func_syms[i]->name);
+    free(ctx->func_syms[i]->filename);
+    free(ctx->func_syms[i]->lines);
+    free(ctx->func_syms[i]);
+  }
+  free(ctx->func_syms);
+  free(ctx->output_pdb_name);
+  free(ctx->output_dll_name);
+
+  for (size_t i = 0; i < ctx->stream_data_len; ++i) {
+    free(ctx->stream_data[i]->blocks);
+    free(ctx->stream_data[i]);
+  }
+  free(ctx->stream_data);
+  free(ctx->compiler_version_string);
+
+  free(ctx->names_nmt->strings);
+  free(ctx->names_nmt->hash);
+  free(ctx->names_nmt);
+
+  free(ctx);
+}
+
+#endif
+//
+// END OF ../../src/dyn_basic_pdb.h
 //
 #if X64WIN
 #undef C
@@ -10001,40 +17615,41 @@ static void unregister_and_free_function_table_data(UserContext* ctx) {
 #pragma warning(pop)
 #endif
 
+
 //| .arch x64
 #if DASM_VERSION != 10500
 #error "Version mismatch between DynASM and included encoding engine"
 #endif
-#line 19 "../../src/codegen.in.c"
+#line 21 "../../src/codegen.in.c"
 //| .section code, pdata
 #define DASM_SECTION_CODE	0
 #define DASM_SECTION_PDATA	1
 #define DASM_MAXSECTION		2
-#line 20 "../../src/codegen.in.c"
+#line 22 "../../src/codegen.in.c"
 //| .actionlist dynasm_actions
-static const unsigned char dynasm_actions[1696] = {
-  80,255,64,88,240,42,255,72,131,252,236,8,252,242,15,17,4,36,255,252,242,64,
-  15,16,4,240,140,36,72,131,196,8,255,252,243,15,16,0,255,252,242,15,16,0,255,
-  219,40,255,15,182,0,255,15,190,0,255,15,183,0,255,15,191,0,255,72,99,0,255,
-  72,139,0,255,68,138,128,233,68,136,129,233,255,252,243,15,17,1,255,252,242,
-  15,17,1,255,219,57,255,136,1,255,102,137,1,255,72,137,1,255,72,139,133,233,
-  255,72,141,133,233,255,72,141,5,245,255,249,72,184,237,237,255,72,129,192,
-  239,255,15,87,201,15,46,193,255,102,15,87,201,102,15,46,193,255,217,252,238,
-  223,232,221,216,255,131,252,248,0,255,72,131,252,248,0,255,15,190,192,255,
-  15,182,192,255,15,191,192,255,15,183,192,255,252,243,15,42,192,255,72,99,
-  192,255,252,242,15,42,192,255,137,68,36,252,252,219,68,36,252,252,255,137,
-  192,252,243,72,15,42,192,255,137,192,255,137,192,252,242,72,15,42,192,255,
-  137,192,72,137,68,36,252,248,223,108,36,252,248,255,72,133,192,15,136,244,
-  247,102,15,252,239,192,252,242,72,15,42,192,252,233,244,248,248,1,72,137,
-  193,131,224,1,102,15,252,239,192,72,209,252,233,72,9,193,252,242,72,15,42,
-  193,252,242,15,88,192,248,2,255,72,137,68,36,252,248,223,108,36,252,248,72,
-  133,192,15,137,244,247,184,0,0,128,95,137,68,36,252,252,216,68,36,252,252,
-  248,1,255,252,243,15,44,192,15,190,192,255,252,243,15,44,192,15,182,192,255,
-  252,243,15,44,192,15,191,192,255,252,243,15,44,192,15,183,192,255,252,243,
-  15,44,192,255,252,243,72,15,44,192,255,252,243,15,90,192,255,252,243,15,17,
-  68,36,252,252,217,68,36,252,252,255,252,242,15,44,192,15,190,192,255,252,
-  242,15,44,192,15,182,192,255,252,242,15,44,192,15,191,192,255,252,242,15,
-  44,192,15,183,192,255,252,242,15,44,192,255,252,242,72,15,44,192,255,252,
+static const unsigned char dynasm_actions[1711] = {
+  249,255,80,255,64,88,240,42,255,72,131,252,236,8,252,242,15,17,4,36,255,252,
+  242,64,15,16,4,240,140,36,72,131,196,8,255,252,243,15,16,0,255,252,242,15,
+  16,0,255,219,40,255,15,182,0,255,15,190,0,255,15,183,0,255,15,191,0,255,72,
+  99,0,255,72,139,0,255,68,138,128,233,68,136,129,233,255,252,243,15,17,1,255,
+  252,242,15,17,1,255,219,57,255,136,1,255,102,137,1,255,72,137,1,255,72,139,
+  133,233,255,72,141,133,233,255,72,141,5,245,255,249,72,184,237,237,255,72,
+  129,192,239,255,15,87,201,15,46,193,255,102,15,87,201,102,15,46,193,255,217,
+  252,238,223,232,221,216,255,131,252,248,0,255,72,131,252,248,0,255,15,190,
+  192,255,15,182,192,255,15,191,192,255,15,183,192,255,252,243,15,42,192,255,
+  72,99,192,255,252,242,15,42,192,255,137,68,36,252,252,219,68,36,252,252,255,
+  137,192,252,243,72,15,42,192,255,137,192,255,137,192,252,242,72,15,42,192,
+  255,137,192,72,137,68,36,252,248,223,108,36,252,248,255,72,133,192,15,136,
+  244,247,102,15,252,239,192,252,242,72,15,42,192,252,233,244,248,248,1,72,
+  137,193,131,224,1,102,15,252,239,192,72,209,252,233,72,9,193,252,242,72,15,
+  42,193,252,242,15,88,192,248,2,255,72,137,68,36,252,248,223,108,36,252,248,
+  72,133,192,15,137,244,247,184,0,0,128,95,137,68,36,252,252,216,68,36,252,
+  252,248,1,255,252,243,15,44,192,15,190,192,255,252,243,15,44,192,15,182,192,
+  255,252,243,15,44,192,15,191,192,255,252,243,15,44,192,15,183,192,255,252,
+  243,15,44,192,255,252,243,72,15,44,192,255,252,243,15,90,192,255,252,243,
+  15,17,68,36,252,252,217,68,36,252,252,255,252,242,15,44,192,15,190,192,255,
+  252,242,15,44,192,15,182,192,255,252,242,15,44,192,15,191,192,255,252,242,
+  15,44,192,15,183,192,255,252,242,15,44,192,255,252,242,72,15,44,192,255,252,
   242,15,90,192,255,252,242,15,17,68,36,252,248,221,68,36,252,248,255,217,124,
   36,252,246,15,183,68,36,252,246,128,204,12,102,137,68,36,252,244,217,108,
   36,252,244,255,219,92,36,232,217,108,36,252,246,15,191,68,36,232,255,219,
@@ -10061,49 +17676,50 @@ static const unsigned char dynasm_actions[1696] = {
   199,192,1,0,0,0,72,193,224,31,102,72,15,110,200,15,87,193,255,72,199,192,
   1,0,0,0,72,193,224,63,102,72,15,110,200,102,15,87,193,255,217,224,255,72,
   252,247,216,255,72,193,224,235,255,72,193,232,235,255,72,193,252,248,235,
-  255,73,137,192,255,72,137,193,72,129,225,239,72,193,225,235,255,72,139,4,
-  36,255,73,199,193,237,76,33,200,72,9,200,255,76,137,192,255,87,255,72,199,
-  193,237,72,141,189,233,176,0,252,243,170,255,95,255,15,132,245,255,252,233,
-  245,249,255,15,148,208,72,15,182,192,255,72,252,247,208,255,15,132,245,72,
-  199,192,1,0,0,0,252,233,245,249,72,199,192,0,0,0,0,249,255,15,133,245,255,
-  15,133,245,72,199,192,0,0,0,0,252,233,245,249,72,199,192,1,0,0,0,249,255,
-  72,131,192,8,255,102,72,15,126,192,240,132,240,36,255,72,129,252,236,239,
-  73,137,194,65,252,255,210,72,129,196,239,255,65,91,255,72,137,133,233,72,
-  141,133,233,255,73,137,194,72,199,192,237,65,252,255,210,72,129,196,239,255,
-  252,240,15,176,17,255,102,252,240,15,177,17,255,252,240,72,15,177,17,255,
-  15,148,209,15,132,244,247,255,65,136,0,255,102,65,137,0,255,73,137,0,255,
-  248,1,15,182,193,255,134,1,255,102,135,1,255,72,135,1,255,252,243,15,88,193,
-  255,252,242,15,88,193,255,252,243,15,92,193,255,252,242,15,92,193,255,252,
-  243,15,89,193,255,252,242,15,89,193,255,252,243,15,94,193,255,252,242,15,
-  94,193,255,15,46,200,255,102,15,46,200,255,15,148,208,15,155,210,32,208,255,
-  15,149,208,15,154,210,8,208,255,15,151,208,255,15,147,208,255,36,1,72,15,
-  182,192,255,222,193,255,222,225,255,222,201,255,222,252,241,255,223,252,241,
-  221,216,255,15,148,208,255,15,149,208,255,72,1,200,255,72,41,200,255,72,15,
-  175,193,255,72,199,194,0,0,0,0,72,252,247,252,241,255,186,0,0,0,0,252,247,
-  252,241,255,72,153,255,72,252,247,252,249,255,72,137,208,255,72,33,200,255,
-  72,49,200,255,72,57,200,255,15,146,208,255,15,156,208,255,15,150,208,255,
-  15,158,208,255,72,137,201,255,72,211,224,255,72,211,232,255,72,211,252,248,
-  255,15,133,245,249,255,72,129,252,248,239,255,72,137,193,72,129,252,233,239,
-  72,129,252,249,239,255,137,193,129,252,233,239,129,252,249,239,255,15,134,
-  245,255,252,233,245,255,252,255,224,255,64,136,133,253,240,131,233,255,102,
-  64,137,133,253,240,139,233,255,72,137,133,253,240,131,233,255,254,0,85,72,
-  137,229,255,249,73,186,237,237,255,65,252,255,210,72,41,196,255,254,1,250,
-  3,249,235,255,235,235,255,235,236,255,235,235,235,235,255,72,137,165,233,
-  255,199,133,233,237,199,133,233,237,72,137,173,233,72,131,133,233,16,72,137,
-  173,233,72,129,133,233,239,255,72,137,189,233,72,137,181,233,72,137,149,233,
-  72,137,141,233,76,137,133,233,76,137,141,233,252,242,15,17,133,233,252,242,
-  15,17,141,233,252,242,15,17,149,233,252,242,15,17,157,233,252,242,15,17,165,
-  233,252,242,15,17,173,233,252,242,15,17,181,233,252,242,15,17,189,233,255,
-  72,137,141,233,72,137,149,233,76,137,133,233,76,137,141,233,255,72,141,101,
-  0,255,72,137,252,236,255,93,195,255
+  255,72,199,192,237,137,133,233,255,73,137,192,255,72,137,193,72,129,225,239,
+  72,193,225,235,255,72,139,4,36,255,73,199,193,237,76,33,200,72,9,200,255,
+  76,137,192,255,87,255,72,199,193,237,72,141,189,233,176,0,252,243,170,255,
+  95,255,15,132,245,255,252,233,245,249,255,15,148,208,72,15,182,192,255,72,
+  252,247,208,255,15,132,245,72,199,192,1,0,0,0,252,233,245,249,72,199,192,
+  0,0,0,0,249,255,15,133,245,255,15,133,245,72,199,192,0,0,0,0,252,233,245,
+  249,72,199,192,1,0,0,0,249,255,72,131,192,8,255,102,72,15,126,192,240,132,
+  240,36,255,72,129,252,236,239,73,137,194,65,252,255,210,72,129,196,239,255,
+  65,91,255,72,137,133,233,72,141,133,233,255,73,137,194,72,199,192,237,65,
+  252,255,210,72,129,196,239,255,252,240,15,176,17,255,102,252,240,15,177,17,
+  255,252,240,72,15,177,17,255,15,148,209,15,132,244,247,255,65,136,0,255,102,
+  65,137,0,255,73,137,0,255,248,1,15,182,193,255,134,1,255,102,135,1,255,72,
+  135,1,255,252,243,15,88,193,255,252,242,15,88,193,255,252,243,15,92,193,255,
+  252,242,15,92,193,255,252,243,15,89,193,255,252,242,15,89,193,255,252,243,
+  15,94,193,255,252,242,15,94,193,255,15,46,200,255,102,15,46,200,255,15,148,
+  208,15,155,210,32,208,255,15,149,208,15,154,210,8,208,255,15,151,208,255,
+  15,147,208,255,36,1,72,15,182,192,255,222,193,255,222,225,255,222,201,255,
+  222,252,241,255,223,252,241,221,216,255,15,148,208,255,15,149,208,255,72,
+  1,200,255,72,41,200,255,72,15,175,193,255,72,199,194,0,0,0,0,72,252,247,252,
+  241,255,186,0,0,0,0,252,247,252,241,255,72,153,255,72,252,247,252,249,255,
+  72,137,208,255,72,33,200,255,72,49,200,255,72,57,200,255,15,146,208,255,15,
+  156,208,255,15,150,208,255,15,158,208,255,72,137,201,255,72,211,224,255,72,
+  211,232,255,72,211,252,248,255,15,133,245,249,255,72,129,252,248,239,255,
+  72,137,193,72,129,252,233,239,72,129,252,249,239,255,137,193,129,252,233,
+  239,129,252,249,239,255,15,134,245,255,252,233,245,255,252,255,224,255,64,
+  136,133,253,240,131,233,255,102,64,137,133,253,240,139,233,255,72,137,133,
+  253,240,131,233,255,254,0,85,72,137,229,255,249,73,186,237,237,255,65,252,
+  255,210,72,41,196,255,254,1,250,3,249,235,255,235,235,255,235,236,255,235,
+  235,235,235,255,72,137,165,233,255,199,133,233,237,199,133,233,237,72,137,
+  173,233,72,131,133,233,16,72,137,173,233,72,129,133,233,239,255,72,137,189,
+  233,72,137,181,233,72,137,149,233,72,137,141,233,76,137,133,233,76,137,141,
+  233,252,242,15,17,133,233,252,242,15,17,141,233,252,242,15,17,149,233,252,
+  242,15,17,157,233,252,242,15,17,165,233,252,242,15,17,173,233,252,242,15,
+  17,181,233,252,242,15,17,189,233,255,72,137,141,233,72,137,149,233,76,137,
+  133,233,76,137,141,233,255,72,141,101,0,255,72,137,252,236,255,93,195,255,
+  250,3,249,254,0
 };
 
-#line 21 "../../src/codegen.in.c"
+#line 23 "../../src/codegen.in.c"
 //| .globals dynasm_globals
 enum {
   dynasm_globals_MAX
 };
-#line 22 "../../src/codegen.in.c"
+#line 24 "../../src/codegen.in.c"
 //| .if WIN
 //| .define X64WIN, 1
 //| .endif
@@ -10154,6 +17770,26 @@ static int dasmargreg[] = {REG_DI, REG_SI, REG_DX, REG_CX, REG_R8, REG_R9};
 static void gen_expr(Node* node);
 static void gen_stmt(Node* node);
 
+#if X64WIN
+static void record_line_syminfo(int file_no, int line_no, int pclabel) {
+  // If file and line haven't changed, then we're working through parts of a
+  // single statement; just ignore.
+  int cur_len = C(current_fn)->file_line_label_data.len;
+  if (cur_len > 0 && C(current_fn)->file_line_label_data.data[cur_len - 1].a == file_no &&
+      C(current_fn)->file_line_label_data.data[cur_len - 1].b == line_no) {
+    return;
+  }
+
+  //|=>pclabel:
+  dasm_put(Dst, 0, pclabel);
+#line 85 "../../src/codegen.in.c"
+  intintintarray_push(&C(current_fn)->file_line_label_data, (IntIntInt){file_no, line_no, pclabel},
+                      AL_Compile);
+  // printf("%s:%d:label %d\n", compiler_state.tokenize__all_tokenized_files.data[file_no]->name,
+  // line_no, pclabel);
+}
+#endif
+
 static int codegen_pclabel(void) {
   int ret = C(numlabels);
   dasm_growpc(&C(dynasm), ++C(numlabels));
@@ -10162,31 +17798,31 @@ static int codegen_pclabel(void) {
 
 static void push(void) {
   //| push rax
-  dasm_put(Dst, 0);
-#line 80 "../../src/codegen.in.c"
+  dasm_put(Dst, 2);
+#line 100 "../../src/codegen.in.c"
   C(depth)++;
 }
 
 static void pop(int dasmreg) {
   //| pop Rq(dasmreg)
-  dasm_put(Dst, 2, (dasmreg));
-#line 85 "../../src/codegen.in.c"
+  dasm_put(Dst, 4, (dasmreg));
+#line 105 "../../src/codegen.in.c"
   C(depth)--;
 }
 
 static void pushf(void) {
   //| sub rsp, 8
   //| movsd qword [rsp], xmm0
-  dasm_put(Dst, 7);
-#line 91 "../../src/codegen.in.c"
+  dasm_put(Dst, 9);
+#line 111 "../../src/codegen.in.c"
   C(depth)++;
 }
 
 static void popf(int reg) {
   //| movsd xmm(reg), qword [rsp]
   //| add rsp, 8
-  dasm_put(Dst, 19, (reg));
-#line 97 "../../src/codegen.in.c"
+  dasm_put(Dst, 21, (reg));
+#line 117 "../../src/codegen.in.c"
   C(depth)--;
 }
 
@@ -10207,19 +17843,19 @@ static void load(Type* ty) {
       return;
     case TY_FLOAT:
       //| movss xmm0, dword [rax]
-      dasm_put(Dst, 33);
-#line 117 "../../src/codegen.in.c"
+      dasm_put(Dst, 35);
+#line 137 "../../src/codegen.in.c"
       return;
     case TY_DOUBLE:
       //| movsd xmm0, qword [rax]
-      dasm_put(Dst, 39);
-#line 120 "../../src/codegen.in.c"
+      dasm_put(Dst, 41);
+#line 140 "../../src/codegen.in.c"
       return;
 #if !X64WIN
     case TY_LDOUBLE:
       //| fld tword [rax]
-      dasm_put(Dst, 45);
-#line 124 "../../src/codegen.in.c"
+      dasm_put(Dst, 47);
+#line 144 "../../src/codegen.in.c"
       return;
 #endif
   }
@@ -10232,31 +17868,31 @@ static void load(Type* ty) {
   if (ty->size == 1) {
     if (ty->is_unsigned) {
       //| movzx eax, byte [rax]
-      dasm_put(Dst, 48);
-#line 136 "../../src/codegen.in.c"
+      dasm_put(Dst, 50);
+#line 156 "../../src/codegen.in.c"
     } else {
       //| movsx eax, byte [rax]
-      dasm_put(Dst, 52);
-#line 138 "../../src/codegen.in.c"
+      dasm_put(Dst, 54);
+#line 158 "../../src/codegen.in.c"
     }
   } else if (ty->size == 2) {
     if (ty->is_unsigned) {
       //| movzx eax, word [rax]
-      dasm_put(Dst, 56);
-#line 142 "../../src/codegen.in.c"
+      dasm_put(Dst, 58);
+#line 162 "../../src/codegen.in.c"
     } else {
       //| movsx eax, word [rax]
-      dasm_put(Dst, 60);
-#line 144 "../../src/codegen.in.c"
+      dasm_put(Dst, 62);
+#line 164 "../../src/codegen.in.c"
     }
   } else if (ty->size == 4) {
     //| movsxd rax, dword [rax]
-    dasm_put(Dst, 64);
-#line 147 "../../src/codegen.in.c"
+    dasm_put(Dst, 66);
+#line 167 "../../src/codegen.in.c"
   } else {
     //| mov rax, qword [rax]
-    dasm_put(Dst, 68);
-#line 149 "../../src/codegen.in.c"
+    dasm_put(Dst, 70);
+#line 169 "../../src/codegen.in.c"
   }
 }
 
@@ -10270,45 +17906,45 @@ static void store(Type* ty) {
       for (int i = 0; i < ty->size; i++) {
         //| mov r8b, [rax+i]
         //| mov [RUTIL+i], r8b
-        dasm_put(Dst, 72, i, i);
-#line 162 "../../src/codegen.in.c"
+        dasm_put(Dst, 74, i, i);
+#line 182 "../../src/codegen.in.c"
       }
       return;
     case TY_FLOAT:
       //| movss dword [RUTIL], xmm0
-      dasm_put(Dst, 81);
-#line 166 "../../src/codegen.in.c"
+      dasm_put(Dst, 83);
+#line 186 "../../src/codegen.in.c"
       return;
     case TY_DOUBLE:
       //| movsd qword [RUTIL], xmm0
-      dasm_put(Dst, 87);
-#line 169 "../../src/codegen.in.c"
+      dasm_put(Dst, 89);
+#line 189 "../../src/codegen.in.c"
       return;
 #if !X64WIN
     case TY_LDOUBLE:
       //| fstp tword [RUTIL]
-      dasm_put(Dst, 93);
-#line 173 "../../src/codegen.in.c"
+      dasm_put(Dst, 95);
+#line 193 "../../src/codegen.in.c"
       return;
 #endif
   }
 
   if (ty->size == 1) {
     //| mov [RUTIL], al
-    dasm_put(Dst, 96);
-#line 179 "../../src/codegen.in.c"
+    dasm_put(Dst, 98);
+#line 199 "../../src/codegen.in.c"
   } else if (ty->size == 2) {
     //| mov [RUTIL], ax
-    dasm_put(Dst, 99);
-#line 181 "../../src/codegen.in.c"
+    dasm_put(Dst, 101);
+#line 201 "../../src/codegen.in.c"
   } else if (ty->size == 4) {
     //| mov [RUTIL], eax
-    dasm_put(Dst, 100);
-#line 183 "../../src/codegen.in.c"
+    dasm_put(Dst, 102);
+#line 203 "../../src/codegen.in.c"
   } else {
     //| mov [RUTIL], rax
-    dasm_put(Dst, 103);
-#line 185 "../../src/codegen.in.c"
+    dasm_put(Dst, 105);
+#line 205 "../../src/codegen.in.c"
   }
 }
 
@@ -10320,16 +17956,16 @@ static void gen_addr(Node* node) {
       // Variable-length array, which is always local.
       if (node->var->ty->kind == TY_VLA) {
         //| mov rax, [rbp+node->var->offset]
-        dasm_put(Dst, 107, node->var->offset);
-#line 196 "../../src/codegen.in.c"
+        dasm_put(Dst, 109, node->var->offset);
+#line 216 "../../src/codegen.in.c"
         return;
       }
 
       // Local variable
       if (node->var->is_local) {
         //| lea rax, [rbp+node->var->offset]
-        dasm_put(Dst, 112, node->var->offset);
-#line 202 "../../src/codegen.in.c"
+        dasm_put(Dst, 114, node->var->offset);
+#line 222 "../../src/codegen.in.c"
         return;
       }
 
@@ -10345,8 +17981,8 @@ static void gen_addr(Node* node) {
       if (node->ty->kind == TY_FUNC) {
         if (node->var->is_definition) {
           //| lea rax, [=>node->var->dasm_entry_label]
-          dasm_put(Dst, 117, node->var->dasm_entry_label);
-#line 217 "../../src/codegen.in.c"
+          dasm_put(Dst, 119, node->var->dasm_entry_label);
+#line 237 "../../src/codegen.in.c"
         } else {
           int fixup_location = codegen_pclabel();
           strintarray_push(&C(fixups), (StringInt){node->var->name, fixup_location}, AL_Compile);
@@ -10356,8 +17992,8 @@ static void gen_addr(Node* node) {
 #endif
           //|=>fixup_location:
           //| mov64 rax, 0xc0dec0dec0dec0de
-          dasm_put(Dst, 122, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
-#line 226 "../../src/codegen.in.c"
+          dasm_put(Dst, 124, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
+#line 246 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -10374,8 +18010,8 @@ static void gen_addr(Node* node) {
 #endif
       //|=>fixup_location:
       //| mov64 rax, 0xda7ada7ada7ada7a
-      dasm_put(Dst, 122, fixup_location, (unsigned int)(0xda7ada7ada7ada7a), (unsigned int)((0xda7ada7ada7ada7a)>>32));
-#line 242 "../../src/codegen.in.c"
+      dasm_put(Dst, 124, fixup_location, (unsigned int)(0xda7ada7ada7ada7a), (unsigned int)((0xda7ada7ada7ada7a)>>32));
+#line 262 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -10392,13 +18028,13 @@ static void gen_addr(Node* node) {
 #if X64WIN
       if (node->lhs->kind == ND_VAR && node->lhs->var->is_param_passed_by_reference) {
         //| mov rax, [rax]
-        dasm_put(Dst, 68);
-#line 258 "../../src/codegen.in.c"
+        dasm_put(Dst, 70);
+#line 278 "../../src/codegen.in.c"
       }
 #endif
       //| add rax, node->member->offset
-      dasm_put(Dst, 128, node->member->offset);
-#line 261 "../../src/codegen.in.c"
+      dasm_put(Dst, 130, node->member->offset);
+#line 281 "../../src/codegen.in.c"
       return;
     case ND_FUNCALL:
       if (node->ret_buffer) {
@@ -10415,8 +18051,8 @@ static void gen_addr(Node* node) {
       break;
     case ND_VLA_PTR:
       //| lea rax, [rbp+node->var->offset]
-      dasm_put(Dst, 112, node->var->offset);
-#line 277 "../../src/codegen.in.c"
+      dasm_put(Dst, 114, node->var->offset);
+#line 297 "../../src/codegen.in.c"
       return;
   }
 
@@ -10428,34 +18064,34 @@ static void cmp_zero(Type* ty) {
     case TY_FLOAT:
       //| xorps xmm1, xmm1
       //| ucomiss xmm0, xmm1
-      dasm_put(Dst, 133);
-#line 288 "../../src/codegen.in.c"
+      dasm_put(Dst, 135);
+#line 308 "../../src/codegen.in.c"
       return;
     case TY_DOUBLE:
       //| xorpd xmm1, xmm1
       //| ucomisd xmm0, xmm1
-      dasm_put(Dst, 140);
-#line 292 "../../src/codegen.in.c"
+      dasm_put(Dst, 142);
+#line 312 "../../src/codegen.in.c"
       return;
 #if !X64WIN
     case TY_LDOUBLE:
       //| fldz
       //| fucomip st0
       //| fstp st0
-      dasm_put(Dst, 149);
-#line 298 "../../src/codegen.in.c"
+      dasm_put(Dst, 151);
+#line 318 "../../src/codegen.in.c"
       return;
 #endif
   }
 
   if (is_integer(ty) && ty->size <= 4) {
     //| cmp eax, 0
-    dasm_put(Dst, 157);
-#line 304 "../../src/codegen.in.c"
+    dasm_put(Dst, 159);
+#line 324 "../../src/codegen.in.c"
   } else {
     //| cmp rax, 0
-    dasm_put(Dst, 162);
-#line 306 "../../src/codegen.in.c"
+    dasm_put(Dst, 164);
+#line 326 "../../src/codegen.in.c"
   }
 }
 
@@ -10485,92 +18121,92 @@ static int get_type_id(Type* ty) {
 
 static void i32i8(void) {
   //| movsx eax, al
-  dasm_put(Dst, 168);
-#line 335 "../../src/codegen.in.c"
+  dasm_put(Dst, 170);
+#line 355 "../../src/codegen.in.c"
 }
 static void i32u8(void) {
   //| movzx eax, al
-  dasm_put(Dst, 172);
-#line 338 "../../src/codegen.in.c"
+  dasm_put(Dst, 174);
+#line 358 "../../src/codegen.in.c"
 }
 static void i32i16(void) {
   //| movsx eax, ax
-  dasm_put(Dst, 176);
-#line 341 "../../src/codegen.in.c"
+  dasm_put(Dst, 178);
+#line 361 "../../src/codegen.in.c"
 }
 static void i32u16(void) {
   //| movzx eax, ax
-  dasm_put(Dst, 180);
-#line 344 "../../src/codegen.in.c"
+  dasm_put(Dst, 182);
+#line 364 "../../src/codegen.in.c"
 }
 static void i32f32(void) {
   //| cvtsi2ss xmm0, eax
-  dasm_put(Dst, 184);
-#line 347 "../../src/codegen.in.c"
+  dasm_put(Dst, 186);
+#line 367 "../../src/codegen.in.c"
 }
 static void i32i64(void) {
   //| movsxd rax, eax
-  dasm_put(Dst, 190);
-#line 350 "../../src/codegen.in.c"
+  dasm_put(Dst, 192);
+#line 370 "../../src/codegen.in.c"
 }
 static void i32f64(void) {
   //| cvtsi2sd xmm0, eax
-  dasm_put(Dst, 194);
-#line 353 "../../src/codegen.in.c"
+  dasm_put(Dst, 196);
+#line 373 "../../src/codegen.in.c"
 }
 static void i32f80(void) {
   //| mov [rsp-4], eax
   //| fild dword [rsp-4]
-  dasm_put(Dst, 200);
-#line 357 "../../src/codegen.in.c"
+  dasm_put(Dst, 202);
+#line 377 "../../src/codegen.in.c"
 }
 
 static void u32f32(void) {
   //| mov eax, eax
   //| cvtsi2ss xmm0, rax
-  dasm_put(Dst, 211);
-#line 362 "../../src/codegen.in.c"
+  dasm_put(Dst, 213);
+#line 382 "../../src/codegen.in.c"
 }
 static void u32i64(void) {
   //| mov eax, eax
-  dasm_put(Dst, 220);
-#line 365 "../../src/codegen.in.c"
+  dasm_put(Dst, 222);
+#line 385 "../../src/codegen.in.c"
 }
 static void u32f64(void) {
   //| mov eax, eax
   //| cvtsi2sd xmm0, rax
-  dasm_put(Dst, 223);
-#line 369 "../../src/codegen.in.c"
+  dasm_put(Dst, 225);
+#line 389 "../../src/codegen.in.c"
 }
 static void u32f80(void) {
   //| mov eax, eax
   //| mov [rsp-8], rax
   //| fild qword [rsp-8]
-  dasm_put(Dst, 232);
-#line 374 "../../src/codegen.in.c"
+  dasm_put(Dst, 234);
+#line 394 "../../src/codegen.in.c"
 }
 
 static void i64f32(void) {
   //| cvtsi2ss xmm0, rax
-  dasm_put(Dst, 213);
-#line 378 "../../src/codegen.in.c"
+  dasm_put(Dst, 215);
+#line 398 "../../src/codegen.in.c"
 }
 static void i64f64(void) {
   //| cvtsi2sd xmm0, rax
-  dasm_put(Dst, 225);
-#line 381 "../../src/codegen.in.c"
+  dasm_put(Dst, 227);
+#line 401 "../../src/codegen.in.c"
 }
 static void i64f80(void) {
   //| mov [rsp-8], rax
   //| fild qword [rsp-8]
-  dasm_put(Dst, 234);
-#line 385 "../../src/codegen.in.c"
+  dasm_put(Dst, 236);
+#line 405 "../../src/codegen.in.c"
 }
 
 static void u64f32(void) {
   //| cvtsi2ss xmm0, rax
-  dasm_put(Dst, 213);
-#line 389 "../../src/codegen.in.c"
+  dasm_put(Dst, 215);
+#line 409 "../../src/codegen.in.c"
 }
 static void u64f64(void) {
   //| test rax,rax
@@ -10587,8 +18223,8 @@ static void u64f64(void) {
   //| cvtsi2sd xmm0,RUTIL
   //| addsd xmm0,xmm0
   //|2:
-  dasm_put(Dst, 246);
-#line 405 "../../src/codegen.in.c"
+  dasm_put(Dst, 248);
+#line 425 "../../src/codegen.in.c"
 }
 static void u64f80(void) {
   //| mov [rsp-8], rax
@@ -10599,120 +18235,120 @@ static void u64f80(void) {
   //| mov [rsp-4], eax
   //| fadd dword [rsp-4]
   //|1:
-  dasm_put(Dst, 302);
-#line 415 "../../src/codegen.in.c"
+  dasm_put(Dst, 304);
+#line 435 "../../src/codegen.in.c"
 }
 
 static void f32i8(void) {
   //| cvttss2si eax, xmm0
   //| movsx eax, al
-  dasm_put(Dst, 338);
-#line 420 "../../src/codegen.in.c"
+  dasm_put(Dst, 340);
+#line 440 "../../src/codegen.in.c"
 }
 static void f32u8(void) {
   //| cvttss2si eax, xmm0
   //| movzx eax, al
-  dasm_put(Dst, 347);
-#line 424 "../../src/codegen.in.c"
+  dasm_put(Dst, 349);
+#line 444 "../../src/codegen.in.c"
 }
 static void f32i16(void) {
   //| cvttss2si eax, xmm0
   //| movsx eax, ax
-  dasm_put(Dst, 356);
-#line 428 "../../src/codegen.in.c"
+  dasm_put(Dst, 358);
+#line 448 "../../src/codegen.in.c"
 }
 static void f32u16(void) {
   //| cvttss2si eax, xmm0
   //| movzx eax, ax
-  dasm_put(Dst, 365);
-#line 432 "../../src/codegen.in.c"
+  dasm_put(Dst, 367);
+#line 452 "../../src/codegen.in.c"
 }
 static void f32i32(void) {
   //| cvttss2si eax, xmm0
-  dasm_put(Dst, 374);
-#line 435 "../../src/codegen.in.c"
+  dasm_put(Dst, 376);
+#line 455 "../../src/codegen.in.c"
 }
 static void f32u32(void) {
   //| cvttss2si rax, xmm0
-  dasm_put(Dst, 380);
-#line 438 "../../src/codegen.in.c"
+  dasm_put(Dst, 382);
+#line 458 "../../src/codegen.in.c"
 }
 static void f32i64(void) {
   //| cvttss2si rax, xmm0
-  dasm_put(Dst, 380);
-#line 441 "../../src/codegen.in.c"
+  dasm_put(Dst, 382);
+#line 461 "../../src/codegen.in.c"
 }
 static void f32u64(void) {
   //| cvttss2si rax, xmm0
-  dasm_put(Dst, 380);
-#line 444 "../../src/codegen.in.c"
+  dasm_put(Dst, 382);
+#line 464 "../../src/codegen.in.c"
 }
 static void f32f64(void) {
   //| cvtss2sd xmm0, xmm0
-  dasm_put(Dst, 387);
-#line 447 "../../src/codegen.in.c"
+  dasm_put(Dst, 389);
+#line 467 "../../src/codegen.in.c"
 }
 static void f32f80(void) {
   //| movss dword [rsp-4], xmm0
   //| fld dword [rsp-4]
-  dasm_put(Dst, 393);
-#line 451 "../../src/codegen.in.c"
+  dasm_put(Dst, 395);
+#line 471 "../../src/codegen.in.c"
 }
 
 static void f64i8(void) {
   //| cvttsd2si eax, xmm0
   //| movsx eax, al
-  dasm_put(Dst, 407);
-#line 456 "../../src/codegen.in.c"
+  dasm_put(Dst, 409);
+#line 476 "../../src/codegen.in.c"
 }
 static void f64u8(void) {
   //| cvttsd2si eax, xmm0
   //| movzx eax, al
-  dasm_put(Dst, 416);
-#line 460 "../../src/codegen.in.c"
+  dasm_put(Dst, 418);
+#line 480 "../../src/codegen.in.c"
 }
 static void f64i16(void) {
   //| cvttsd2si eax, xmm0
   //| movsx eax, ax
-  dasm_put(Dst, 425);
-#line 464 "../../src/codegen.in.c"
+  dasm_put(Dst, 427);
+#line 484 "../../src/codegen.in.c"
 }
 static void f64u16(void) {
   //| cvttsd2si eax, xmm0
   //| movzx eax, ax
-  dasm_put(Dst, 434);
-#line 468 "../../src/codegen.in.c"
+  dasm_put(Dst, 436);
+#line 488 "../../src/codegen.in.c"
 }
 static void f64i32(void) {
   //| cvttsd2si eax, xmm0
-  dasm_put(Dst, 443);
-#line 471 "../../src/codegen.in.c"
+  dasm_put(Dst, 445);
+#line 491 "../../src/codegen.in.c"
 }
 static void f64u32(void) {
   //| cvttsd2si rax, xmm0
-  dasm_put(Dst, 449);
-#line 474 "../../src/codegen.in.c"
+  dasm_put(Dst, 451);
+#line 494 "../../src/codegen.in.c"
 }
 static void f64i64(void) {
   //| cvttsd2si rax, xmm0
-  dasm_put(Dst, 449);
-#line 477 "../../src/codegen.in.c"
+  dasm_put(Dst, 451);
+#line 497 "../../src/codegen.in.c"
 }
 static void f64u64(void) {
   //| cvttsd2si rax, xmm0
-  dasm_put(Dst, 449);
-#line 480 "../../src/codegen.in.c"
+  dasm_put(Dst, 451);
+#line 500 "../../src/codegen.in.c"
 }
 static void f64f32(void) {
   //| cvtsd2ss xmm0, xmm0
-  dasm_put(Dst, 456);
-#line 483 "../../src/codegen.in.c"
+  dasm_put(Dst, 458);
+#line 503 "../../src/codegen.in.c"
 }
 static void f64f80(void) {
   //| movsd qword [rsp-8], xmm0
   //| fld qword [rsp-8]
-  dasm_put(Dst, 462);
-#line 487 "../../src/codegen.in.c"
+  dasm_put(Dst, 464);
+#line 507 "../../src/codegen.in.c"
 }
 
 static void from_f80_1(void) {
@@ -10721,8 +18357,8 @@ static void from_f80_1(void) {
   //| or ah, 12
   //| mov [rsp-12], ax
   //| fldcw word [rsp-12]
-  dasm_put(Dst, 476);
-#line 495 "../../src/codegen.in.c"
+  dasm_put(Dst, 478);
+#line 515 "../../src/codegen.in.c"
 }
 
 #define FROM_F80_2 " [rsp-24]\n fldcw [rsp-10]\n "
@@ -10732,8 +18368,8 @@ static void f80i8(void) {
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| movsx eax, word [rsp-24]
-  dasm_put(Dst, 502);
-#line 504 "../../src/codegen.in.c"
+  dasm_put(Dst, 504);
+#line 524 "../../src/codegen.in.c"
 }
 static void f80u8(void) {
   from_f80_1();
@@ -10741,68 +18377,68 @@ static void f80u8(void) {
   //| fldcw word [rsp-10]
   //| movzx eax, word [rsp-24]
   //| and eax, 0xff
-  dasm_put(Dst, 517);
-#line 511 "../../src/codegen.in.c"
+  dasm_put(Dst, 519);
+#line 531 "../../src/codegen.in.c"
 }
 static void f80i16(void) {
   from_f80_1();
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| movsx eax, word [rsp-24]
-  dasm_put(Dst, 502);
-#line 517 "../../src/codegen.in.c"
+  dasm_put(Dst, 504);
+#line 537 "../../src/codegen.in.c"
 }
 static void f80u16(void) {
   from_f80_1();
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| movzx eax, word [rsp-24]
-  dasm_put(Dst, 538);
-#line 523 "../../src/codegen.in.c"
+  dasm_put(Dst, 540);
+#line 543 "../../src/codegen.in.c"
 }
 static void f80i32(void) {
   from_f80_1();
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| mov eax, [rsp-24]
-  dasm_put(Dst, 553);
-#line 529 "../../src/codegen.in.c"
+  dasm_put(Dst, 555);
+#line 549 "../../src/codegen.in.c"
 }
 static void f80u32(void) {
   from_f80_1();
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| mov eax, [rsp-24]
-  dasm_put(Dst, 553);
-#line 535 "../../src/codegen.in.c"
+  dasm_put(Dst, 555);
+#line 555 "../../src/codegen.in.c"
 }
 static void f80i64(void) {
   from_f80_1();
   //| fistp qword [rsp-24]
   //| fldcw word [rsp-10]
   //| mov rax, [rsp-24]
-  dasm_put(Dst, 567);
-#line 541 "../../src/codegen.in.c"
+  dasm_put(Dst, 569);
+#line 561 "../../src/codegen.in.c"
 }
 static void f80u64(void) {
   from_f80_1();
   //| fistp qword [rsp-24]
   //| fldcw word [rsp-10]
   //| mov rax, [rsp-24]
-  dasm_put(Dst, 567);
-#line 547 "../../src/codegen.in.c"
+  dasm_put(Dst, 569);
+#line 567 "../../src/codegen.in.c"
 }
 static void f80f32(void) {
   //| fstp dword [rsp-8]
   //| movss xmm0, dword [rsp-8]
-  dasm_put(Dst, 582);
-#line 551 "../../src/codegen.in.c"
+  dasm_put(Dst, 584);
+#line 571 "../../src/codegen.in.c"
 }
 static void f80f64(void) {
   //| fstp qword [rsp-8]
   //| movsd xmm0, qword [rsp-8]
-  dasm_put(Dst, 596);
-#line 555 "../../src/codegen.in.c"
+  dasm_put(Dst, 598);
+#line 575 "../../src/codegen.in.c"
 }
 
 typedef void (*DynasmCastFunc)(void);
@@ -10839,8 +18475,8 @@ static void cg_cast(Type* from, Type* to) {
     cmp_zero(from);
     //| setne al
     //| movzx eax, al
-    dasm_put(Dst, 610);
-#line 591 "../../src/codegen.in.c"
+    dasm_put(Dst, 612);
+#line 611 "../../src/codegen.in.c"
     return;
   }
 
@@ -10896,15 +18532,15 @@ static bool has_flonum2(Type* ty) {
 static int push_struct(Type* ty) {
   int sz = (int)align_to_s(ty->size, 8);
   //| sub rsp, sz
-  dasm_put(Dst, 617, sz);
-#line 646 "../../src/codegen.in.c"
+  dasm_put(Dst, 619, sz);
+#line 666 "../../src/codegen.in.c"
   C(depth) += sz / 8;
 
   for (int i = 0; i < ty->size; i++) {
     //| mov r10b, [rax+i]
     //| mov [rsp+i], r10b
-    dasm_put(Dst, 623, i, i);
-#line 651 "../../src/codegen.in.c"
+    dasm_put(Dst, 625, i, i);
+#line 671 "../../src/codegen.in.c"
   }
 
   return sz;
@@ -10948,12 +18584,12 @@ static void push_args2_win(Node* args, bool first_pass) {
       if (!type_passed_in_register(args->ty)) {
         assert(args->pass_by_reference);
         //| lea rax, [r11-args->pass_by_reference]
-        dasm_put(Dst, 634, -args->pass_by_reference);
-#line 694 "../../src/codegen.in.c"
+        dasm_put(Dst, 636, -args->pass_by_reference);
+#line 714 "../../src/codegen.in.c"
       } else {
         //| mov rax, [rax]
-        dasm_put(Dst, 68);
-#line 696 "../../src/codegen.in.c"
+        dasm_put(Dst, 70);
+#line 716 "../../src/codegen.in.c"
       }
       push();
       break;
@@ -11029,8 +18665,8 @@ static int push_args_win(Node* node, int* by_ref_copies_size) {
     // Use r11 as a base pointer for by-reference copies of structs.
     //| push r11
     //| mov r11, rsp
-    dasm_put(Dst, 639);
-#line 771 "../../src/codegen.in.c"
+    dasm_put(Dst, 641);
+#line 791 "../../src/codegen.in.c"
   }
 
   // If the return type is a large struct/union, the caller passes
@@ -11080,8 +18716,8 @@ static int push_args_win(Node* node, int* by_ref_copies_size) {
 
   if ((C(depth) + stack + (*by_ref_copies_size / 8)) % 2 == 1) {
     //| sub rsp, 8
-    dasm_put(Dst, 645);
-#line 820 "../../src/codegen.in.c"
+    dasm_put(Dst, 647);
+#line 840 "../../src/codegen.in.c"
     C(depth)++;
     stack++;
   }
@@ -11093,8 +18729,8 @@ static int push_args_win(Node* node, int* by_ref_copies_size) {
   // a pointer to a buffer as if it were the first argument.
   if (node->ret_buffer && !type_passed_in_register(node->ty)) {
     //| lea rax, [rbp+node->ret_buffer->offset]
-    dasm_put(Dst, 112, node->ret_buffer->offset);
-#line 831 "../../src/codegen.in.c"
+    dasm_put(Dst, 114, node->ret_buffer->offset);
+#line 851 "../../src/codegen.in.c"
     push();
   }
 
@@ -11127,8 +18763,8 @@ static void push_args2_sysv(Node* args, bool first_pass) {
     case TY_LDOUBLE:
       //| sub rsp, 16
       //| fstp tword [rsp]
-      dasm_put(Dst, 651);
-#line 863 "../../src/codegen.in.c"
+      dasm_put(Dst, 653);
+#line 883 "../../src/codegen.in.c"
       C(depth) += 2;
       break;
     default:
@@ -11212,8 +18848,8 @@ static int push_args_sysv(Node* node) {
 
   if ((C(depth) + stack) % 2 == 1) {
     //| sub rsp, 8
-    dasm_put(Dst, 645);
-#line 946 "../../src/codegen.in.c"
+    dasm_put(Dst, 647);
+#line 966 "../../src/codegen.in.c"
     C(depth)++;
     stack++;
   }
@@ -11225,8 +18861,8 @@ static int push_args_sysv(Node* node) {
   // a pointer to a buffer as if it were the first argument.
   if (node->ret_buffer && node->ty->size > 16) {
     //| lea rax, [rbp+node->ret_buffer->offset]
-    dasm_put(Dst, 112, node->ret_buffer->offset);
-#line 957 "../../src/codegen.in.c"
+    dasm_put(Dst, 114, node->ret_buffer->offset);
+#line 977 "../../src/codegen.in.c"
     push();
   }
 
@@ -11241,20 +18877,20 @@ static void copy_ret_buffer(Obj* var) {
     assert(ty->size == 4 || 8 <= ty->size);
     if (ty->size == 4) {
       //| movss dword [rbp+var->offset], xmm0
-      dasm_put(Dst, 660, var->offset);
-#line 971 "../../src/codegen.in.c"
+      dasm_put(Dst, 662, var->offset);
+#line 991 "../../src/codegen.in.c"
     } else {
       //| movsd qword [rbp+var->offset], xmm0
-      dasm_put(Dst, 667, var->offset);
-#line 973 "../../src/codegen.in.c"
+      dasm_put(Dst, 669, var->offset);
+#line 993 "../../src/codegen.in.c"
     }
     fp++;
   } else {
     for (int i = 0; i < MIN(8, ty->size); i++) {
       //| mov [rbp+var->offset+i], al
       //| shr rax, 8
-      dasm_put(Dst, 674, var->offset+i);
-#line 979 "../../src/codegen.in.c"
+      dasm_put(Dst, 676, var->offset+i);
+#line 999 "../../src/codegen.in.c"
     }
     gp++;
   }
@@ -11264,19 +18900,19 @@ static void copy_ret_buffer(Obj* var) {
       assert(ty->size == 12 || ty->size == 16);
       if (ty->size == 12) {
         //| movss dword [rbp+var->offset+8], xmm(fp)
-        dasm_put(Dst, 682, (fp), var->offset+8);
-#line 988 "../../src/codegen.in.c"
+        dasm_put(Dst, 684, (fp), var->offset+8);
+#line 1008 "../../src/codegen.in.c"
       } else {
         //| movsd qword [rbp+var->offset+8], xmm(fp)
-        dasm_put(Dst, 693, (fp), var->offset+8);
-#line 990 "../../src/codegen.in.c"
+        dasm_put(Dst, 695, (fp), var->offset+8);
+#line 1010 "../../src/codegen.in.c"
       }
     } else {
       for (int i = 8; i < MIN(16, ty->size); i++) {
         //| mov [rbp+var->offset+i], Rb(gp)
         //| shr Rq(gp), 8
-        dasm_put(Dst, 704, (gp), var->offset+i, (gp));
-#line 995 "../../src/codegen.in.c"
+        dasm_put(Dst, 706, (gp), var->offset+i, (gp));
+#line 1015 "../../src/codegen.in.c"
       }
     }
   }
@@ -11288,38 +18924,38 @@ static void copy_struct_reg(void) {
 #if X64WIN
   // TODO: I'm not sure if this is right/sufficient.
   //| mov rax, [rax]
-  dasm_put(Dst, 68);
-#line 1006 "../../src/codegen.in.c"
+  dasm_put(Dst, 70);
+#line 1026 "../../src/codegen.in.c"
 #else
   Type* ty = C(current_fn)->ty->return_ty;
 
   int gp = 0, fp = 0;
 
   //| mov RUTIL, rax
-  dasm_put(Dst, 718);
-#line 1012 "../../src/codegen.in.c"
+  dasm_put(Dst, 720);
+#line 1032 "../../src/codegen.in.c"
 
   if (has_flonum(ty, 0, 8, 0)) {
     assert(ty->size == 4 || 8 <= ty->size);
     if (ty->size == 4) {
       //| movss xmm0, dword [RUTIL]
-      dasm_put(Dst, 722);
-#line 1017 "../../src/codegen.in.c"
+      dasm_put(Dst, 724);
+#line 1037 "../../src/codegen.in.c"
     } else {
       //| movsd xmm0, qword [RUTIL]
-      dasm_put(Dst, 728);
-#line 1019 "../../src/codegen.in.c"
+      dasm_put(Dst, 730);
+#line 1039 "../../src/codegen.in.c"
     }
     fp++;
   } else {
     //| mov rax, 0
-    dasm_put(Dst, 734);
-#line 1023 "../../src/codegen.in.c"
+    dasm_put(Dst, 736);
+#line 1043 "../../src/codegen.in.c"
     for (int i = MIN(8, ty->size) - 1; i >= 0; i--) {
       //| shl rax, 8
       //| mov ax, [RUTIL+i]
-      dasm_put(Dst, 742, i);
-#line 1026 "../../src/codegen.in.c"
+      dasm_put(Dst, 744, i);
+#line 1046 "../../src/codegen.in.c"
     }
     gp++;
   }
@@ -11329,22 +18965,22 @@ static void copy_struct_reg(void) {
       assert(ty->size == 12 || ty->size == 16);
       if (ty->size == 4) {
         //| movss xmm(fp), dword [RUTIL+8]
-        dasm_put(Dst, 751, (fp));
-#line 1035 "../../src/codegen.in.c"
+        dasm_put(Dst, 753, (fp));
+#line 1055 "../../src/codegen.in.c"
       } else {
         //| movsd xmm(fp), qword [RUTIL+8]
-        dasm_put(Dst, 761, (fp));
-#line 1037 "../../src/codegen.in.c"
+        dasm_put(Dst, 763, (fp));
+#line 1057 "../../src/codegen.in.c"
       }
     } else {
       //| mov Rq(gp), 0
-      dasm_put(Dst, 771, (gp));
-#line 1040 "../../src/codegen.in.c"
+      dasm_put(Dst, 773, (gp));
+#line 1060 "../../src/codegen.in.c"
       for (int i = MIN(16, ty->size) - 1; i >= 8; i--) {
         //| shl Rq(gp), 8
         //| mov Rb(gp), [RUTIL+i]
-        dasm_put(Dst, 781, (gp), (gp), i);
-#line 1043 "../../src/codegen.in.c"
+        dasm_put(Dst, 783, (gp), (gp), i);
+#line 1063 "../../src/codegen.in.c"
       }
     }
   }
@@ -11356,14 +18992,14 @@ static void copy_struct_mem(void) {
   Obj* var = C(current_fn)->params;
 
   //| mov RUTIL, [rbp+var->offset]
-  dasm_put(Dst, 795, var->offset);
-#line 1054 "../../src/codegen.in.c"
+  dasm_put(Dst, 797, var->offset);
+#line 1074 "../../src/codegen.in.c"
 
   for (int i = 0; i < ty->size; i++) {
     //| mov dl, [rax+i]
     //| mov [RUTIL+i], dl
-    dasm_put(Dst, 800, i, i);
-#line 1058 "../../src/codegen.in.c"
+    dasm_put(Dst, 802, i, i);
+#line 1078 "../../src/codegen.in.c"
   }
 }
 
@@ -11371,8 +19007,8 @@ static void builtin_alloca(void) {
   // Align size to 16 bytes.
   //| add CARG1, 15
   //| and CARG1d, 0xfffffff0
-  dasm_put(Dst, 807);
-#line 1065 "../../src/codegen.in.c"
+  dasm_put(Dst, 809);
+#line 1085 "../../src/codegen.in.c"
 
   // Shift the temporary area by CARG1.
   //| mov CARG4, [rbp+C(current_fn)->alloca_bottom->offset]
@@ -11390,15 +19026,15 @@ static void builtin_alloca(void) {
   //| dec CARG4
   //| jmp <1
   //|2:
-  dasm_put(Dst, 816, C(current_fn)->alloca_bottom->offset);
-#line 1082 "../../src/codegen.in.c"
+  dasm_put(Dst, 818, C(current_fn)->alloca_bottom->offset);
+#line 1102 "../../src/codegen.in.c"
 
   // Move alloca_bottom pointer.
   //| mov rax, [rbp+C(current_fn)->alloca_bottom->offset]
   //| sub rax, CARG1
   //| mov [rbp+C(current_fn)->alloca_bottom->offset], rax
-  dasm_put(Dst, 868, C(current_fn)->alloca_bottom->offset, C(current_fn)->alloca_bottom->offset);
-#line 1087 "../../src/codegen.in.c"
+  dasm_put(Dst, 870, C(current_fn)->alloca_bottom->offset, C(current_fn)->alloca_bottom->offset);
+#line 1107 "../../src/codegen.in.c"
 }
 
 // Generate code for a given node.
@@ -11415,8 +19051,8 @@ static void gen_expr(Node* node) {
           } u = {(float)node->fval};
           //| mov eax, u.u32
           //| movd xmm0, rax
-          dasm_put(Dst, 880, u.u32);
-#line 1103 "../../src/codegen.in.c"
+          dasm_put(Dst, 882, u.u32);
+#line 1123 "../../src/codegen.in.c"
           return;
         }
         case TY_DOUBLE: {
@@ -11426,8 +19062,8 @@ static void gen_expr(Node* node) {
           } u = {(double)node->fval};
           //| mov64 rax, u.u64
           //| movd xmm0, rax
-          dasm_put(Dst, 888, (unsigned int)(u.u64), (unsigned int)((u.u64)>>32));
-#line 1112 "../../src/codegen.in.c"
+          dasm_put(Dst, 890, (unsigned int)(u.u64), (unsigned int)((u.u64)>>32));
+#line 1132 "../../src/codegen.in.c"
           return;
         }
 #if !X64WIN
@@ -11443,8 +19079,8 @@ static void gen_expr(Node* node) {
           //| mov64 rax, u.u64[1]
           //| mov [rsp-8], rax
           //| fld tword [rsp-16]
-          dasm_put(Dst, 898, (unsigned int)(u.u64[0]), (unsigned int)((u.u64[0])>>32), (unsigned int)(u.u64[1]), (unsigned int)((u.u64[1])>>32));
-#line 1127 "../../src/codegen.in.c"
+          dasm_put(Dst, 900, (unsigned int)(u.u64[0]), (unsigned int)((u.u64[0])>>32), (unsigned int)(u.u64[1]), (unsigned int)((u.u64[1])>>32));
+#line 1147 "../../src/codegen.in.c"
           return;
         }
 #endif
@@ -11452,12 +19088,12 @@ static void gen_expr(Node* node) {
 
       if (node->val < INT_MIN || node->val > INT_MAX) {
         //| mov64 rax, node->val
-        dasm_put(Dst, 123, (unsigned int)(node->val), (unsigned int)((node->val)>>32));
-#line 1134 "../../src/codegen.in.c"
+        dasm_put(Dst, 125, (unsigned int)(node->val), (unsigned int)((node->val)>>32));
+#line 1154 "../../src/codegen.in.c"
       } else {
         //| mov rax, node->val
-        dasm_put(Dst, 924, node->val);
-#line 1136 "../../src/codegen.in.c"
+        dasm_put(Dst, 926, node->val);
+#line 1156 "../../src/codegen.in.c"
       }
       return;
     }
@@ -11470,29 +19106,29 @@ static void gen_expr(Node* node) {
           //| shl rax, 31
           //| movd xmm1, rax
           //| xorps xmm0, xmm1
-          dasm_put(Dst, 929);
-#line 1148 "../../src/codegen.in.c"
+          dasm_put(Dst, 931);
+#line 1168 "../../src/codegen.in.c"
           return;
         case TY_DOUBLE:
           //| mov rax, 1
           //| shl rax, 63
           //| movd xmm1, rax
           //| xorpd xmm0, xmm1
-          dasm_put(Dst, 949);
-#line 1154 "../../src/codegen.in.c"
+          dasm_put(Dst, 951);
+#line 1174 "../../src/codegen.in.c"
           return;
 #if !X64WIN
         case TY_LDOUBLE:
           //| fchs
-          dasm_put(Dst, 970);
-#line 1158 "../../src/codegen.in.c"
+          dasm_put(Dst, 972);
+#line 1178 "../../src/codegen.in.c"
           return;
 #endif
       }
 
       //| neg rax
-      dasm_put(Dst, 973);
-#line 1163 "../../src/codegen.in.c"
+      dasm_put(Dst, 975);
+#line 1183 "../../src/codegen.in.c"
       return;
     case ND_VAR:
       gen_addr(node);
@@ -11505,16 +19141,16 @@ static void gen_expr(Node* node) {
       Member* mem = node->member;
       if (mem->is_bitfield) {
         //| shl rax, 64 - mem->bit_width - mem->bit_offset
-        dasm_put(Dst, 978, 64 - mem->bit_width - mem->bit_offset);
-#line 1175 "../../src/codegen.in.c"
+        dasm_put(Dst, 980, 64 - mem->bit_width - mem->bit_offset);
+#line 1195 "../../src/codegen.in.c"
         if (mem->ty->is_unsigned) {
           //| shr rax, 64 - mem->bit_width
-          dasm_put(Dst, 983, 64 - mem->bit_width);
-#line 1177 "../../src/codegen.in.c"
+          dasm_put(Dst, 985, 64 - mem->bit_width);
+#line 1197 "../../src/codegen.in.c"
         } else {
           //| sar rax, 64 - mem->bit_width
-          dasm_put(Dst, 988, 64 - mem->bit_width);
-#line 1179 "../../src/codegen.in.c"
+          dasm_put(Dst, 990, 64 - mem->bit_width);
+#line 1199 "../../src/codegen.in.c"
         }
       }
       return;
@@ -11527,43 +19163,59 @@ static void gen_expr(Node* node) {
       gen_addr(node->lhs);
       return;
     case ND_ASSIGN:
-      gen_addr(node->lhs);
-      push();
-      gen_expr(node->rhs);
+      // Special case "int into a local". Normally this would compile to:
+      //   lea rax,[rbp+node->lhs->offset]
+      //   push rax
+      //   mov rax, node->rhs->val
+      //   pop rcx
+      //   mov [rcx], eax
+      if (node->lhs->kind == ND_VAR && node->lhs->var->is_local && node->rhs->kind == ND_NUM &&
+          node->rhs->ty->kind != TY_FLOAT && node->rhs->ty->kind != TY_DOUBLE &&
+          node->rhs->ty->kind != TY_LDOUBLE && node->rhs->val >= INT_MIN &&
+          node->rhs->val <= INT_MAX) {
+        //| mov rax, node->rhs->val
+        //| mov dword [rbp+node->lhs->var->offset], eax
+        dasm_put(Dst, 996, node->rhs->val, node->lhs->var->offset);
+#line 1223 "../../src/codegen.in.c"
+      } else {
+        gen_addr(node->lhs);
+        push();
+        gen_expr(node->rhs);
 
-      if (node->lhs->kind == ND_MEMBER && node->lhs->member->is_bitfield) {
-        //| mov r8, rax
-        dasm_put(Dst, 994);
-#line 1197 "../../src/codegen.in.c"
+        if (node->lhs->kind == ND_MEMBER && node->lhs->member->is_bitfield) {
+          //| mov r8, rax
+          dasm_put(Dst, 1004);
+#line 1230 "../../src/codegen.in.c"
 
-        // If the lhs is a bitfield, we need to read the current value
-        // from memory and merge it with a new value.
-        Member* mem = node->lhs->member;
-        //| mov RUTIL, rax
-        //| and RUTIL, (1L << mem->bit_width) - 1
-        //| shl RUTIL, mem->bit_offset
-        dasm_put(Dst, 998, (1L << mem->bit_width) - 1, mem->bit_offset);
-#line 1204 "../../src/codegen.in.c"
+          // If the lhs is a bitfield, we need to read the current value
+          // from memory and merge it with a new value.
+          Member* mem = node->lhs->member;
+          //| mov RUTIL, rax
+          //| and RUTIL, (1L << mem->bit_width) - 1
+          //| shl RUTIL, mem->bit_offset
+          dasm_put(Dst, 1008, (1L << mem->bit_width) - 1, mem->bit_offset);
+#line 1237 "../../src/codegen.in.c"
 
-        //| mov rax, [rsp]
-        dasm_put(Dst, 1010);
-#line 1206 "../../src/codegen.in.c"
-        load(mem->ty);
+          //| mov rax, [rsp]
+          dasm_put(Dst, 1020);
+#line 1239 "../../src/codegen.in.c"
+          load(mem->ty);
 
-        long mask = ((1L << mem->bit_width) - 1) << mem->bit_offset;
-        //| mov r9, ~mask
-        //| and rax, r9
-        //| or rax, RUTIL
-        dasm_put(Dst, 1015, ~mask);
-#line 1212 "../../src/codegen.in.c"
+          long mask = ((1L << mem->bit_width) - 1) << mem->bit_offset;
+          //| mov r9, ~mask
+          //| and rax, r9
+          //| or rax, RUTIL
+          dasm_put(Dst, 1025, ~mask);
+#line 1245 "../../src/codegen.in.c"
+          store(node->ty);
+          //| mov rax, r8
+          dasm_put(Dst, 1036);
+#line 1247 "../../src/codegen.in.c"
+          return;
+        }
+
         store(node->ty);
-        //| mov rax, r8
-        dasm_put(Dst, 1026);
-#line 1214 "../../src/codegen.in.c"
-        return;
       }
-
-      store(node->ty);
       return;
     case ND_STMT_EXPR:
       for (Node* n = node->body; n; n = n->next)
@@ -11581,20 +19233,20 @@ static void gen_expr(Node* node) {
       // `rep stosb` is equivalent to `memset(rdi, al, rcx)`.
 #if X64WIN
       //| push rdi
-      dasm_put(Dst, 1030);
-#line 1235 "../../src/codegen.in.c"
+      dasm_put(Dst, 1040);
+#line 1269 "../../src/codegen.in.c"
 #endif
       //| mov rcx, node->var->ty->size
       //| lea rdi, [rbp+node->var->offset]
       //| mov al, 0
       //| rep
       //| stosb
-      dasm_put(Dst, 1032, node->var->ty->size, node->var->offset);
-#line 1241 "../../src/codegen.in.c"
+      dasm_put(Dst, 1042, node->var->ty->size, node->var->offset);
+#line 1275 "../../src/codegen.in.c"
 #if X64WIN
       //| pop rdi
-      dasm_put(Dst, 1046);
-#line 1243 "../../src/codegen.in.c"
+      dasm_put(Dst, 1056);
+#line 1277 "../../src/codegen.in.c"
 #endif
       return;
     case ND_COND: {
@@ -11603,17 +19255,17 @@ static void gen_expr(Node* node) {
       gen_expr(node->cond);
       cmp_zero(node->cond->ty);
       //| je =>lelse
-      dasm_put(Dst, 1048, lelse);
-#line 1251 "../../src/codegen.in.c"
+      dasm_put(Dst, 1058, lelse);
+#line 1285 "../../src/codegen.in.c"
       gen_expr(node->then);
       //| jmp =>lend
       //|=>lelse:
-      dasm_put(Dst, 1052, lend, lelse);
-#line 1254 "../../src/codegen.in.c"
+      dasm_put(Dst, 1062, lend, lelse);
+#line 1288 "../../src/codegen.in.c"
       gen_expr(node->els);
       //|=>lend:
-      dasm_put(Dst, 1055, lend);
-#line 1256 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, lend);
+#line 1290 "../../src/codegen.in.c"
       return;
     }
     case ND_NOT:
@@ -11621,14 +19273,14 @@ static void gen_expr(Node* node) {
       cmp_zero(node->lhs->ty);
       //| sete al
       //| movzx rax, al
-      dasm_put(Dst, 1057);
-#line 1263 "../../src/codegen.in.c"
+      dasm_put(Dst, 1067);
+#line 1297 "../../src/codegen.in.c"
       return;
     case ND_BITNOT:
       gen_expr(node->lhs);
       //| not rax
-      dasm_put(Dst, 1065);
-#line 1267 "../../src/codegen.in.c"
+      dasm_put(Dst, 1075);
+#line 1301 "../../src/codegen.in.c"
       return;
     case ND_LOGAND: {
       int lfalse = codegen_pclabel();
@@ -11636,8 +19288,8 @@ static void gen_expr(Node* node) {
       gen_expr(node->lhs);
       cmp_zero(node->lhs->ty);
       //| je =>lfalse
-      dasm_put(Dst, 1048, lfalse);
-#line 1274 "../../src/codegen.in.c"
+      dasm_put(Dst, 1058, lfalse);
+#line 1308 "../../src/codegen.in.c"
       gen_expr(node->rhs);
       cmp_zero(node->rhs->ty);
       //| je =>lfalse
@@ -11646,8 +19298,8 @@ static void gen_expr(Node* node) {
       //|=>lfalse:
       //| mov rax, 0
       //|=>lend:
-      dasm_put(Dst, 1070, lfalse, lend, lfalse, lend);
-#line 1282 "../../src/codegen.in.c"
+      dasm_put(Dst, 1080, lfalse, lend, lfalse, lend);
+#line 1316 "../../src/codegen.in.c"
       return;
     }
     case ND_LOGOR: {
@@ -11656,8 +19308,8 @@ static void gen_expr(Node* node) {
       gen_expr(node->lhs);
       cmp_zero(node->lhs->ty);
       //| jne =>ltrue
-      dasm_put(Dst, 1093, ltrue);
-#line 1290 "../../src/codegen.in.c"
+      dasm_put(Dst, 1103, ltrue);
+#line 1324 "../../src/codegen.in.c"
       gen_expr(node->rhs);
       cmp_zero(node->rhs->ty);
       //| jne =>ltrue
@@ -11666,16 +19318,16 @@ static void gen_expr(Node* node) {
       //|=>ltrue:
       //| mov rax, 1
       //|=>lend:
-      dasm_put(Dst, 1097, ltrue, lend, ltrue, lend);
-#line 1298 "../../src/codegen.in.c"
+      dasm_put(Dst, 1107, ltrue, lend, ltrue, lend);
+#line 1332 "../../src/codegen.in.c"
       return;
     }
     case ND_FUNCALL: {
       if (node->lhs->kind == ND_VAR && !strcmp(node->lhs->var->name, "alloca")) {
         gen_expr(node->args);
         //| mov CARG1, rax
-        dasm_put(Dst, 718);
-#line 1304 "../../src/codegen.in.c"
+        dasm_put(Dst, 720);
+#line 1338 "../../src/codegen.in.c"
         builtin_alloca();
         return;
       }
@@ -11691,14 +19343,14 @@ static void gen_expr(Node* node) {
         gen_addr(node->args->next);
         // RAX is now &x, move it to the next qword.
         //| add rax, 8
-        dasm_put(Dst, 1120);
-#line 1319 "../../src/codegen.in.c"
+        dasm_put(Dst, 1130);
+#line 1353 "../../src/codegen.in.c"
 
         // Store one-past the second argument into &ap.
         pop(REG_UTIL);
         //| mov [RUTIL], rax
-        dasm_put(Dst, 103);
-#line 1323 "../../src/codegen.in.c"
+        dasm_put(Dst, 105);
+#line 1357 "../../src/codegen.in.c"
         return;
       }
 #endif
@@ -11734,8 +19386,8 @@ static void gen_expr(Node* node) {
               popf(reg);
               // Varargs requires a copy of fp in gp.
               //| movd Rq(dasmargreg[reg]), xmm(reg)
-              dasm_put(Dst, 1125, (reg), (dasmargreg[reg]));
-#line 1358 "../../src/codegen.in.c"
+              dasm_put(Dst, 1135, (reg), (dasmargreg[reg]));
+#line 1392 "../../src/codegen.in.c"
               ++reg;
             }
             break;
@@ -11750,12 +19402,12 @@ static void gen_expr(Node* node) {
       //| mov r10, rax
       //| call r10
       //| add rsp, stack_args*8 + PARAMETER_SAVE_SIZE + by_ref_copies_size
-      dasm_put(Dst, 1135, PARAMETER_SAVE_SIZE, stack_args*8 + PARAMETER_SAVE_SIZE + by_ref_copies_size);
-#line 1372 "../../src/codegen.in.c"
+      dasm_put(Dst, 1145, PARAMETER_SAVE_SIZE, stack_args*8 + PARAMETER_SAVE_SIZE + by_ref_copies_size);
+#line 1406 "../../src/codegen.in.c"
       if (by_ref_copies_size > 0) {
         //| pop r11
-        dasm_put(Dst, 1152);
-#line 1374 "../../src/codegen.in.c"
+        dasm_put(Dst, 1162);
+#line 1408 "../../src/codegen.in.c"
       }
 
       C(depth) -= by_ref_copies_size / 8;
@@ -11767,29 +19419,29 @@ static void gen_expr(Node* node) {
       switch (node->ty->kind) {
         case TY_BOOL:
           //| movzx eax, al
-          dasm_put(Dst, 172);
-#line 1385 "../../src/codegen.in.c"
+          dasm_put(Dst, 174);
+#line 1419 "../../src/codegen.in.c"
           return;
         case TY_CHAR:
           if (node->ty->is_unsigned) {
             //| movzx eax, al
-            dasm_put(Dst, 172);
-#line 1389 "../../src/codegen.in.c"
+            dasm_put(Dst, 174);
+#line 1423 "../../src/codegen.in.c"
           } else {
             //| movsx eax, al
-            dasm_put(Dst, 168);
-#line 1391 "../../src/codegen.in.c"
+            dasm_put(Dst, 170);
+#line 1425 "../../src/codegen.in.c"
           }
           return;
         case TY_SHORT:
           if (node->ty->is_unsigned) {
             //| movzx eax, ax
-            dasm_put(Dst, 180);
-#line 1396 "../../src/codegen.in.c"
+            dasm_put(Dst, 182);
+#line 1430 "../../src/codegen.in.c"
           } else {
             //| movsx eax, ax
-            dasm_put(Dst, 176);
-#line 1398 "../../src/codegen.in.c"
+            dasm_put(Dst, 178);
+#line 1432 "../../src/codegen.in.c"
           }
           return;
       }
@@ -11800,8 +19452,8 @@ static void gen_expr(Node* node) {
       if (node->ret_buffer && type_passed_in_register(node->ty)) {
         //| mov [rbp+node->ret_buffer->offset], rax
         //| lea rax, [rbp+node->ret_buffer->offset]
-        dasm_put(Dst, 1155, node->ret_buffer->offset, node->ret_buffer->offset);
-#line 1408 "../../src/codegen.in.c"
+        dasm_put(Dst, 1165, node->ret_buffer->offset, node->ret_buffer->offset);
+#line 1442 "../../src/codegen.in.c"
       }
 
 #else  // SysV
@@ -11863,8 +19515,8 @@ static void gen_expr(Node* node) {
       //| mov rax, fp
       //| call r10
       //| add rsp, stack_args*8
-      dasm_put(Dst, 1164, fp, stack_args*8);
-#line 1469 "../../src/codegen.in.c"
+      dasm_put(Dst, 1174, fp, stack_args*8);
+#line 1503 "../../src/codegen.in.c"
 
       C(depth) -= stack_args;
 
@@ -11874,29 +19526,29 @@ static void gen_expr(Node* node) {
       switch (node->ty->kind) {
         case TY_BOOL:
           //| movzx eax, al
-          dasm_put(Dst, 172);
-#line 1478 "../../src/codegen.in.c"
+          dasm_put(Dst, 174);
+#line 1512 "../../src/codegen.in.c"
           return;
         case TY_CHAR:
           if (node->ty->is_unsigned) {
             //| movzx eax, al
-            dasm_put(Dst, 172);
-#line 1482 "../../src/codegen.in.c"
+            dasm_put(Dst, 174);
+#line 1516 "../../src/codegen.in.c"
           } else {
             //| movsx eax, al
-            dasm_put(Dst, 168);
-#line 1484 "../../src/codegen.in.c"
+            dasm_put(Dst, 170);
+#line 1518 "../../src/codegen.in.c"
           }
           return;
         case TY_SHORT:
           if (node->ty->is_unsigned) {
             //| movzx eax, ax
-            dasm_put(Dst, 180);
-#line 1489 "../../src/codegen.in.c"
+            dasm_put(Dst, 182);
+#line 1523 "../../src/codegen.in.c"
           } else {
             //| movsx eax, ax
-            dasm_put(Dst, 176);
-#line 1491 "../../src/codegen.in.c"
+            dasm_put(Dst, 178);
+#line 1525 "../../src/codegen.in.c"
           }
           return;
       }
@@ -11906,8 +19558,8 @@ static void gen_expr(Node* node) {
       if (node->ret_buffer && node->ty->size <= 16) {
         copy_ret_buffer(node->ret_buffer);
         //| lea rax, [rbp+node->ret_buffer->offset]
-        dasm_put(Dst, 112, node->ret_buffer->offset);
-#line 1500 "../../src/codegen.in.c"
+        dasm_put(Dst, 114, node->ret_buffer->offset);
+#line 1534 "../../src/codegen.in.c"
       }
 
 #endif  // SysV
@@ -11916,13 +19568,13 @@ static void gen_expr(Node* node) {
     }
     case ND_LABEL_VAL:
       //| lea rax, [=>node->pc_label]
-      dasm_put(Dst, 117, node->pc_label);
-#line 1508 "../../src/codegen.in.c"
+      dasm_put(Dst, 119, node->pc_label);
+#line 1542 "../../src/codegen.in.c"
       return;
     case ND_REFLECT_TYPE_PTR:
-      //| mov64 rax, node->rty;
-      dasm_put(Dst, 123, (unsigned int)(node->rty), (unsigned int)((node->rty)>>32));
-#line 1511 "../../src/codegen.in.c"
+      //| mov64 rax, node->reflect_ty;
+      dasm_put(Dst, 125, (unsigned int)(node->reflect_ty), (unsigned int)((node->reflect_ty)>>32));
+#line 1545 "../../src/codegen.in.c"
       return;
     case ND_CAS:
     case ND_LOCKCE: {
@@ -11935,8 +19587,8 @@ static void gen_expr(Node* node) {
       gen_expr(node->cas_old);
       if (!is_locked_ce) {
         //| mov r8, rax
-        dasm_put(Dst, 994);
-#line 1523 "../../src/codegen.in.c"
+        dasm_put(Dst, 1004);
+#line 1557 "../../src/codegen.in.c"
         load(node->cas_old->ty->base);
       }
       pop(REG_DX);    // new
@@ -11954,8 +19606,8 @@ static void gen_expr(Node* node) {
           //| .byte 0x0f
           //| .byte 0xb0
           //| .byte RUTILenc
-          dasm_put(Dst, 1180);
-#line 1540 "../../src/codegen.in.c"
+          dasm_put(Dst, 1190);
+#line 1574 "../../src/codegen.in.c"
           break;
         case 2:
           // lock cmpxchg WORD PTR [rdi/rcx],dx
@@ -11964,8 +19616,8 @@ static void gen_expr(Node* node) {
           //| .byte 0x0f
           //| .byte 0xb1
           //| .byte RUTILenc
-          dasm_put(Dst, 1186);
-#line 1548 "../../src/codegen.in.c"
+          dasm_put(Dst, 1196);
+#line 1582 "../../src/codegen.in.c"
           break;
         case 4:
           // lock cmpxchg DWORD PTR [rdi/rcx],edx
@@ -11973,8 +19625,8 @@ static void gen_expr(Node* node) {
           //| .byte 0x0f
           //| .byte 0xb1
           //| .byte RUTILenc
-          dasm_put(Dst, 1187);
-#line 1555 "../../src/codegen.in.c"
+          dasm_put(Dst, 1197);
+#line 1589 "../../src/codegen.in.c"
           break;
         case 8:
           // lock cmpxchg QWORD PTR [rdi/rcx],rdx
@@ -11983,8 +19635,8 @@ static void gen_expr(Node* node) {
           //| .byte 0x0f
           //| .byte 0xb1
           //| .byte RUTILenc
-          dasm_put(Dst, 1193);
-#line 1563 "../../src/codegen.in.c"
+          dasm_put(Dst, 1203);
+#line 1597 "../../src/codegen.in.c"
           break;
         default:
           unreachable();
@@ -11992,36 +19644,36 @@ static void gen_expr(Node* node) {
       if (!is_locked_ce) {
         //| sete cl
         //| je >1
-        dasm_put(Dst, 1200);
-#line 1570 "../../src/codegen.in.c"
+        dasm_put(Dst, 1210);
+#line 1604 "../../src/codegen.in.c"
         switch (sz) {
           case 1:
             //| mov [r8], al
-            dasm_put(Dst, 1208);
-#line 1573 "../../src/codegen.in.c"
+            dasm_put(Dst, 1218);
+#line 1607 "../../src/codegen.in.c"
             break;
           case 2:
             //| mov [r8], ax
-            dasm_put(Dst, 1212);
-#line 1576 "../../src/codegen.in.c"
+            dasm_put(Dst, 1222);
+#line 1610 "../../src/codegen.in.c"
             break;
           case 4:
             //| mov [r8], eax
-            dasm_put(Dst, 1213);
-#line 1579 "../../src/codegen.in.c"
+            dasm_put(Dst, 1223);
+#line 1613 "../../src/codegen.in.c"
             break;
           case 8:
             //| mov [r8], rax
-            dasm_put(Dst, 1217);
-#line 1582 "../../src/codegen.in.c"
+            dasm_put(Dst, 1227);
+#line 1616 "../../src/codegen.in.c"
             break;
           default:
             unreachable();
         }
         //|1:
         //| movzx eax, cl
-        dasm_put(Dst, 1221);
-#line 1588 "../../src/codegen.in.c"
+        dasm_put(Dst, 1231);
+#line 1622 "../../src/codegen.in.c"
       }
 
       return;
@@ -12036,23 +19688,23 @@ static void gen_expr(Node* node) {
       switch (sz) {
         case 1:
           //| xchg [RUTIL], al
-          dasm_put(Dst, 1227);
-#line 1602 "../../src/codegen.in.c"
+          dasm_put(Dst, 1237);
+#line 1636 "../../src/codegen.in.c"
           break;
         case 2:
           //| xchg [RUTIL], ax
-          dasm_put(Dst, 1230);
-#line 1605 "../../src/codegen.in.c"
+          dasm_put(Dst, 1240);
+#line 1639 "../../src/codegen.in.c"
           break;
         case 4:
           //| xchg [RUTIL], eax
-          dasm_put(Dst, 1231);
-#line 1608 "../../src/codegen.in.c"
+          dasm_put(Dst, 1241);
+#line 1642 "../../src/codegen.in.c"
           break;
         case 8:
           //| xchg [RUTIL], rax
-          dasm_put(Dst, 1234);
-#line 1611 "../../src/codegen.in.c"
+          dasm_put(Dst, 1244);
+#line 1645 "../../src/codegen.in.c"
           break;
         default:
           unreachable();
@@ -12075,45 +19727,45 @@ static void gen_expr(Node* node) {
         case ND_ADD:
           if (is_float) {
             //| addss xmm0, xmm1
-            dasm_put(Dst, 1238);
-#line 1633 "../../src/codegen.in.c"
+            dasm_put(Dst, 1248);
+#line 1667 "../../src/codegen.in.c"
           } else {
             //| addsd xmm0, xmm1
-            dasm_put(Dst, 1244);
-#line 1635 "../../src/codegen.in.c"
+            dasm_put(Dst, 1254);
+#line 1669 "../../src/codegen.in.c"
           }
           return;
         case ND_SUB:
           if (is_float) {
             //| subss xmm0, xmm1
-            dasm_put(Dst, 1250);
-#line 1640 "../../src/codegen.in.c"
+            dasm_put(Dst, 1260);
+#line 1674 "../../src/codegen.in.c"
           } else {
             //| subsd xmm0, xmm1
-            dasm_put(Dst, 1256);
-#line 1642 "../../src/codegen.in.c"
+            dasm_put(Dst, 1266);
+#line 1676 "../../src/codegen.in.c"
           }
           return;
         case ND_MUL:
           if (is_float) {
             //| mulss xmm0, xmm1
-            dasm_put(Dst, 1262);
-#line 1647 "../../src/codegen.in.c"
+            dasm_put(Dst, 1272);
+#line 1681 "../../src/codegen.in.c"
           } else {
             //| mulsd xmm0, xmm1
-            dasm_put(Dst, 1268);
-#line 1649 "../../src/codegen.in.c"
+            dasm_put(Dst, 1278);
+#line 1683 "../../src/codegen.in.c"
           }
           return;
         case ND_DIV:
           if (is_float) {
             //| divss xmm0, xmm1
-            dasm_put(Dst, 1274);
-#line 1654 "../../src/codegen.in.c"
+            dasm_put(Dst, 1284);
+#line 1688 "../../src/codegen.in.c"
           } else {
             //| divsd xmm0, xmm1
-            dasm_put(Dst, 1280);
-#line 1656 "../../src/codegen.in.c"
+            dasm_put(Dst, 1290);
+#line 1690 "../../src/codegen.in.c"
           }
           return;
         case ND_EQ:
@@ -12122,40 +19774,40 @@ static void gen_expr(Node* node) {
         case ND_LE:
           if (is_float) {
             //| ucomiss xmm1, xmm0
-            dasm_put(Dst, 1286);
-#line 1664 "../../src/codegen.in.c"
+            dasm_put(Dst, 1296);
+#line 1698 "../../src/codegen.in.c"
           } else {
             //| ucomisd xmm1, xmm0
-            dasm_put(Dst, 1290);
-#line 1666 "../../src/codegen.in.c"
+            dasm_put(Dst, 1300);
+#line 1700 "../../src/codegen.in.c"
           }
 
           if (node->kind == ND_EQ) {
             //| sete al
             //| setnp dl
             //| and al, dl
-            dasm_put(Dst, 1295);
-#line 1672 "../../src/codegen.in.c"
+            dasm_put(Dst, 1305);
+#line 1706 "../../src/codegen.in.c"
           } else if (node->kind == ND_NE) {
             //| setne al
             //| setp dl
             //| or al, dl
-            dasm_put(Dst, 1304);
-#line 1676 "../../src/codegen.in.c"
+            dasm_put(Dst, 1314);
+#line 1710 "../../src/codegen.in.c"
           } else if (node->kind == ND_LT) {
             //| seta al
-            dasm_put(Dst, 1313);
-#line 1678 "../../src/codegen.in.c"
+            dasm_put(Dst, 1323);
+#line 1712 "../../src/codegen.in.c"
           } else {
             //| setae al
-            dasm_put(Dst, 1317);
-#line 1680 "../../src/codegen.in.c"
+            dasm_put(Dst, 1327);
+#line 1714 "../../src/codegen.in.c"
           }
 
           //| and al, 1
           //| movzx rax, al
-          dasm_put(Dst, 1321);
-#line 1684 "../../src/codegen.in.c"
+          dasm_put(Dst, 1331);
+#line 1718 "../../src/codegen.in.c"
           return;
       }
 
@@ -12169,23 +19821,23 @@ static void gen_expr(Node* node) {
       switch (node->kind) {
         case ND_ADD:
           //| faddp st1, st0
-          dasm_put(Dst, 1328);
-#line 1697 "../../src/codegen.in.c"
+          dasm_put(Dst, 1338);
+#line 1731 "../../src/codegen.in.c"
           return;
         case ND_SUB:
           //| fsubrp st1, st0
-          dasm_put(Dst, 1331);
-#line 1700 "../../src/codegen.in.c"
+          dasm_put(Dst, 1341);
+#line 1734 "../../src/codegen.in.c"
           return;
         case ND_MUL:
           //| fmulp st1, st0
-          dasm_put(Dst, 1334);
-#line 1703 "../../src/codegen.in.c"
+          dasm_put(Dst, 1344);
+#line 1737 "../../src/codegen.in.c"
           return;
         case ND_DIV:
           //| fdivrp st1, st0
-          dasm_put(Dst, 1337);
-#line 1706 "../../src/codegen.in.c"
+          dasm_put(Dst, 1347);
+#line 1740 "../../src/codegen.in.c"
           return;
         case ND_EQ:
         case ND_NE:
@@ -12193,30 +19845,30 @@ static void gen_expr(Node* node) {
         case ND_LE:
           //| fcomip st1
           //| fstp st0
-          dasm_put(Dst, 1341);
-#line 1713 "../../src/codegen.in.c"
+          dasm_put(Dst, 1351);
+#line 1747 "../../src/codegen.in.c"
 
           if (node->kind == ND_EQ) {
             //| sete al
-            dasm_put(Dst, 1347);
-#line 1716 "../../src/codegen.in.c"
+            dasm_put(Dst, 1357);
+#line 1750 "../../src/codegen.in.c"
           } else if (node->kind == ND_NE) {
             //| setne al
-            dasm_put(Dst, 1351);
-#line 1718 "../../src/codegen.in.c"
+            dasm_put(Dst, 1361);
+#line 1752 "../../src/codegen.in.c"
           } else if (node->kind == ND_LT) {
             //| seta al
-            dasm_put(Dst, 1313);
-#line 1720 "../../src/codegen.in.c"
+            dasm_put(Dst, 1323);
+#line 1754 "../../src/codegen.in.c"
           } else {
             //| setae al
-            dasm_put(Dst, 1317);
-#line 1722 "../../src/codegen.in.c"
+            dasm_put(Dst, 1327);
+#line 1756 "../../src/codegen.in.c"
           }
 
           //| movzx rax, al
-          dasm_put(Dst, 1060);
-#line 1725 "../../src/codegen.in.c"
+          dasm_put(Dst, 1070);
+#line 1759 "../../src/codegen.in.c"
           return;
       }
 
@@ -12236,34 +19888,34 @@ static void gen_expr(Node* node) {
     case ND_ADD:
       if (is_long) {
         //| add rax, RUTIL
-        dasm_put(Dst, 1355);
-#line 1744 "../../src/codegen.in.c"
+        dasm_put(Dst, 1365);
+#line 1778 "../../src/codegen.in.c"
       } else {
         //| add eax, RUTILd
-        dasm_put(Dst, 1356);
-#line 1746 "../../src/codegen.in.c"
+        dasm_put(Dst, 1366);
+#line 1780 "../../src/codegen.in.c"
       }
       return;
     case ND_SUB:
       if (is_long) {
         //| sub rax, RUTIL
-        dasm_put(Dst, 1359);
-#line 1751 "../../src/codegen.in.c"
+        dasm_put(Dst, 1369);
+#line 1785 "../../src/codegen.in.c"
       } else {
         //| sub eax, RUTILd
-        dasm_put(Dst, 1360);
-#line 1753 "../../src/codegen.in.c"
+        dasm_put(Dst, 1370);
+#line 1787 "../../src/codegen.in.c"
       }
       return;
     case ND_MUL:
       if (is_long) {
         //| imul rax, RUTIL
-        dasm_put(Dst, 1363);
-#line 1758 "../../src/codegen.in.c"
+        dasm_put(Dst, 1373);
+#line 1792 "../../src/codegen.in.c"
       } else {
         //| imul eax, RUTILd
-        dasm_put(Dst, 1364);
-#line 1760 "../../src/codegen.in.c"
+        dasm_put(Dst, 1374);
+#line 1794 "../../src/codegen.in.c"
       }
       return;
     case ND_DIV:
@@ -12272,72 +19924,72 @@ static void gen_expr(Node* node) {
         if (is_long) {
           //| mov rdx, 0
           //| div RUTIL
-          dasm_put(Dst, 1368);
-#line 1768 "../../src/codegen.in.c"
+          dasm_put(Dst, 1378);
+#line 1802 "../../src/codegen.in.c"
         } else {
           //| mov edx, 0
           //| div RUTILd
-          dasm_put(Dst, 1381);
-#line 1771 "../../src/codegen.in.c"
+          dasm_put(Dst, 1391);
+#line 1805 "../../src/codegen.in.c"
         }
       } else {
         if (node->lhs->ty->size == 8) {
           //| cqo
-          dasm_put(Dst, 1391);
-#line 1775 "../../src/codegen.in.c"
+          dasm_put(Dst, 1401);
+#line 1809 "../../src/codegen.in.c"
         } else {
           //| cdq
-          dasm_put(Dst, 1392);
-#line 1777 "../../src/codegen.in.c"
+          dasm_put(Dst, 1402);
+#line 1811 "../../src/codegen.in.c"
         }
         if (is_long) {
           //| idiv RUTIL
-          dasm_put(Dst, 1394);
-#line 1780 "../../src/codegen.in.c"
+          dasm_put(Dst, 1404);
+#line 1814 "../../src/codegen.in.c"
         } else {
           //| idiv RUTILd
-          dasm_put(Dst, 1395);
-#line 1782 "../../src/codegen.in.c"
+          dasm_put(Dst, 1405);
+#line 1816 "../../src/codegen.in.c"
         }
       }
 
       if (node->kind == ND_MOD) {
         //| mov rax, rdx
-        dasm_put(Dst, 1400);
-#line 1787 "../../src/codegen.in.c"
+        dasm_put(Dst, 1410);
+#line 1821 "../../src/codegen.in.c"
       }
       return;
     case ND_BITAND:
       if (is_long) {
         //| and rax, RUTIL
-        dasm_put(Dst, 1404);
-#line 1792 "../../src/codegen.in.c"
+        dasm_put(Dst, 1414);
+#line 1826 "../../src/codegen.in.c"
       } else {
         //| and eax, RUTILd
-        dasm_put(Dst, 1405);
-#line 1794 "../../src/codegen.in.c"
+        dasm_put(Dst, 1415);
+#line 1828 "../../src/codegen.in.c"
       }
       return;
     case ND_BITOR:
       if (is_long) {
         //| or rax, RUTIL
-        dasm_put(Dst, 1022);
-#line 1799 "../../src/codegen.in.c"
+        dasm_put(Dst, 1032);
+#line 1833 "../../src/codegen.in.c"
       } else {
         //| or eax, RUTILd
-        dasm_put(Dst, 1023);
-#line 1801 "../../src/codegen.in.c"
+        dasm_put(Dst, 1033);
+#line 1835 "../../src/codegen.in.c"
       }
       return;
     case ND_BITXOR:
       if (is_long) {
         //| xor rax, RUTIL
-        dasm_put(Dst, 1408);
-#line 1806 "../../src/codegen.in.c"
+        dasm_put(Dst, 1418);
+#line 1840 "../../src/codegen.in.c"
       } else {
         //| xor eax, RUTILd
-        dasm_put(Dst, 1409);
-#line 1808 "../../src/codegen.in.c"
+        dasm_put(Dst, 1419);
+#line 1842 "../../src/codegen.in.c"
       }
       return;
     case ND_EQ:
@@ -12346,85 +19998,85 @@ static void gen_expr(Node* node) {
     case ND_LE:
       if (is_long) {
         //| cmp rax, RUTIL
-        dasm_put(Dst, 1412);
-#line 1816 "../../src/codegen.in.c"
+        dasm_put(Dst, 1422);
+#line 1850 "../../src/codegen.in.c"
       } else {
         //| cmp eax, RUTILd
-        dasm_put(Dst, 1413);
-#line 1818 "../../src/codegen.in.c"
+        dasm_put(Dst, 1423);
+#line 1852 "../../src/codegen.in.c"
       }
 
       if (node->kind == ND_EQ) {
         //| sete al
-        dasm_put(Dst, 1347);
-#line 1822 "../../src/codegen.in.c"
+        dasm_put(Dst, 1357);
+#line 1856 "../../src/codegen.in.c"
       } else if (node->kind == ND_NE) {
         //| setne al
-        dasm_put(Dst, 1351);
-#line 1824 "../../src/codegen.in.c"
+        dasm_put(Dst, 1361);
+#line 1858 "../../src/codegen.in.c"
       } else if (node->kind == ND_LT) {
         if (node->lhs->ty->is_unsigned) {
           //| setb al
-          dasm_put(Dst, 1416);
-#line 1827 "../../src/codegen.in.c"
+          dasm_put(Dst, 1426);
+#line 1861 "../../src/codegen.in.c"
         } else {
           //| setl al
-          dasm_put(Dst, 1420);
-#line 1829 "../../src/codegen.in.c"
+          dasm_put(Dst, 1430);
+#line 1863 "../../src/codegen.in.c"
         }
       } else if (node->kind == ND_LE) {
         if (node->lhs->ty->is_unsigned) {
           //| setbe al
-          dasm_put(Dst, 1424);
-#line 1833 "../../src/codegen.in.c"
+          dasm_put(Dst, 1434);
+#line 1867 "../../src/codegen.in.c"
         } else {
           //| setle al
-          dasm_put(Dst, 1428);
-#line 1835 "../../src/codegen.in.c"
+          dasm_put(Dst, 1438);
+#line 1869 "../../src/codegen.in.c"
         }
       }
 
       //| movzx rax, al
-      dasm_put(Dst, 1060);
-#line 1839 "../../src/codegen.in.c"
+      dasm_put(Dst, 1070);
+#line 1873 "../../src/codegen.in.c"
       return;
     case ND_SHL:
       //| mov rcx, RUTIL
-      dasm_put(Dst, 1432);
-#line 1842 "../../src/codegen.in.c"
+      dasm_put(Dst, 1442);
+#line 1876 "../../src/codegen.in.c"
       if (is_long) {
         //| shl rax, cl
-        dasm_put(Dst, 1436);
-#line 1844 "../../src/codegen.in.c"
+        dasm_put(Dst, 1446);
+#line 1878 "../../src/codegen.in.c"
       } else {
         //| shl eax, cl
-        dasm_put(Dst, 1437);
-#line 1846 "../../src/codegen.in.c"
+        dasm_put(Dst, 1447);
+#line 1880 "../../src/codegen.in.c"
       }
       return;
     case ND_SHR:
       //| mov rcx, RUTIL
-      dasm_put(Dst, 1432);
-#line 1850 "../../src/codegen.in.c"
+      dasm_put(Dst, 1442);
+#line 1884 "../../src/codegen.in.c"
       if (node->lhs->ty->is_unsigned) {
         if (is_long) {
           //| shr rax, cl
-          dasm_put(Dst, 1440);
-#line 1853 "../../src/codegen.in.c"
+          dasm_put(Dst, 1450);
+#line 1887 "../../src/codegen.in.c"
         } else {
           //| shr eax, cl
-          dasm_put(Dst, 1441);
-#line 1855 "../../src/codegen.in.c"
+          dasm_put(Dst, 1451);
+#line 1889 "../../src/codegen.in.c"
         }
       } else {
         if (is_long) {
           //| sar rax, cl
-          dasm_put(Dst, 1444);
-#line 1859 "../../src/codegen.in.c"
+          dasm_put(Dst, 1454);
+#line 1893 "../../src/codegen.in.c"
         } else {
           //| sar eax, cl
-          dasm_put(Dst, 1445);
-#line 1861 "../../src/codegen.in.c"
+          dasm_put(Dst, 1455);
+#line 1895 "../../src/codegen.in.c"
         }
       }
       return;
@@ -12434,6 +20086,12 @@ static void gen_expr(Node* node) {
 }
 
 static void gen_stmt(Node* node) {
+#if X64WIN
+  if (user_context->generate_debug_symbols) {
+    record_line_syminfo(node->tok->file->file_no, node->tok->line_no, codegen_pclabel());
+  }
+#endif
+
   switch (node->kind) {
     case ND_IF: {
       int lelse = codegen_pclabel();
@@ -12441,18 +20099,18 @@ static void gen_stmt(Node* node) {
       gen_expr(node->cond);
       cmp_zero(node->cond->ty);
       //| je =>lelse
-      dasm_put(Dst, 1048, lelse);
-#line 1877 "../../src/codegen.in.c"
+      dasm_put(Dst, 1058, lelse);
+#line 1917 "../../src/codegen.in.c"
       gen_stmt(node->then);
       //| jmp =>lend
       //|=>lelse:
-      dasm_put(Dst, 1052, lend, lelse);
-#line 1880 "../../src/codegen.in.c"
+      dasm_put(Dst, 1062, lend, lelse);
+#line 1920 "../../src/codegen.in.c"
       if (node->els)
         gen_stmt(node->els);
       //|=>lend:
-      dasm_put(Dst, 1055, lend);
-#line 1883 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, lend);
+#line 1923 "../../src/codegen.in.c"
       return;
     }
     case ND_FOR: {
@@ -12460,42 +20118,42 @@ static void gen_stmt(Node* node) {
         gen_stmt(node->init);
       int lbegin = codegen_pclabel();
       //|=>lbegin:
-      dasm_put(Dst, 1055, lbegin);
-#line 1890 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, lbegin);
+#line 1930 "../../src/codegen.in.c"
       if (node->cond) {
         gen_expr(node->cond);
         cmp_zero(node->cond->ty);
         //| je =>node->brk_pc_label
-        dasm_put(Dst, 1048, node->brk_pc_label);
-#line 1894 "../../src/codegen.in.c"
+        dasm_put(Dst, 1058, node->brk_pc_label);
+#line 1934 "../../src/codegen.in.c"
       }
       gen_stmt(node->then);
       //|=>node->cont_pc_label:
-      dasm_put(Dst, 1055, node->cont_pc_label);
-#line 1897 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->cont_pc_label);
+#line 1937 "../../src/codegen.in.c"
       if (node->inc)
         gen_expr(node->inc);
       //| jmp =>lbegin
       //|=>node->brk_pc_label:
-      dasm_put(Dst, 1052, lbegin, node->brk_pc_label);
-#line 1901 "../../src/codegen.in.c"
+      dasm_put(Dst, 1062, lbegin, node->brk_pc_label);
+#line 1941 "../../src/codegen.in.c"
       return;
     }
     case ND_DO: {
       int lbegin = codegen_pclabel();
       //|=>lbegin:
-      dasm_put(Dst, 1055, lbegin);
-#line 1906 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, lbegin);
+#line 1946 "../../src/codegen.in.c"
       gen_stmt(node->then);
       //|=>node->cont_pc_label:
-      dasm_put(Dst, 1055, node->cont_pc_label);
-#line 1908 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->cont_pc_label);
+#line 1948 "../../src/codegen.in.c"
       gen_expr(node->cond);
       cmp_zero(node->cond->ty);
       //| jne =>lbegin
       //|=>node->brk_pc_label:
-      dasm_put(Dst, 1449, lbegin, node->brk_pc_label);
-#line 1912 "../../src/codegen.in.c"
+      dasm_put(Dst, 1459, lbegin, node->brk_pc_label);
+#line 1952 "../../src/codegen.in.c"
       return;
     }
     case ND_SWITCH:
@@ -12507,16 +20165,16 @@ static void gen_stmt(Node* node) {
         if (n->begin == n->end) {
           if (is_long) {
             //| cmp rax, n->begin
-            dasm_put(Dst, 1454, n->begin);
-#line 1923 "../../src/codegen.in.c"
+            dasm_put(Dst, 1464, n->begin);
+#line 1963 "../../src/codegen.in.c"
           } else {
             //| cmp eax, n->begin
-            dasm_put(Dst, 1455, n->begin);
-#line 1925 "../../src/codegen.in.c"
+            dasm_put(Dst, 1465, n->begin);
+#line 1965 "../../src/codegen.in.c"
           }
           //| je =>n->pc_label
-          dasm_put(Dst, 1048, n->pc_label);
-#line 1927 "../../src/codegen.in.c"
+          dasm_put(Dst, 1058, n->pc_label);
+#line 1967 "../../src/codegen.in.c"
           continue;
         }
 
@@ -12525,38 +20183,38 @@ static void gen_stmt(Node* node) {
           //| mov RUTIL, rax
           //| sub RUTIL, n->begin
           //| cmp RUTIL, n->end - n->begin
-          dasm_put(Dst, 1460, n->begin, n->end - n->begin);
-#line 1935 "../../src/codegen.in.c"
+          dasm_put(Dst, 1470, n->begin, n->end - n->begin);
+#line 1975 "../../src/codegen.in.c"
         } else {
           //| mov RUTILd, eax
           //| sub RUTILd, n->begin
           //| cmp RUTILd, n->end - n->begin
-          dasm_put(Dst, 1474, n->begin, n->end - n->begin);
-#line 1939 "../../src/codegen.in.c"
+          dasm_put(Dst, 1484, n->begin, n->end - n->begin);
+#line 1979 "../../src/codegen.in.c"
         }
         //| jbe =>n->pc_label
-        dasm_put(Dst, 1485, n->pc_label);
-#line 1941 "../../src/codegen.in.c"
+        dasm_put(Dst, 1495, n->pc_label);
+#line 1981 "../../src/codegen.in.c"
       }
 
       if (node->default_case) {
         //| jmp =>node->default_case->pc_label
-        dasm_put(Dst, 1489, node->default_case->pc_label);
-#line 1945 "../../src/codegen.in.c"
+        dasm_put(Dst, 1499, node->default_case->pc_label);
+#line 1985 "../../src/codegen.in.c"
       }
 
       //| jmp =>node->brk_pc_label
-      dasm_put(Dst, 1489, node->brk_pc_label);
-#line 1948 "../../src/codegen.in.c"
+      dasm_put(Dst, 1499, node->brk_pc_label);
+#line 1988 "../../src/codegen.in.c"
       gen_stmt(node->then);
       //|=>node->brk_pc_label:
-      dasm_put(Dst, 1055, node->brk_pc_label);
-#line 1950 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->brk_pc_label);
+#line 1990 "../../src/codegen.in.c"
       return;
     case ND_CASE:
       //|=>node->pc_label:
-      dasm_put(Dst, 1055, node->pc_label);
-#line 1953 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->pc_label);
+#line 1993 "../../src/codegen.in.c"
       gen_stmt(node->lhs);
       return;
     case ND_BLOCK:
@@ -12565,19 +20223,19 @@ static void gen_stmt(Node* node) {
       return;
     case ND_GOTO:
       //| jmp =>node->pc_label
-      dasm_put(Dst, 1489, node->pc_label);
-#line 1961 "../../src/codegen.in.c"
+      dasm_put(Dst, 1499, node->pc_label);
+#line 2001 "../../src/codegen.in.c"
       return;
     case ND_GOTO_EXPR:
       gen_expr(node->lhs);
       //| jmp rax
-      dasm_put(Dst, 1493);
-#line 1965 "../../src/codegen.in.c"
+      dasm_put(Dst, 1503);
+#line 2005 "../../src/codegen.in.c"
       return;
     case ND_LABEL:
       //|=>node->pc_label:
-      dasm_put(Dst, 1055, node->pc_label);
-#line 1968 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->pc_label);
+#line 2008 "../../src/codegen.in.c"
       gen_stmt(node->lhs);
       return;
     case ND_RETURN:
@@ -12604,8 +20262,8 @@ static void gen_stmt(Node* node) {
       }
 
       //| jmp =>C(current_fn)->dasm_return_label
-      dasm_put(Dst, 1489, C(current_fn)->dasm_return_label);
-#line 1994 "../../src/codegen.in.c"
+      dasm_put(Dst, 1499, C(current_fn)->dasm_return_label);
+#line 2034 "../../src/codegen.in.c"
       return;
     case ND_EXPR_STMT:
       gen_expr(node->lhs);
@@ -12919,13 +20577,13 @@ static void store_fp(int r, int offset, int sz) {
   switch (sz) {
     case 4:
       //| movss dword [rbp+offset], xmm(r)
-      dasm_put(Dst, 682, (r), offset);
-#line 2307 "../../src/codegen.in.c"
+      dasm_put(Dst, 684, (r), offset);
+#line 2347 "../../src/codegen.in.c"
       return;
     case 8:
       //| movsd qword [rbp+offset], xmm(r)
-      dasm_put(Dst, 693, (r), offset);
-#line 2310 "../../src/codegen.in.c"
+      dasm_put(Dst, 695, (r), offset);
+#line 2350 "../../src/codegen.in.c"
       return;
   }
   unreachable();
@@ -12935,31 +20593,31 @@ static void store_gp(int r, int offset, int sz) {
   switch (sz) {
     case 1:
       //| mov [rbp+offset], Rb(dasmargreg[r])
-      dasm_put(Dst, 1497, (dasmargreg[r]), offset);
-#line 2319 "../../src/codegen.in.c"
+      dasm_put(Dst, 1507, (dasmargreg[r]), offset);
+#line 2359 "../../src/codegen.in.c"
       return;
     case 2:
       //| mov [rbp+offset], Rw(dasmargreg[r])
-      dasm_put(Dst, 1505, (dasmargreg[r]), offset);
-#line 2322 "../../src/codegen.in.c"
+      dasm_put(Dst, 1515, (dasmargreg[r]), offset);
+#line 2362 "../../src/codegen.in.c"
       return;
       return;
     case 4:
       //| mov [rbp+offset], Rd(dasmargreg[r])
-      dasm_put(Dst, 1506, (dasmargreg[r]), offset);
-#line 2326 "../../src/codegen.in.c"
+      dasm_put(Dst, 1516, (dasmargreg[r]), offset);
+#line 2366 "../../src/codegen.in.c"
       return;
     case 8:
       //| mov [rbp+offset], Rq(dasmargreg[r])
-      dasm_put(Dst, 1514, (dasmargreg[r]), offset);
-#line 2329 "../../src/codegen.in.c"
+      dasm_put(Dst, 1524, (dasmargreg[r]), offset);
+#line 2369 "../../src/codegen.in.c"
       return;
     default:
       for (int i = 0; i < sz; i++) {
         //| mov [rbp+offset+i], Rb(dasmargreg[r])
         //| shr Rq(dasmargreg[r]), 8
-        dasm_put(Dst, 704, (dasmargreg[r]), offset+i, (dasmargreg[r]));
-#line 2334 "../../src/codegen.in.c"
+        dasm_put(Dst, 706, (dasmargreg[r]), offset+i, (dasmargreg[r]));
+#line 2374 "../../src/codegen.in.c"
       }
       return;
   }
@@ -12982,34 +20640,38 @@ static void emit_text(Obj* prog) {
   }
 
   //| .code
-  dasm_put(Dst, 1522);
-#line 2356 "../../src/codegen.in.c"
+  dasm_put(Dst, 1532);
+#line 2396 "../../src/codegen.in.c"
 
   for (Obj* fn = prog; fn; fn = fn->next) {
     if (!fn->is_function || !fn->is_definition || !fn->is_live)
       continue;
 
     //|=>fn->dasm_entry_label:
-    dasm_put(Dst, 1055, fn->dasm_entry_label);
-#line 2362 "../../src/codegen.in.c"
+    dasm_put(Dst, 0, fn->dasm_entry_label);
+#line 2402 "../../src/codegen.in.c"
 
     C(current_fn) = fn;
+
+#if X64WIN
+    record_line_syminfo(fn->ty->name->file->file_no, fn->ty->name->line_no, codegen_pclabel());
+#endif
 
     // outaf("---- %s\n", fn->name);
 
     // Prologue
     //| push rbp
     //| mov rbp, rsp
-    dasm_put(Dst, 1524);
-#line 2370 "../../src/codegen.in.c"
+    dasm_put(Dst, 1534);
+#line 2414 "../../src/codegen.in.c"
 
 #if X64WIN
     // Stack probe on Windows if necessary. The MSDN reference for __chkstk says
     // it's only necessary beyond 8k for x64, but cl does it at 4k.
     if (fn->stack_size >= 4096) {
       //| mov rax, fn->stack_size
-      dasm_put(Dst, 924, fn->stack_size);
-#line 2376 "../../src/codegen.in.c"
+      dasm_put(Dst, 926, fn->stack_size);
+#line 2420 "../../src/codegen.in.c"
       int fixup_location = codegen_pclabel();
       strintarray_push(&C(fixups), (StringInt){"__chkstk", fixup_location}, AL_Compile);
 #ifdef _MSC_VER
@@ -13018,15 +20680,15 @@ static void emit_text(Obj* prog) {
 #endif
       //|=>fixup_location:
       //| mov64 r10, 0xc0dec0dec0dec0de
-      dasm_put(Dst, 1529, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
-#line 2384 "../../src/codegen.in.c"
+      dasm_put(Dst, 1539, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
+#line 2428 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
       //| call r10
       //| sub rsp, rax
-      dasm_put(Dst, 1535);
-#line 2389 "../../src/codegen.in.c"
+      dasm_put(Dst, 1545);
+#line 2433 "../../src/codegen.in.c"
 
       // TODO: pdata emission
     } else
@@ -13034,8 +20696,8 @@ static void emit_text(Obj* prog) {
 
     {
       //| sub rsp, fn->stack_size
-      dasm_put(Dst, 617, fn->stack_size);
-#line 2396 "../../src/codegen.in.c"
+      dasm_put(Dst, 619, fn->stack_size);
+#line 2440 "../../src/codegen.in.c"
 
       // TODO: add a label here to assert that the prolog size is as expected
 
@@ -13065,14 +20727,14 @@ static void emit_text(Obj* prog) {
       // These are the UNWIND_INFO structure that is referenced by the third
       // element of RUNTIME_FUNCTION.
       //| .pdata
-      dasm_put(Dst, 1543);
-#line 2425 "../../src/codegen.in.c"
+      dasm_put(Dst, 1553);
+#line 2469 "../../src/codegen.in.c"
       // This takes care of cases where CountOfCodes is odd.
       //| .align 4
       //|=>fn->dasm_unwind_info_label:
       //| .byte 1  /* Version:3 (1) and Flags:5 (0) */
-      dasm_put(Dst, 1545, fn->dasm_unwind_info_label, 1  /* Version:3 (1) and Flags:5 (0) */);
-#line 2429 "../../src/codegen.in.c"
+      dasm_put(Dst, 1555, fn->dasm_unwind_info_label, 1  /* Version:3 (1) and Flags:5 (0) */);
+#line 2473 "../../src/codegen.in.c"
       bool small_stack = fn->stack_size / 8 - 1 <= 15;
       if (small_stack) {
         // We just happen to "know" this is the form used for small stack sizes.
@@ -13082,8 +20744,8 @@ static void emit_text(Obj* prog) {
         // xxxxxxxxxxxx0009 ...
         //| .byte 8  /* SizeOfProlog */
         //| .byte 3  /* CountOfCodes */
-        dasm_put(Dst, 1550, 8  /* SizeOfProlog */, 3  /* CountOfCodes */);
-#line 2438 "../../src/codegen.in.c"
+        dasm_put(Dst, 1560, 8  /* SizeOfProlog */, 3  /* CountOfCodes */);
+#line 2482 "../../src/codegen.in.c"
       } else {
         // And this one for larger reservations.
         // xxxxxxxxxxxx0000 55                   push        rbp
@@ -13092,44 +20754,44 @@ static void emit_text(Obj* prog) {
         // xxxxxxxxxxxx000b ...
         //| .byte 11  /* SizeOfProlog */
         //| .byte 4  /* CountOfCodes */
-        dasm_put(Dst, 1550, 11  /* SizeOfProlog */, 4  /* CountOfCodes */);
-#line 2446 "../../src/codegen.in.c"
+        dasm_put(Dst, 1560, 11  /* SizeOfProlog */, 4  /* CountOfCodes */);
+#line 2490 "../../src/codegen.in.c"
       }
       //| .byte 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */
-      dasm_put(Dst, 981, 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */);
-#line 2448 "../../src/codegen.in.c"
+      dasm_put(Dst, 983, 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */);
+#line 2492 "../../src/codegen.in.c"
 
       if (small_stack) {
         //| .byte 8  /* CodeOffset */
         //| .byte UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4)
-        dasm_put(Dst, 1550, 8  /* CodeOffset */, UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4));
-#line 2452 "../../src/codegen.in.c"
+        dasm_put(Dst, 1560, 8  /* CodeOffset */, UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4));
+#line 2496 "../../src/codegen.in.c"
       } else {
         //| .byte 11  /* CodeOffset */
-        dasm_put(Dst, 981, 11  /* CodeOffset */);
-#line 2454 "../../src/codegen.in.c"
+        dasm_put(Dst, 983, 11  /* CodeOffset */);
+#line 2498 "../../src/codegen.in.c"
         assert(fn->stack_size / 8 <= 65535 && "todo; not UWOP_ALLOC_LARGE 0-style");
         //| .byte UWOP_ALLOC_LARGE
         //| .word fn->stack_size / 8
-        dasm_put(Dst, 1553, UWOP_ALLOC_LARGE, fn->stack_size / 8);
-#line 2457 "../../src/codegen.in.c"
+        dasm_put(Dst, 1563, UWOP_ALLOC_LARGE, fn->stack_size / 8);
+#line 2501 "../../src/codegen.in.c"
       }
       //| .byte 4  /* CodeOffset */
       //| .byte UWOP_SET_FPREG
       //| .byte 1  /* CodeOffset */
       //| .byte UWOP_PUSH_NONVOL | (5 /* RBP */ << 4)
-      dasm_put(Dst, 1556, 4  /* CodeOffset */, UWOP_SET_FPREG, 1  /* CodeOffset */, UWOP_PUSH_NONVOL | (5 /* RBP */ << 4));
-#line 2462 "../../src/codegen.in.c"
+      dasm_put(Dst, 1566, 4  /* CodeOffset */, UWOP_SET_FPREG, 1  /* CodeOffset */, UWOP_PUSH_NONVOL | (5 /* RBP */ << 4));
+#line 2506 "../../src/codegen.in.c"
 
       //| .code
-      dasm_put(Dst, 1522);
-#line 2464 "../../src/codegen.in.c"
+      dasm_put(Dst, 1532);
+#line 2508 "../../src/codegen.in.c"
 #endif
     }
 
     //| mov [rbp+fn->alloca_bottom->offset], rsp
-    dasm_put(Dst, 1561, fn->alloca_bottom->offset);
-#line 2468 "../../src/codegen.in.c"
+    dasm_put(Dst, 1571, fn->alloca_bottom->offset);
+#line 2512 "../../src/codegen.in.c"
 
 #if !X64WIN
     // Save arg registers if function is variadic
@@ -13151,8 +20813,8 @@ static void emit_text(Obj* prog) {
       //| add qword [rbp+off+8], 16
       //| mov [rbp+off+16], rbp                // reg_save_area
       //| add qword [rbp+off+16], off+24
-      dasm_put(Dst, 1566, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
-#line 2489 "../../src/codegen.in.c"
+      dasm_put(Dst, 1576, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
+#line 2533 "../../src/codegen.in.c"
 
       // __reg_save_area__
       //| mov [rbp + off + 24], rdi
@@ -13169,8 +20831,8 @@ static void emit_text(Obj* prog) {
       //| movsd qword [rbp + off + 112], xmm5
       //| movsd qword [rbp + off + 120], xmm6
       //| movsd qword [rbp + off + 128], xmm7
-      dasm_put(Dst, 1593, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
-#line 2505 "../../src/codegen.in.c"
+      dasm_put(Dst, 1603, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
+#line 2549 "../../src/codegen.in.c"
     }
 #endif
 
@@ -13182,8 +20844,8 @@ static void emit_text(Obj* prog) {
       //| mov [rbp + 24], CARG2
       //| mov [rbp + 32], CARG3
       //| mov [rbp + 40], CARG4
-      dasm_put(Dst, 1666, 16, 24, 32, 40);
-#line 2516 "../../src/codegen.in.c"
+      dasm_put(Dst, 1676, 16, 24, 32, 40);
+#line 2560 "../../src/codegen.in.c"
     } else {
       // Save passed-by-register arguments to the stack
       int reg = 0;
@@ -13259,33 +20921,33 @@ static void emit_text(Obj* prog) {
     // behavior is undefined for the other functions.
     if (strcmp(fn->name, "main") == 0) {
       //| mov rax, 0
-      dasm_put(Dst, 734);
-#line 2591 "../../src/codegen.in.c"
+      dasm_put(Dst, 736);
+#line 2635 "../../src/codegen.in.c"
     }
 
     // Epilogue
     //|=>fn->dasm_return_label:
-    dasm_put(Dst, 1055, fn->dasm_return_label);
-#line 2595 "../../src/codegen.in.c"
+    dasm_put(Dst, 0, fn->dasm_return_label);
+#line 2639 "../../src/codegen.in.c"
 #if X64WIN
     // https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog?view=msvc-170#epilog-code
     // says this the required form to recognize an epilog.
     //| lea rsp, [rbp]
-    dasm_put(Dst, 1683);
-#line 2599 "../../src/codegen.in.c"
+    dasm_put(Dst, 1693);
+#line 2643 "../../src/codegen.in.c"
 #else
     //| mov rsp, rbp
-    dasm_put(Dst, 1688);
-#line 2601 "../../src/codegen.in.c"
+    dasm_put(Dst, 1698);
+#line 2645 "../../src/codegen.in.c"
 #endif
     //| pop rbp
     //| ret
-    dasm_put(Dst, 1693);
-#line 2604 "../../src/codegen.in.c"
+    dasm_put(Dst, 1703);
+#line 2648 "../../src/codegen.in.c"
 
     //|=>fn->dasm_end_of_function_label:
-    dasm_put(Dst, 1055, fn->dasm_end_of_function_label);
-#line 2606 "../../src/codegen.in.c"
+    dasm_put(Dst, 0, fn->dasm_end_of_function_label);
+#line 2650 "../../src/codegen.in.c"
   }
 }
 
@@ -13336,7 +20998,10 @@ typedef struct RuntimeFunction {
   unsigned long UnwindData;
 } RuntimeFunction;
 
-static void create_and_register_exception_function_table(Obj* prog, char* base_addr) {
+static void emit_symbols_and_exception_function_table(Obj* prog,
+                                                      char* base_addr,
+                                                      int pdata_start_offset,
+                                                      int pdata_end_offset) {
   int func_count = 0;
   for (Obj* fn = prog; fn; fn = fn->next) {
     if (!fn->is_function || !fn->is_definition || !fn->is_live)
@@ -13350,7 +21015,6 @@ static void create_and_register_exception_function_table(Obj* prog, char* base_a
   unregister_and_free_function_table_data(user_context);
   char* function_table_data = malloc(alloc_size);
   user_context->function_table_data = function_table_data;
-
   char* pfuncs = function_table_data;
 
   for (Obj* fn = prog; fn; fn = fn->next) {
@@ -13363,6 +21027,33 @@ static void create_and_register_exception_function_table(Obj* prog, char* base_a
     rf->EndAddress = dasm_getpclabel(&C(dynasm), fn->dasm_end_of_function_label);
     rf->UnwindData = dasm_getpclabel(&C(dynasm), fn->dasm_unwind_info_label);
     pfuncs += sizeof(RuntimeFunction);
+
+    if (user_context->generate_debug_symbols) {
+      DbpFunctionSymbol* dbp_func_sym =
+          dbp_add_function_symbol(user_context->dbp_ctx, fn->name, fn->ty->name->filename,
+                                  dasm_getpclabel(&C(dynasm), fn->dasm_entry_label),
+                                  dasm_getpclabel(&C(dynasm), fn->dasm_end_of_function_label));
+      for (int i = 0; i < fn->file_line_label_data.len; ++i) {
+        // TODO: ignoring file index, might not be needed unless something got
+        // inlined (which doesn't happen). Maybe there's a macro case that could
+        // cause it already though?
+        int offset = dasm_getpclabel(&C(dynasm), fn->file_line_label_data.data[i].c);
+        dbp_add_line_mapping(user_context->dbp_ctx, dbp_func_sym, offset,
+                             fn->file_line_label_data.data[i].b);
+      }
+    }
+  }
+
+  if (user_context->generate_debug_symbols) {
+    char* unwind_base = base_addr + pdata_start_offset;
+    size_t unwind_len = pdata_end_offset - pdata_start_offset;
+    DbpExceptionTables exception_tables = {
+        .pdata = (DbpRUNTIME_FUNCTION*)user_context->function_table_data,
+        .num_pdata_entries = func_count,
+        .unwind_info = (unsigned char*)unwind_base,
+        .unwind_info_byte_length = unwind_len,
+    };
+    dbp_ready_to_execute(user_context->dbp_ctx, &exception_tables);
   }
 
   register_function_table_data(user_context, func_count, base_addr);
@@ -13370,9 +21061,14 @@ static void create_and_register_exception_function_table(Obj* prog, char* base_a
 
 #else  // !X64WIN
 
-static void create_and_register_exception_function_table(Obj* prog, char* base_addr) {
+static void emit_symbols_and_exception_function_table(Obj* prog,
+                                                      char* base_addr,
+                                                      int pdata_start_offset,
+                                                      int pdata_end_offset) {
   (void)prog;
   (void)base_addr;
+  (void)pdata_start_offset;
+  (void)pdata_end_offset;
 }
 
 #endif
@@ -13392,8 +21088,27 @@ static void codegen(Obj* prog, size_t file_index) {
 
   dasm_setup(&C(dynasm), dynasm_actions);
 
+  //| .pdata
+  dasm_put(Dst, 1553);
+#line 2791 "../../src/codegen.in.c"
+  int start_of_pdata = codegen_pclabel();
+  //|.align 4
+  //|=>start_of_pdata:
+  //| .code
+  dasm_put(Dst, 1706, start_of_pdata);
+#line 2795 "../../src/codegen.in.c"
+
   assign_lvar_offsets(prog);
   emit_text(prog);
+
+  //| .pdata
+  dasm_put(Dst, 1553);
+#line 2800 "../../src/codegen.in.c"
+  int end_of_pdata = codegen_pclabel();
+  //|=>end_of_pdata:
+  //| .code
+  dasm_put(Dst, 1708, end_of_pdata);
+#line 2803 "../../src/codegen.in.c"
 
   size_t code_size;
   dasm_link(&C(dynasm), &code_size);
@@ -13408,7 +21123,16 @@ static void codegen(Obj* prog, size_t file_index) {
   unsigned int page_sized = (unsigned int)align_to_u(code_size, get_page_size());
 
   fld->codeseg_size = page_sized;
+#if X64WIN
+  if (user_context->generate_debug_symbols) {
+    user_context->dbp_ctx = dbp_create(fld->codeseg_size, get_temp_pdb_filename(AL_Compile));
+    fld->codeseg_base_address = dbp_get_image_base(user_context->dbp_ctx);
+  } else {
+    fld->codeseg_base_address = allocate_writable_memory(page_sized);
+  }
+#else
   fld->codeseg_base_address = allocate_writable_memory(page_sized);
+#endif
   // outaf("code_size: %zu, page_sized: %zu\n", code_size, page_sized);
 
   fill_out_text_exports(prog, fld->codeseg_base_address);
@@ -13419,13 +21143,22 @@ static void codegen(Obj* prog, size_t file_index) {
 
   dasm_encode(&C(dynasm), fld->codeseg_base_address);
 
+#if 0
+  FILE* f = fopen("code.raw", "wb");
+  fwrite(fld->codeseg_base_address, code_size, 1, f);
+  fclose(f);
+  system("ndisasm -b64 code.raw");
+#endif
+
   int check_result = dasm_checkstep(&C(dynasm), 0);
   if (check_result != DASM_S_OK) {
     outaf("check_result: 0x%08x\n", check_result);
     ABORT("dasm_checkstep failed");
   }
 
-  create_and_register_exception_function_table(prog, fld->codeseg_base_address);
+  emit_symbols_and_exception_function_table(prog, fld->codeseg_base_address,
+                                            dasm_getpclabel(&C(dynasm), start_of_pdata),
+                                            dasm_getpclabel(&C(dynasm), end_of_pdata));
 
   codegen_free();
 }
@@ -13468,40 +21201,41 @@ static void codegen_free(void) {
 #pragma warning(pop)
 #endif
 
+
 //| .arch x64
 #if DASM_VERSION != 10500
 #error "Version mismatch between DynASM and included encoding engine"
 #endif
-#line 19 "../../src/codegen.in.c"
+#line 21 "../../src/codegen.in.c"
 //| .section code, pdata
 #define DASM_SECTION_CODE	0
 #define DASM_SECTION_PDATA	1
 #define DASM_MAXSECTION		2
-#line 20 "../../src/codegen.in.c"
+#line 22 "../../src/codegen.in.c"
 //| .actionlist dynasm_actions
-static const unsigned char dynasm_actions[1705] = {
-  80,255,64,88,240,42,255,72,131,252,236,8,252,242,15,17,4,36,255,252,242,64,
-  15,16,4,240,140,36,72,131,196,8,255,252,243,15,16,0,255,252,242,15,16,0,255,
-  219,40,255,15,182,0,255,15,190,0,255,15,183,0,255,15,191,0,255,72,99,0,255,
-  72,139,0,255,68,138,128,233,68,136,135,233,255,252,243,15,17,7,255,252,242,
-  15,17,7,255,219,63,255,136,7,255,102,137,7,255,72,137,7,255,72,139,133,233,
-  255,72,141,133,233,255,72,141,5,245,255,249,72,184,237,237,255,72,129,192,
-  239,255,15,87,201,15,46,193,255,102,15,87,201,102,15,46,193,255,217,252,238,
-  223,232,221,216,255,131,252,248,0,255,72,131,252,248,0,255,15,190,192,255,
-  15,182,192,255,15,191,192,255,15,183,192,255,252,243,15,42,192,255,72,99,
-  192,255,252,242,15,42,192,255,137,68,36,252,252,219,68,36,252,252,255,137,
-  192,252,243,72,15,42,192,255,137,192,255,137,192,252,242,72,15,42,192,255,
-  137,192,72,137,68,36,252,248,223,108,36,252,248,255,72,133,192,15,136,244,
-  247,102,15,252,239,192,252,242,72,15,42,192,252,233,244,248,248,1,72,137,
-  199,131,224,1,102,15,252,239,192,72,209,252,239,72,9,199,252,242,72,15,42,
-  199,252,242,15,88,192,248,2,255,72,137,68,36,252,248,223,108,36,252,248,72,
-  133,192,15,137,244,247,184,0,0,128,95,137,68,36,252,252,216,68,36,252,252,
-  248,1,255,252,243,15,44,192,15,190,192,255,252,243,15,44,192,15,182,192,255,
-  252,243,15,44,192,15,191,192,255,252,243,15,44,192,15,183,192,255,252,243,
-  15,44,192,255,252,243,72,15,44,192,255,252,243,15,90,192,255,252,243,15,17,
-  68,36,252,252,217,68,36,252,252,255,252,242,15,44,192,15,190,192,255,252,
-  242,15,44,192,15,182,192,255,252,242,15,44,192,15,191,192,255,252,242,15,
-  44,192,15,183,192,255,252,242,15,44,192,255,252,242,72,15,44,192,255,252,
+static const unsigned char dynasm_actions[1720] = {
+  249,255,80,255,64,88,240,42,255,72,131,252,236,8,252,242,15,17,4,36,255,252,
+  242,64,15,16,4,240,140,36,72,131,196,8,255,252,243,15,16,0,255,252,242,15,
+  16,0,255,219,40,255,15,182,0,255,15,190,0,255,15,183,0,255,15,191,0,255,72,
+  99,0,255,72,139,0,255,68,138,128,233,68,136,135,233,255,252,243,15,17,7,255,
+  252,242,15,17,7,255,219,63,255,136,7,255,102,137,7,255,72,137,7,255,72,139,
+  133,233,255,72,141,133,233,255,72,141,5,245,255,249,72,184,237,237,255,72,
+  129,192,239,255,15,87,201,15,46,193,255,102,15,87,201,102,15,46,193,255,217,
+  252,238,223,232,221,216,255,131,252,248,0,255,72,131,252,248,0,255,15,190,
+  192,255,15,182,192,255,15,191,192,255,15,183,192,255,252,243,15,42,192,255,
+  72,99,192,255,252,242,15,42,192,255,137,68,36,252,252,219,68,36,252,252,255,
+  137,192,252,243,72,15,42,192,255,137,192,255,137,192,252,242,72,15,42,192,
+  255,137,192,72,137,68,36,252,248,223,108,36,252,248,255,72,133,192,15,136,
+  244,247,102,15,252,239,192,252,242,72,15,42,192,252,233,244,248,248,1,72,
+  137,199,131,224,1,102,15,252,239,192,72,209,252,239,72,9,199,252,242,72,15,
+  42,199,252,242,15,88,192,248,2,255,72,137,68,36,252,248,223,108,36,252,248,
+  72,133,192,15,137,244,247,184,0,0,128,95,137,68,36,252,252,216,68,36,252,
+  252,248,1,255,252,243,15,44,192,15,190,192,255,252,243,15,44,192,15,182,192,
+  255,252,243,15,44,192,15,191,192,255,252,243,15,44,192,15,183,192,255,252,
+  243,15,44,192,255,252,243,72,15,44,192,255,252,243,15,90,192,255,252,243,
+  15,17,68,36,252,252,217,68,36,252,252,255,252,242,15,44,192,15,190,192,255,
+  252,242,15,44,192,15,182,192,255,252,242,15,44,192,15,191,192,255,252,242,
+  15,44,192,15,183,192,255,252,242,15,44,192,255,252,242,72,15,44,192,255,252,
   242,15,90,192,255,252,242,15,17,68,36,252,248,221,68,36,252,248,255,217,124,
   36,252,246,15,183,68,36,252,246,128,204,12,102,137,68,36,252,244,217,108,
   36,252,244,255,219,92,36,232,217,108,36,252,246,15,191,68,36,232,255,219,
@@ -13528,50 +21262,50 @@ static const unsigned char dynasm_actions[1705] = {
   255,72,199,192,1,0,0,0,72,193,224,31,102,72,15,110,200,15,87,193,255,72,199,
   192,1,0,0,0,72,193,224,63,102,72,15,110,200,102,15,87,193,255,217,224,255,
   72,252,247,216,255,72,193,224,235,255,72,193,232,235,255,72,193,252,248,235,
-  255,73,137,192,255,72,137,199,72,129,231,239,72,193,231,235,255,72,139,4,
-  36,255,73,199,193,237,76,33,200,72,9,252,248,255,76,137,192,255,87,255,72,
-  199,193,237,72,141,189,233,176,0,252,243,170,255,95,255,15,132,245,255,252,
-  233,245,249,255,15,148,208,72,15,182,192,255,72,252,247,208,255,15,132,245,
-  72,199,192,1,0,0,0,252,233,245,249,72,199,192,0,0,0,0,249,255,15,133,245,
-  255,15,133,245,72,199,192,0,0,0,0,252,233,245,249,72,199,192,1,0,0,0,249,
-  255,72,131,192,8,255,102,72,15,126,192,240,132,240,36,255,72,129,252,236,
-  239,73,137,194,65,252,255,210,72,129,196,239,255,65,91,255,72,137,133,233,
-  72,141,133,233,255,73,137,194,72,199,192,237,65,252,255,210,72,129,196,239,
-  255,252,240,15,176,23,255,102,252,240,15,177,23,255,252,240,72,15,177,23,
-  255,15,148,209,15,132,244,247,255,65,136,0,255,102,65,137,0,255,73,137,0,
-  255,248,1,15,182,193,255,134,7,255,102,135,7,255,72,135,7,255,252,243,15,
-  88,193,255,252,242,15,88,193,255,252,243,15,92,193,255,252,242,15,92,193,
-  255,252,243,15,89,193,255,252,242,15,89,193,255,252,243,15,94,193,255,252,
-  242,15,94,193,255,15,46,200,255,102,15,46,200,255,15,148,208,15,155,210,32,
-  208,255,15,149,208,15,154,210,8,208,255,15,151,208,255,15,147,208,255,36,
-  1,72,15,182,192,255,222,193,255,222,225,255,222,201,255,222,252,241,255,223,
-  252,241,221,216,255,15,148,208,255,15,149,208,255,72,1,252,248,255,72,41,
-  252,248,255,72,15,175,199,255,72,199,194,0,0,0,0,72,252,247,252,247,255,186,
-  0,0,0,0,252,247,252,247,255,72,153,255,72,252,247,252,255,255,72,137,208,
-  255,72,33,252,248,255,72,49,252,248,255,72,57,252,248,255,15,146,208,255,
-  15,156,208,255,15,150,208,255,15,158,208,255,72,137,252,249,255,72,211,224,
-  255,72,211,232,255,72,211,252,248,255,15,133,245,249,255,72,129,252,248,239,
-  255,72,137,199,72,129,252,239,239,72,129,252,255,239,255,137,199,129,252,
-  239,239,129,252,255,239,255,15,134,245,255,252,233,245,255,252,255,224,255,
-  64,136,133,253,240,131,233,255,102,64,137,133,253,240,139,233,255,72,137,
-  133,253,240,131,233,255,254,0,85,72,137,229,255,249,73,186,237,237,255,65,
-  252,255,210,72,41,196,255,254,1,250,3,249,235,255,235,235,255,235,236,255,
-  235,235,235,235,255,72,137,165,233,255,199,133,233,237,199,133,233,237,72,
-  137,173,233,72,131,133,233,16,72,137,173,233,72,129,133,233,239,255,72,137,
-  189,233,72,137,181,233,72,137,149,233,72,137,141,233,76,137,133,233,76,137,
-  141,233,252,242,15,17,133,233,252,242,15,17,141,233,252,242,15,17,149,233,
-  252,242,15,17,157,233,252,242,15,17,165,233,252,242,15,17,173,233,252,242,
-  15,17,181,233,252,242,15,17,189,233,255,72,137,189,233,72,137,181,233,72,
-  137,149,233,72,137,141,233,255,72,141,101,0,255,72,137,252,236,255,93,195,
-  255
+  255,72,199,192,237,137,133,233,255,73,137,192,255,72,137,199,72,129,231,239,
+  72,193,231,235,255,72,139,4,36,255,73,199,193,237,76,33,200,72,9,252,248,
+  255,76,137,192,255,87,255,72,199,193,237,72,141,189,233,176,0,252,243,170,
+  255,95,255,15,132,245,255,252,233,245,249,255,15,148,208,72,15,182,192,255,
+  72,252,247,208,255,15,132,245,72,199,192,1,0,0,0,252,233,245,249,72,199,192,
+  0,0,0,0,249,255,15,133,245,255,15,133,245,72,199,192,0,0,0,0,252,233,245,
+  249,72,199,192,1,0,0,0,249,255,72,131,192,8,255,102,72,15,126,192,240,132,
+  240,36,255,72,129,252,236,239,73,137,194,65,252,255,210,72,129,196,239,255,
+  65,91,255,72,137,133,233,72,141,133,233,255,73,137,194,72,199,192,237,65,
+  252,255,210,72,129,196,239,255,252,240,15,176,23,255,102,252,240,15,177,23,
+  255,252,240,72,15,177,23,255,15,148,209,15,132,244,247,255,65,136,0,255,102,
+  65,137,0,255,73,137,0,255,248,1,15,182,193,255,134,7,255,102,135,7,255,72,
+  135,7,255,252,243,15,88,193,255,252,242,15,88,193,255,252,243,15,92,193,255,
+  252,242,15,92,193,255,252,243,15,89,193,255,252,242,15,89,193,255,252,243,
+  15,94,193,255,252,242,15,94,193,255,15,46,200,255,102,15,46,200,255,15,148,
+  208,15,155,210,32,208,255,15,149,208,15,154,210,8,208,255,15,151,208,255,
+  15,147,208,255,36,1,72,15,182,192,255,222,193,255,222,225,255,222,201,255,
+  222,252,241,255,223,252,241,221,216,255,15,148,208,255,15,149,208,255,72,
+  1,252,248,255,72,41,252,248,255,72,15,175,199,255,72,199,194,0,0,0,0,72,252,
+  247,252,247,255,186,0,0,0,0,252,247,252,247,255,72,153,255,72,252,247,252,
+  255,255,72,137,208,255,72,33,252,248,255,72,49,252,248,255,72,57,252,248,
+  255,15,146,208,255,15,156,208,255,15,150,208,255,15,158,208,255,72,137,252,
+  249,255,72,211,224,255,72,211,232,255,72,211,252,248,255,15,133,245,249,255,
+  72,129,252,248,239,255,72,137,199,72,129,252,239,239,72,129,252,255,239,255,
+  137,199,129,252,239,239,129,252,255,239,255,15,134,245,255,252,233,245,255,
+  252,255,224,255,64,136,133,253,240,131,233,255,102,64,137,133,253,240,139,
+  233,255,72,137,133,253,240,131,233,255,254,0,85,72,137,229,255,249,73,186,
+  237,237,255,65,252,255,210,72,41,196,255,254,1,250,3,249,235,255,235,235,
+  255,235,236,255,235,235,235,235,255,72,137,165,233,255,199,133,233,237,199,
+  133,233,237,72,137,173,233,72,131,133,233,16,72,137,173,233,72,129,133,233,
+  239,255,72,137,189,233,72,137,181,233,72,137,149,233,72,137,141,233,76,137,
+  133,233,76,137,141,233,252,242,15,17,133,233,252,242,15,17,141,233,252,242,
+  15,17,149,233,252,242,15,17,157,233,252,242,15,17,165,233,252,242,15,17,173,
+  233,252,242,15,17,181,233,252,242,15,17,189,233,255,72,137,189,233,72,137,
+  181,233,72,137,149,233,72,137,141,233,255,72,141,101,0,255,72,137,252,236,
+  255,93,195,255,250,3,249,254,0
 };
 
-#line 21 "../../src/codegen.in.c"
+#line 23 "../../src/codegen.in.c"
 //| .globals dynasm_globals
 enum {
   dynasm_globals_MAX
 };
-#line 22 "../../src/codegen.in.c"
+#line 24 "../../src/codegen.in.c"
 //| .if WIN
 //| .define X64WIN, 1
 //| .endif
@@ -13622,6 +21356,26 @@ static int dasmargreg[] = {REG_DI, REG_SI, REG_DX, REG_CX, REG_R8, REG_R9};
 static void gen_expr(Node* node);
 static void gen_stmt(Node* node);
 
+#if X64WIN
+static void record_line_syminfo(int file_no, int line_no, int pclabel) {
+  // If file and line haven't changed, then we're working through parts of a
+  // single statement; just ignore.
+  int cur_len = C(current_fn)->file_line_label_data.len;
+  if (cur_len > 0 && C(current_fn)->file_line_label_data.data[cur_len - 1].a == file_no &&
+      C(current_fn)->file_line_label_data.data[cur_len - 1].b == line_no) {
+    return;
+  }
+
+  //|=>pclabel:
+  dasm_put(Dst, 0, pclabel);
+#line 85 "../../src/codegen.in.c"
+  intintintarray_push(&C(current_fn)->file_line_label_data, (IntIntInt){file_no, line_no, pclabel},
+                      AL_Compile);
+  // printf("%s:%d:label %d\n", compiler_state.tokenize__all_tokenized_files.data[file_no]->name,
+  // line_no, pclabel);
+}
+#endif
+
 static int codegen_pclabel(void) {
   int ret = C(numlabels);
   dasm_growpc(&C(dynasm), ++C(numlabels));
@@ -13630,31 +21384,31 @@ static int codegen_pclabel(void) {
 
 static void push(void) {
   //| push rax
-  dasm_put(Dst, 0);
-#line 80 "../../src/codegen.in.c"
+  dasm_put(Dst, 2);
+#line 100 "../../src/codegen.in.c"
   C(depth)++;
 }
 
 static void pop(int dasmreg) {
   //| pop Rq(dasmreg)
-  dasm_put(Dst, 2, (dasmreg));
-#line 85 "../../src/codegen.in.c"
+  dasm_put(Dst, 4, (dasmreg));
+#line 105 "../../src/codegen.in.c"
   C(depth)--;
 }
 
 static void pushf(void) {
   //| sub rsp, 8
   //| movsd qword [rsp], xmm0
-  dasm_put(Dst, 7);
-#line 91 "../../src/codegen.in.c"
+  dasm_put(Dst, 9);
+#line 111 "../../src/codegen.in.c"
   C(depth)++;
 }
 
 static void popf(int reg) {
   //| movsd xmm(reg), qword [rsp]
   //| add rsp, 8
-  dasm_put(Dst, 19, (reg));
-#line 97 "../../src/codegen.in.c"
+  dasm_put(Dst, 21, (reg));
+#line 117 "../../src/codegen.in.c"
   C(depth)--;
 }
 
@@ -13675,19 +21429,19 @@ static void load(Type* ty) {
       return;
     case TY_FLOAT:
       //| movss xmm0, dword [rax]
-      dasm_put(Dst, 33);
-#line 117 "../../src/codegen.in.c"
+      dasm_put(Dst, 35);
+#line 137 "../../src/codegen.in.c"
       return;
     case TY_DOUBLE:
       //| movsd xmm0, qword [rax]
-      dasm_put(Dst, 39);
-#line 120 "../../src/codegen.in.c"
+      dasm_put(Dst, 41);
+#line 140 "../../src/codegen.in.c"
       return;
 #if !X64WIN
     case TY_LDOUBLE:
       //| fld tword [rax]
-      dasm_put(Dst, 45);
-#line 124 "../../src/codegen.in.c"
+      dasm_put(Dst, 47);
+#line 144 "../../src/codegen.in.c"
       return;
 #endif
   }
@@ -13700,31 +21454,31 @@ static void load(Type* ty) {
   if (ty->size == 1) {
     if (ty->is_unsigned) {
       //| movzx eax, byte [rax]
-      dasm_put(Dst, 48);
-#line 136 "../../src/codegen.in.c"
+      dasm_put(Dst, 50);
+#line 156 "../../src/codegen.in.c"
     } else {
       //| movsx eax, byte [rax]
-      dasm_put(Dst, 52);
-#line 138 "../../src/codegen.in.c"
+      dasm_put(Dst, 54);
+#line 158 "../../src/codegen.in.c"
     }
   } else if (ty->size == 2) {
     if (ty->is_unsigned) {
       //| movzx eax, word [rax]
-      dasm_put(Dst, 56);
-#line 142 "../../src/codegen.in.c"
+      dasm_put(Dst, 58);
+#line 162 "../../src/codegen.in.c"
     } else {
       //| movsx eax, word [rax]
-      dasm_put(Dst, 60);
-#line 144 "../../src/codegen.in.c"
+      dasm_put(Dst, 62);
+#line 164 "../../src/codegen.in.c"
     }
   } else if (ty->size == 4) {
     //| movsxd rax, dword [rax]
-    dasm_put(Dst, 64);
-#line 147 "../../src/codegen.in.c"
+    dasm_put(Dst, 66);
+#line 167 "../../src/codegen.in.c"
   } else {
     //| mov rax, qword [rax]
-    dasm_put(Dst, 68);
-#line 149 "../../src/codegen.in.c"
+    dasm_put(Dst, 70);
+#line 169 "../../src/codegen.in.c"
   }
 }
 
@@ -13738,45 +21492,45 @@ static void store(Type* ty) {
       for (int i = 0; i < ty->size; i++) {
         //| mov r8b, [rax+i]
         //| mov [RUTIL+i], r8b
-        dasm_put(Dst, 72, i, i);
-#line 162 "../../src/codegen.in.c"
+        dasm_put(Dst, 74, i, i);
+#line 182 "../../src/codegen.in.c"
       }
       return;
     case TY_FLOAT:
       //| movss dword [RUTIL], xmm0
-      dasm_put(Dst, 81);
-#line 166 "../../src/codegen.in.c"
+      dasm_put(Dst, 83);
+#line 186 "../../src/codegen.in.c"
       return;
     case TY_DOUBLE:
       //| movsd qword [RUTIL], xmm0
-      dasm_put(Dst, 87);
-#line 169 "../../src/codegen.in.c"
+      dasm_put(Dst, 89);
+#line 189 "../../src/codegen.in.c"
       return;
 #if !X64WIN
     case TY_LDOUBLE:
       //| fstp tword [RUTIL]
-      dasm_put(Dst, 93);
-#line 173 "../../src/codegen.in.c"
+      dasm_put(Dst, 95);
+#line 193 "../../src/codegen.in.c"
       return;
 #endif
   }
 
   if (ty->size == 1) {
     //| mov [RUTIL], al
-    dasm_put(Dst, 96);
-#line 179 "../../src/codegen.in.c"
+    dasm_put(Dst, 98);
+#line 199 "../../src/codegen.in.c"
   } else if (ty->size == 2) {
     //| mov [RUTIL], ax
-    dasm_put(Dst, 99);
-#line 181 "../../src/codegen.in.c"
+    dasm_put(Dst, 101);
+#line 201 "../../src/codegen.in.c"
   } else if (ty->size == 4) {
     //| mov [RUTIL], eax
-    dasm_put(Dst, 100);
-#line 183 "../../src/codegen.in.c"
+    dasm_put(Dst, 102);
+#line 203 "../../src/codegen.in.c"
   } else {
     //| mov [RUTIL], rax
-    dasm_put(Dst, 103);
-#line 185 "../../src/codegen.in.c"
+    dasm_put(Dst, 105);
+#line 205 "../../src/codegen.in.c"
   }
 }
 
@@ -13788,16 +21542,16 @@ static void gen_addr(Node* node) {
       // Variable-length array, which is always local.
       if (node->var->ty->kind == TY_VLA) {
         //| mov rax, [rbp+node->var->offset]
-        dasm_put(Dst, 107, node->var->offset);
-#line 196 "../../src/codegen.in.c"
+        dasm_put(Dst, 109, node->var->offset);
+#line 216 "../../src/codegen.in.c"
         return;
       }
 
       // Local variable
       if (node->var->is_local) {
         //| lea rax, [rbp+node->var->offset]
-        dasm_put(Dst, 112, node->var->offset);
-#line 202 "../../src/codegen.in.c"
+        dasm_put(Dst, 114, node->var->offset);
+#line 222 "../../src/codegen.in.c"
         return;
       }
 
@@ -13813,8 +21567,8 @@ static void gen_addr(Node* node) {
       if (node->ty->kind == TY_FUNC) {
         if (node->var->is_definition) {
           //| lea rax, [=>node->var->dasm_entry_label]
-          dasm_put(Dst, 117, node->var->dasm_entry_label);
-#line 217 "../../src/codegen.in.c"
+          dasm_put(Dst, 119, node->var->dasm_entry_label);
+#line 237 "../../src/codegen.in.c"
         } else {
           int fixup_location = codegen_pclabel();
           strintarray_push(&C(fixups), (StringInt){node->var->name, fixup_location}, AL_Compile);
@@ -13824,8 +21578,8 @@ static void gen_addr(Node* node) {
 #endif
           //|=>fixup_location:
           //| mov64 rax, 0xc0dec0dec0dec0de
-          dasm_put(Dst, 122, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
-#line 226 "../../src/codegen.in.c"
+          dasm_put(Dst, 124, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
+#line 246 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -13842,8 +21596,8 @@ static void gen_addr(Node* node) {
 #endif
       //|=>fixup_location:
       //| mov64 rax, 0xda7ada7ada7ada7a
-      dasm_put(Dst, 122, fixup_location, (unsigned int)(0xda7ada7ada7ada7a), (unsigned int)((0xda7ada7ada7ada7a)>>32));
-#line 242 "../../src/codegen.in.c"
+      dasm_put(Dst, 124, fixup_location, (unsigned int)(0xda7ada7ada7ada7a), (unsigned int)((0xda7ada7ada7ada7a)>>32));
+#line 262 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -13860,13 +21614,13 @@ static void gen_addr(Node* node) {
 #if X64WIN
       if (node->lhs->kind == ND_VAR && node->lhs->var->is_param_passed_by_reference) {
         //| mov rax, [rax]
-        dasm_put(Dst, 68);
-#line 258 "../../src/codegen.in.c"
+        dasm_put(Dst, 70);
+#line 278 "../../src/codegen.in.c"
       }
 #endif
       //| add rax, node->member->offset
-      dasm_put(Dst, 128, node->member->offset);
-#line 261 "../../src/codegen.in.c"
+      dasm_put(Dst, 130, node->member->offset);
+#line 281 "../../src/codegen.in.c"
       return;
     case ND_FUNCALL:
       if (node->ret_buffer) {
@@ -13883,8 +21637,8 @@ static void gen_addr(Node* node) {
       break;
     case ND_VLA_PTR:
       //| lea rax, [rbp+node->var->offset]
-      dasm_put(Dst, 112, node->var->offset);
-#line 277 "../../src/codegen.in.c"
+      dasm_put(Dst, 114, node->var->offset);
+#line 297 "../../src/codegen.in.c"
       return;
   }
 
@@ -13896,34 +21650,34 @@ static void cmp_zero(Type* ty) {
     case TY_FLOAT:
       //| xorps xmm1, xmm1
       //| ucomiss xmm0, xmm1
-      dasm_put(Dst, 133);
-#line 288 "../../src/codegen.in.c"
+      dasm_put(Dst, 135);
+#line 308 "../../src/codegen.in.c"
       return;
     case TY_DOUBLE:
       //| xorpd xmm1, xmm1
       //| ucomisd xmm0, xmm1
-      dasm_put(Dst, 140);
-#line 292 "../../src/codegen.in.c"
+      dasm_put(Dst, 142);
+#line 312 "../../src/codegen.in.c"
       return;
 #if !X64WIN
     case TY_LDOUBLE:
       //| fldz
       //| fucomip st0
       //| fstp st0
-      dasm_put(Dst, 149);
-#line 298 "../../src/codegen.in.c"
+      dasm_put(Dst, 151);
+#line 318 "../../src/codegen.in.c"
       return;
 #endif
   }
 
   if (is_integer(ty) && ty->size <= 4) {
     //| cmp eax, 0
-    dasm_put(Dst, 157);
-#line 304 "../../src/codegen.in.c"
+    dasm_put(Dst, 159);
+#line 324 "../../src/codegen.in.c"
   } else {
     //| cmp rax, 0
-    dasm_put(Dst, 162);
-#line 306 "../../src/codegen.in.c"
+    dasm_put(Dst, 164);
+#line 326 "../../src/codegen.in.c"
   }
 }
 
@@ -13953,92 +21707,92 @@ static int get_type_id(Type* ty) {
 
 static void i32i8(void) {
   //| movsx eax, al
-  dasm_put(Dst, 168);
-#line 335 "../../src/codegen.in.c"
+  dasm_put(Dst, 170);
+#line 355 "../../src/codegen.in.c"
 }
 static void i32u8(void) {
   //| movzx eax, al
-  dasm_put(Dst, 172);
-#line 338 "../../src/codegen.in.c"
+  dasm_put(Dst, 174);
+#line 358 "../../src/codegen.in.c"
 }
 static void i32i16(void) {
   //| movsx eax, ax
-  dasm_put(Dst, 176);
-#line 341 "../../src/codegen.in.c"
+  dasm_put(Dst, 178);
+#line 361 "../../src/codegen.in.c"
 }
 static void i32u16(void) {
   //| movzx eax, ax
-  dasm_put(Dst, 180);
-#line 344 "../../src/codegen.in.c"
+  dasm_put(Dst, 182);
+#line 364 "../../src/codegen.in.c"
 }
 static void i32f32(void) {
   //| cvtsi2ss xmm0, eax
-  dasm_put(Dst, 184);
-#line 347 "../../src/codegen.in.c"
+  dasm_put(Dst, 186);
+#line 367 "../../src/codegen.in.c"
 }
 static void i32i64(void) {
   //| movsxd rax, eax
-  dasm_put(Dst, 190);
-#line 350 "../../src/codegen.in.c"
+  dasm_put(Dst, 192);
+#line 370 "../../src/codegen.in.c"
 }
 static void i32f64(void) {
   //| cvtsi2sd xmm0, eax
-  dasm_put(Dst, 194);
-#line 353 "../../src/codegen.in.c"
+  dasm_put(Dst, 196);
+#line 373 "../../src/codegen.in.c"
 }
 static void i32f80(void) {
   //| mov [rsp-4], eax
   //| fild dword [rsp-4]
-  dasm_put(Dst, 200);
-#line 357 "../../src/codegen.in.c"
+  dasm_put(Dst, 202);
+#line 377 "../../src/codegen.in.c"
 }
 
 static void u32f32(void) {
   //| mov eax, eax
   //| cvtsi2ss xmm0, rax
-  dasm_put(Dst, 211);
-#line 362 "../../src/codegen.in.c"
+  dasm_put(Dst, 213);
+#line 382 "../../src/codegen.in.c"
 }
 static void u32i64(void) {
   //| mov eax, eax
-  dasm_put(Dst, 220);
-#line 365 "../../src/codegen.in.c"
+  dasm_put(Dst, 222);
+#line 385 "../../src/codegen.in.c"
 }
 static void u32f64(void) {
   //| mov eax, eax
   //| cvtsi2sd xmm0, rax
-  dasm_put(Dst, 223);
-#line 369 "../../src/codegen.in.c"
+  dasm_put(Dst, 225);
+#line 389 "../../src/codegen.in.c"
 }
 static void u32f80(void) {
   //| mov eax, eax
   //| mov [rsp-8], rax
   //| fild qword [rsp-8]
-  dasm_put(Dst, 232);
-#line 374 "../../src/codegen.in.c"
+  dasm_put(Dst, 234);
+#line 394 "../../src/codegen.in.c"
 }
 
 static void i64f32(void) {
   //| cvtsi2ss xmm0, rax
-  dasm_put(Dst, 213);
-#line 378 "../../src/codegen.in.c"
+  dasm_put(Dst, 215);
+#line 398 "../../src/codegen.in.c"
 }
 static void i64f64(void) {
   //| cvtsi2sd xmm0, rax
-  dasm_put(Dst, 225);
-#line 381 "../../src/codegen.in.c"
+  dasm_put(Dst, 227);
+#line 401 "../../src/codegen.in.c"
 }
 static void i64f80(void) {
   //| mov [rsp-8], rax
   //| fild qword [rsp-8]
-  dasm_put(Dst, 234);
-#line 385 "../../src/codegen.in.c"
+  dasm_put(Dst, 236);
+#line 405 "../../src/codegen.in.c"
 }
 
 static void u64f32(void) {
   //| cvtsi2ss xmm0, rax
-  dasm_put(Dst, 213);
-#line 389 "../../src/codegen.in.c"
+  dasm_put(Dst, 215);
+#line 409 "../../src/codegen.in.c"
 }
 static void u64f64(void) {
   //| test rax,rax
@@ -14055,8 +21809,8 @@ static void u64f64(void) {
   //| cvtsi2sd xmm0,RUTIL
   //| addsd xmm0,xmm0
   //|2:
-  dasm_put(Dst, 246);
-#line 405 "../../src/codegen.in.c"
+  dasm_put(Dst, 248);
+#line 425 "../../src/codegen.in.c"
 }
 static void u64f80(void) {
   //| mov [rsp-8], rax
@@ -14067,120 +21821,120 @@ static void u64f80(void) {
   //| mov [rsp-4], eax
   //| fadd dword [rsp-4]
   //|1:
-  dasm_put(Dst, 302);
-#line 415 "../../src/codegen.in.c"
+  dasm_put(Dst, 304);
+#line 435 "../../src/codegen.in.c"
 }
 
 static void f32i8(void) {
   //| cvttss2si eax, xmm0
   //| movsx eax, al
-  dasm_put(Dst, 338);
-#line 420 "../../src/codegen.in.c"
+  dasm_put(Dst, 340);
+#line 440 "../../src/codegen.in.c"
 }
 static void f32u8(void) {
   //| cvttss2si eax, xmm0
   //| movzx eax, al
-  dasm_put(Dst, 347);
-#line 424 "../../src/codegen.in.c"
+  dasm_put(Dst, 349);
+#line 444 "../../src/codegen.in.c"
 }
 static void f32i16(void) {
   //| cvttss2si eax, xmm0
   //| movsx eax, ax
-  dasm_put(Dst, 356);
-#line 428 "../../src/codegen.in.c"
+  dasm_put(Dst, 358);
+#line 448 "../../src/codegen.in.c"
 }
 static void f32u16(void) {
   //| cvttss2si eax, xmm0
   //| movzx eax, ax
-  dasm_put(Dst, 365);
-#line 432 "../../src/codegen.in.c"
+  dasm_put(Dst, 367);
+#line 452 "../../src/codegen.in.c"
 }
 static void f32i32(void) {
   //| cvttss2si eax, xmm0
-  dasm_put(Dst, 374);
-#line 435 "../../src/codegen.in.c"
+  dasm_put(Dst, 376);
+#line 455 "../../src/codegen.in.c"
 }
 static void f32u32(void) {
   //| cvttss2si rax, xmm0
-  dasm_put(Dst, 380);
-#line 438 "../../src/codegen.in.c"
+  dasm_put(Dst, 382);
+#line 458 "../../src/codegen.in.c"
 }
 static void f32i64(void) {
   //| cvttss2si rax, xmm0
-  dasm_put(Dst, 380);
-#line 441 "../../src/codegen.in.c"
+  dasm_put(Dst, 382);
+#line 461 "../../src/codegen.in.c"
 }
 static void f32u64(void) {
   //| cvttss2si rax, xmm0
-  dasm_put(Dst, 380);
-#line 444 "../../src/codegen.in.c"
+  dasm_put(Dst, 382);
+#line 464 "../../src/codegen.in.c"
 }
 static void f32f64(void) {
   //| cvtss2sd xmm0, xmm0
-  dasm_put(Dst, 387);
-#line 447 "../../src/codegen.in.c"
+  dasm_put(Dst, 389);
+#line 467 "../../src/codegen.in.c"
 }
 static void f32f80(void) {
   //| movss dword [rsp-4], xmm0
   //| fld dword [rsp-4]
-  dasm_put(Dst, 393);
-#line 451 "../../src/codegen.in.c"
+  dasm_put(Dst, 395);
+#line 471 "../../src/codegen.in.c"
 }
 
 static void f64i8(void) {
   //| cvttsd2si eax, xmm0
   //| movsx eax, al
-  dasm_put(Dst, 407);
-#line 456 "../../src/codegen.in.c"
+  dasm_put(Dst, 409);
+#line 476 "../../src/codegen.in.c"
 }
 static void f64u8(void) {
   //| cvttsd2si eax, xmm0
   //| movzx eax, al
-  dasm_put(Dst, 416);
-#line 460 "../../src/codegen.in.c"
+  dasm_put(Dst, 418);
+#line 480 "../../src/codegen.in.c"
 }
 static void f64i16(void) {
   //| cvttsd2si eax, xmm0
   //| movsx eax, ax
-  dasm_put(Dst, 425);
-#line 464 "../../src/codegen.in.c"
+  dasm_put(Dst, 427);
+#line 484 "../../src/codegen.in.c"
 }
 static void f64u16(void) {
   //| cvttsd2si eax, xmm0
   //| movzx eax, ax
-  dasm_put(Dst, 434);
-#line 468 "../../src/codegen.in.c"
+  dasm_put(Dst, 436);
+#line 488 "../../src/codegen.in.c"
 }
 static void f64i32(void) {
   //| cvttsd2si eax, xmm0
-  dasm_put(Dst, 443);
-#line 471 "../../src/codegen.in.c"
+  dasm_put(Dst, 445);
+#line 491 "../../src/codegen.in.c"
 }
 static void f64u32(void) {
   //| cvttsd2si rax, xmm0
-  dasm_put(Dst, 449);
-#line 474 "../../src/codegen.in.c"
+  dasm_put(Dst, 451);
+#line 494 "../../src/codegen.in.c"
 }
 static void f64i64(void) {
   //| cvttsd2si rax, xmm0
-  dasm_put(Dst, 449);
-#line 477 "../../src/codegen.in.c"
+  dasm_put(Dst, 451);
+#line 497 "../../src/codegen.in.c"
 }
 static void f64u64(void) {
   //| cvttsd2si rax, xmm0
-  dasm_put(Dst, 449);
-#line 480 "../../src/codegen.in.c"
+  dasm_put(Dst, 451);
+#line 500 "../../src/codegen.in.c"
 }
 static void f64f32(void) {
   //| cvtsd2ss xmm0, xmm0
-  dasm_put(Dst, 456);
-#line 483 "../../src/codegen.in.c"
+  dasm_put(Dst, 458);
+#line 503 "../../src/codegen.in.c"
 }
 static void f64f80(void) {
   //| movsd qword [rsp-8], xmm0
   //| fld qword [rsp-8]
-  dasm_put(Dst, 462);
-#line 487 "../../src/codegen.in.c"
+  dasm_put(Dst, 464);
+#line 507 "../../src/codegen.in.c"
 }
 
 static void from_f80_1(void) {
@@ -14189,8 +21943,8 @@ static void from_f80_1(void) {
   //| or ah, 12
   //| mov [rsp-12], ax
   //| fldcw word [rsp-12]
-  dasm_put(Dst, 476);
-#line 495 "../../src/codegen.in.c"
+  dasm_put(Dst, 478);
+#line 515 "../../src/codegen.in.c"
 }
 
 #define FROM_F80_2 " [rsp-24]\n fldcw [rsp-10]\n "
@@ -14200,8 +21954,8 @@ static void f80i8(void) {
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| movsx eax, word [rsp-24]
-  dasm_put(Dst, 502);
-#line 504 "../../src/codegen.in.c"
+  dasm_put(Dst, 504);
+#line 524 "../../src/codegen.in.c"
 }
 static void f80u8(void) {
   from_f80_1();
@@ -14209,68 +21963,68 @@ static void f80u8(void) {
   //| fldcw word [rsp-10]
   //| movzx eax, word [rsp-24]
   //| and eax, 0xff
-  dasm_put(Dst, 517);
-#line 511 "../../src/codegen.in.c"
+  dasm_put(Dst, 519);
+#line 531 "../../src/codegen.in.c"
 }
 static void f80i16(void) {
   from_f80_1();
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| movsx eax, word [rsp-24]
-  dasm_put(Dst, 502);
-#line 517 "../../src/codegen.in.c"
+  dasm_put(Dst, 504);
+#line 537 "../../src/codegen.in.c"
 }
 static void f80u16(void) {
   from_f80_1();
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| movzx eax, word [rsp-24]
-  dasm_put(Dst, 538);
-#line 523 "../../src/codegen.in.c"
+  dasm_put(Dst, 540);
+#line 543 "../../src/codegen.in.c"
 }
 static void f80i32(void) {
   from_f80_1();
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| mov eax, [rsp-24]
-  dasm_put(Dst, 553);
-#line 529 "../../src/codegen.in.c"
+  dasm_put(Dst, 555);
+#line 549 "../../src/codegen.in.c"
 }
 static void f80u32(void) {
   from_f80_1();
   //| fistp dword [rsp-24]
   //| fldcw word [rsp-10]
   //| mov eax, [rsp-24]
-  dasm_put(Dst, 553);
-#line 535 "../../src/codegen.in.c"
+  dasm_put(Dst, 555);
+#line 555 "../../src/codegen.in.c"
 }
 static void f80i64(void) {
   from_f80_1();
   //| fistp qword [rsp-24]
   //| fldcw word [rsp-10]
   //| mov rax, [rsp-24]
-  dasm_put(Dst, 567);
-#line 541 "../../src/codegen.in.c"
+  dasm_put(Dst, 569);
+#line 561 "../../src/codegen.in.c"
 }
 static void f80u64(void) {
   from_f80_1();
   //| fistp qword [rsp-24]
   //| fldcw word [rsp-10]
   //| mov rax, [rsp-24]
-  dasm_put(Dst, 567);
-#line 547 "../../src/codegen.in.c"
+  dasm_put(Dst, 569);
+#line 567 "../../src/codegen.in.c"
 }
 static void f80f32(void) {
   //| fstp dword [rsp-8]
   //| movss xmm0, dword [rsp-8]
-  dasm_put(Dst, 582);
-#line 551 "../../src/codegen.in.c"
+  dasm_put(Dst, 584);
+#line 571 "../../src/codegen.in.c"
 }
 static void f80f64(void) {
   //| fstp qword [rsp-8]
   //| movsd xmm0, qword [rsp-8]
-  dasm_put(Dst, 596);
-#line 555 "../../src/codegen.in.c"
+  dasm_put(Dst, 598);
+#line 575 "../../src/codegen.in.c"
 }
 
 typedef void (*DynasmCastFunc)(void);
@@ -14307,8 +22061,8 @@ static void cg_cast(Type* from, Type* to) {
     cmp_zero(from);
     //| setne al
     //| movzx eax, al
-    dasm_put(Dst, 610);
-#line 591 "../../src/codegen.in.c"
+    dasm_put(Dst, 612);
+#line 611 "../../src/codegen.in.c"
     return;
   }
 
@@ -14364,15 +22118,15 @@ static bool has_flonum2(Type* ty) {
 static int push_struct(Type* ty) {
   int sz = (int)align_to_s(ty->size, 8);
   //| sub rsp, sz
-  dasm_put(Dst, 617, sz);
-#line 646 "../../src/codegen.in.c"
+  dasm_put(Dst, 619, sz);
+#line 666 "../../src/codegen.in.c"
   C(depth) += sz / 8;
 
   for (int i = 0; i < ty->size; i++) {
     //| mov r10b, [rax+i]
     //| mov [rsp+i], r10b
-    dasm_put(Dst, 623, i, i);
-#line 651 "../../src/codegen.in.c"
+    dasm_put(Dst, 625, i, i);
+#line 671 "../../src/codegen.in.c"
   }
 
   return sz;
@@ -14416,12 +22170,12 @@ static void push_args2_win(Node* args, bool first_pass) {
       if (!type_passed_in_register(args->ty)) {
         assert(args->pass_by_reference);
         //| lea rax, [r11-args->pass_by_reference]
-        dasm_put(Dst, 634, -args->pass_by_reference);
-#line 694 "../../src/codegen.in.c"
+        dasm_put(Dst, 636, -args->pass_by_reference);
+#line 714 "../../src/codegen.in.c"
       } else {
         //| mov rax, [rax]
-        dasm_put(Dst, 68);
-#line 696 "../../src/codegen.in.c"
+        dasm_put(Dst, 70);
+#line 716 "../../src/codegen.in.c"
       }
       push();
       break;
@@ -14497,8 +22251,8 @@ static int push_args_win(Node* node, int* by_ref_copies_size) {
     // Use r11 as a base pointer for by-reference copies of structs.
     //| push r11
     //| mov r11, rsp
-    dasm_put(Dst, 639);
-#line 771 "../../src/codegen.in.c"
+    dasm_put(Dst, 641);
+#line 791 "../../src/codegen.in.c"
   }
 
   // If the return type is a large struct/union, the caller passes
@@ -14548,8 +22302,8 @@ static int push_args_win(Node* node, int* by_ref_copies_size) {
 
   if ((C(depth) + stack + (*by_ref_copies_size / 8)) % 2 == 1) {
     //| sub rsp, 8
-    dasm_put(Dst, 645);
-#line 820 "../../src/codegen.in.c"
+    dasm_put(Dst, 647);
+#line 840 "../../src/codegen.in.c"
     C(depth)++;
     stack++;
   }
@@ -14561,8 +22315,8 @@ static int push_args_win(Node* node, int* by_ref_copies_size) {
   // a pointer to a buffer as if it were the first argument.
   if (node->ret_buffer && !type_passed_in_register(node->ty)) {
     //| lea rax, [rbp+node->ret_buffer->offset]
-    dasm_put(Dst, 112, node->ret_buffer->offset);
-#line 831 "../../src/codegen.in.c"
+    dasm_put(Dst, 114, node->ret_buffer->offset);
+#line 851 "../../src/codegen.in.c"
     push();
   }
 
@@ -14595,8 +22349,8 @@ static void push_args2_sysv(Node* args, bool first_pass) {
     case TY_LDOUBLE:
       //| sub rsp, 16
       //| fstp tword [rsp]
-      dasm_put(Dst, 651);
-#line 863 "../../src/codegen.in.c"
+      dasm_put(Dst, 653);
+#line 883 "../../src/codegen.in.c"
       C(depth) += 2;
       break;
     default:
@@ -14680,8 +22434,8 @@ static int push_args_sysv(Node* node) {
 
   if ((C(depth) + stack) % 2 == 1) {
     //| sub rsp, 8
-    dasm_put(Dst, 645);
-#line 946 "../../src/codegen.in.c"
+    dasm_put(Dst, 647);
+#line 966 "../../src/codegen.in.c"
     C(depth)++;
     stack++;
   }
@@ -14693,8 +22447,8 @@ static int push_args_sysv(Node* node) {
   // a pointer to a buffer as if it were the first argument.
   if (node->ret_buffer && node->ty->size > 16) {
     //| lea rax, [rbp+node->ret_buffer->offset]
-    dasm_put(Dst, 112, node->ret_buffer->offset);
-#line 957 "../../src/codegen.in.c"
+    dasm_put(Dst, 114, node->ret_buffer->offset);
+#line 977 "../../src/codegen.in.c"
     push();
   }
 
@@ -14709,20 +22463,20 @@ static void copy_ret_buffer(Obj* var) {
     assert(ty->size == 4 || 8 <= ty->size);
     if (ty->size == 4) {
       //| movss dword [rbp+var->offset], xmm0
-      dasm_put(Dst, 660, var->offset);
-#line 971 "../../src/codegen.in.c"
+      dasm_put(Dst, 662, var->offset);
+#line 991 "../../src/codegen.in.c"
     } else {
       //| movsd qword [rbp+var->offset], xmm0
-      dasm_put(Dst, 667, var->offset);
-#line 973 "../../src/codegen.in.c"
+      dasm_put(Dst, 669, var->offset);
+#line 993 "../../src/codegen.in.c"
     }
     fp++;
   } else {
     for (int i = 0; i < MIN(8, ty->size); i++) {
       //| mov [rbp+var->offset+i], al
       //| shr rax, 8
-      dasm_put(Dst, 674, var->offset+i);
-#line 979 "../../src/codegen.in.c"
+      dasm_put(Dst, 676, var->offset+i);
+#line 999 "../../src/codegen.in.c"
     }
     gp++;
   }
@@ -14732,19 +22486,19 @@ static void copy_ret_buffer(Obj* var) {
       assert(ty->size == 12 || ty->size == 16);
       if (ty->size == 12) {
         //| movss dword [rbp+var->offset+8], xmm(fp)
-        dasm_put(Dst, 682, (fp), var->offset+8);
-#line 988 "../../src/codegen.in.c"
+        dasm_put(Dst, 684, (fp), var->offset+8);
+#line 1008 "../../src/codegen.in.c"
       } else {
         //| movsd qword [rbp+var->offset+8], xmm(fp)
-        dasm_put(Dst, 693, (fp), var->offset+8);
-#line 990 "../../src/codegen.in.c"
+        dasm_put(Dst, 695, (fp), var->offset+8);
+#line 1010 "../../src/codegen.in.c"
       }
     } else {
       for (int i = 8; i < MIN(16, ty->size); i++) {
         //| mov [rbp+var->offset+i], Rb(gp)
         //| shr Rq(gp), 8
-        dasm_put(Dst, 704, (gp), var->offset+i, (gp));
-#line 995 "../../src/codegen.in.c"
+        dasm_put(Dst, 706, (gp), var->offset+i, (gp));
+#line 1015 "../../src/codegen.in.c"
       }
     }
   }
@@ -14756,38 +22510,38 @@ static void copy_struct_reg(void) {
 #if X64WIN
   // TODO: I'm not sure if this is right/sufficient.
   //| mov rax, [rax]
-  dasm_put(Dst, 68);
-#line 1006 "../../src/codegen.in.c"
+  dasm_put(Dst, 70);
+#line 1026 "../../src/codegen.in.c"
 #else
   Type* ty = C(current_fn)->ty->return_ty;
 
   int gp = 0, fp = 0;
 
   //| mov RUTIL, rax
-  dasm_put(Dst, 718);
-#line 1012 "../../src/codegen.in.c"
+  dasm_put(Dst, 720);
+#line 1032 "../../src/codegen.in.c"
 
   if (has_flonum(ty, 0, 8, 0)) {
     assert(ty->size == 4 || 8 <= ty->size);
     if (ty->size == 4) {
       //| movss xmm0, dword [RUTIL]
-      dasm_put(Dst, 722);
-#line 1017 "../../src/codegen.in.c"
+      dasm_put(Dst, 724);
+#line 1037 "../../src/codegen.in.c"
     } else {
       //| movsd xmm0, qword [RUTIL]
-      dasm_put(Dst, 728);
-#line 1019 "../../src/codegen.in.c"
+      dasm_put(Dst, 730);
+#line 1039 "../../src/codegen.in.c"
     }
     fp++;
   } else {
     //| mov rax, 0
-    dasm_put(Dst, 734);
-#line 1023 "../../src/codegen.in.c"
+    dasm_put(Dst, 736);
+#line 1043 "../../src/codegen.in.c"
     for (int i = MIN(8, ty->size) - 1; i >= 0; i--) {
       //| shl rax, 8
       //| mov ax, [RUTIL+i]
-      dasm_put(Dst, 742, i);
-#line 1026 "../../src/codegen.in.c"
+      dasm_put(Dst, 744, i);
+#line 1046 "../../src/codegen.in.c"
     }
     gp++;
   }
@@ -14797,22 +22551,22 @@ static void copy_struct_reg(void) {
       assert(ty->size == 12 || ty->size == 16);
       if (ty->size == 4) {
         //| movss xmm(fp), dword [RUTIL+8]
-        dasm_put(Dst, 751, (fp));
-#line 1035 "../../src/codegen.in.c"
+        dasm_put(Dst, 753, (fp));
+#line 1055 "../../src/codegen.in.c"
       } else {
         //| movsd xmm(fp), qword [RUTIL+8]
-        dasm_put(Dst, 761, (fp));
-#line 1037 "../../src/codegen.in.c"
+        dasm_put(Dst, 763, (fp));
+#line 1057 "../../src/codegen.in.c"
       }
     } else {
       //| mov Rq(gp), 0
-      dasm_put(Dst, 771, (gp));
-#line 1040 "../../src/codegen.in.c"
+      dasm_put(Dst, 773, (gp));
+#line 1060 "../../src/codegen.in.c"
       for (int i = MIN(16, ty->size) - 1; i >= 8; i--) {
         //| shl Rq(gp), 8
         //| mov Rb(gp), [RUTIL+i]
-        dasm_put(Dst, 781, (gp), (gp), i);
-#line 1043 "../../src/codegen.in.c"
+        dasm_put(Dst, 783, (gp), (gp), i);
+#line 1063 "../../src/codegen.in.c"
       }
     }
   }
@@ -14824,14 +22578,14 @@ static void copy_struct_mem(void) {
   Obj* var = C(current_fn)->params;
 
   //| mov RUTIL, [rbp+var->offset]
-  dasm_put(Dst, 795, var->offset);
-#line 1054 "../../src/codegen.in.c"
+  dasm_put(Dst, 797, var->offset);
+#line 1074 "../../src/codegen.in.c"
 
   for (int i = 0; i < ty->size; i++) {
     //| mov dl, [rax+i]
     //| mov [RUTIL+i], dl
-    dasm_put(Dst, 800, i, i);
-#line 1058 "../../src/codegen.in.c"
+    dasm_put(Dst, 802, i, i);
+#line 1078 "../../src/codegen.in.c"
   }
 }
 
@@ -14839,8 +22593,8 @@ static void builtin_alloca(void) {
   // Align size to 16 bytes.
   //| add CARG1, 15
   //| and CARG1d, 0xfffffff0
-  dasm_put(Dst, 807);
-#line 1065 "../../src/codegen.in.c"
+  dasm_put(Dst, 809);
+#line 1085 "../../src/codegen.in.c"
 
   // Shift the temporary area by CARG1.
   //| mov CARG4, [rbp+C(current_fn)->alloca_bottom->offset]
@@ -14858,15 +22612,15 @@ static void builtin_alloca(void) {
   //| dec CARG4
   //| jmp <1
   //|2:
-  dasm_put(Dst, 816, C(current_fn)->alloca_bottom->offset);
-#line 1082 "../../src/codegen.in.c"
+  dasm_put(Dst, 818, C(current_fn)->alloca_bottom->offset);
+#line 1102 "../../src/codegen.in.c"
 
   // Move alloca_bottom pointer.
   //| mov rax, [rbp+C(current_fn)->alloca_bottom->offset]
   //| sub rax, CARG1
   //| mov [rbp+C(current_fn)->alloca_bottom->offset], rax
-  dasm_put(Dst, 869, C(current_fn)->alloca_bottom->offset, C(current_fn)->alloca_bottom->offset);
-#line 1087 "../../src/codegen.in.c"
+  dasm_put(Dst, 871, C(current_fn)->alloca_bottom->offset, C(current_fn)->alloca_bottom->offset);
+#line 1107 "../../src/codegen.in.c"
 }
 
 // Generate code for a given node.
@@ -14883,8 +22637,8 @@ static void gen_expr(Node* node) {
           } u = {(float)node->fval};
           //| mov eax, u.u32
           //| movd xmm0, rax
-          dasm_put(Dst, 882, u.u32);
-#line 1103 "../../src/codegen.in.c"
+          dasm_put(Dst, 884, u.u32);
+#line 1123 "../../src/codegen.in.c"
           return;
         }
         case TY_DOUBLE: {
@@ -14894,8 +22648,8 @@ static void gen_expr(Node* node) {
           } u = {(double)node->fval};
           //| mov64 rax, u.u64
           //| movd xmm0, rax
-          dasm_put(Dst, 890, (unsigned int)(u.u64), (unsigned int)((u.u64)>>32));
-#line 1112 "../../src/codegen.in.c"
+          dasm_put(Dst, 892, (unsigned int)(u.u64), (unsigned int)((u.u64)>>32));
+#line 1132 "../../src/codegen.in.c"
           return;
         }
 #if !X64WIN
@@ -14911,8 +22665,8 @@ static void gen_expr(Node* node) {
           //| mov64 rax, u.u64[1]
           //| mov [rsp-8], rax
           //| fld tword [rsp-16]
-          dasm_put(Dst, 900, (unsigned int)(u.u64[0]), (unsigned int)((u.u64[0])>>32), (unsigned int)(u.u64[1]), (unsigned int)((u.u64[1])>>32));
-#line 1127 "../../src/codegen.in.c"
+          dasm_put(Dst, 902, (unsigned int)(u.u64[0]), (unsigned int)((u.u64[0])>>32), (unsigned int)(u.u64[1]), (unsigned int)((u.u64[1])>>32));
+#line 1147 "../../src/codegen.in.c"
           return;
         }
 #endif
@@ -14920,12 +22674,12 @@ static void gen_expr(Node* node) {
 
       if (node->val < INT_MIN || node->val > INT_MAX) {
         //| mov64 rax, node->val
-        dasm_put(Dst, 123, (unsigned int)(node->val), (unsigned int)((node->val)>>32));
-#line 1134 "../../src/codegen.in.c"
+        dasm_put(Dst, 125, (unsigned int)(node->val), (unsigned int)((node->val)>>32));
+#line 1154 "../../src/codegen.in.c"
       } else {
         //| mov rax, node->val
-        dasm_put(Dst, 926, node->val);
-#line 1136 "../../src/codegen.in.c"
+        dasm_put(Dst, 928, node->val);
+#line 1156 "../../src/codegen.in.c"
       }
       return;
     }
@@ -14938,29 +22692,29 @@ static void gen_expr(Node* node) {
           //| shl rax, 31
           //| movd xmm1, rax
           //| xorps xmm0, xmm1
-          dasm_put(Dst, 931);
-#line 1148 "../../src/codegen.in.c"
+          dasm_put(Dst, 933);
+#line 1168 "../../src/codegen.in.c"
           return;
         case TY_DOUBLE:
           //| mov rax, 1
           //| shl rax, 63
           //| movd xmm1, rax
           //| xorpd xmm0, xmm1
-          dasm_put(Dst, 951);
-#line 1154 "../../src/codegen.in.c"
+          dasm_put(Dst, 953);
+#line 1174 "../../src/codegen.in.c"
           return;
 #if !X64WIN
         case TY_LDOUBLE:
           //| fchs
-          dasm_put(Dst, 972);
-#line 1158 "../../src/codegen.in.c"
+          dasm_put(Dst, 974);
+#line 1178 "../../src/codegen.in.c"
           return;
 #endif
       }
 
       //| neg rax
-      dasm_put(Dst, 975);
-#line 1163 "../../src/codegen.in.c"
+      dasm_put(Dst, 977);
+#line 1183 "../../src/codegen.in.c"
       return;
     case ND_VAR:
       gen_addr(node);
@@ -14973,16 +22727,16 @@ static void gen_expr(Node* node) {
       Member* mem = node->member;
       if (mem->is_bitfield) {
         //| shl rax, 64 - mem->bit_width - mem->bit_offset
-        dasm_put(Dst, 980, 64 - mem->bit_width - mem->bit_offset);
-#line 1175 "../../src/codegen.in.c"
+        dasm_put(Dst, 982, 64 - mem->bit_width - mem->bit_offset);
+#line 1195 "../../src/codegen.in.c"
         if (mem->ty->is_unsigned) {
           //| shr rax, 64 - mem->bit_width
-          dasm_put(Dst, 985, 64 - mem->bit_width);
-#line 1177 "../../src/codegen.in.c"
+          dasm_put(Dst, 987, 64 - mem->bit_width);
+#line 1197 "../../src/codegen.in.c"
         } else {
           //| sar rax, 64 - mem->bit_width
-          dasm_put(Dst, 990, 64 - mem->bit_width);
-#line 1179 "../../src/codegen.in.c"
+          dasm_put(Dst, 992, 64 - mem->bit_width);
+#line 1199 "../../src/codegen.in.c"
         }
       }
       return;
@@ -14995,43 +22749,59 @@ static void gen_expr(Node* node) {
       gen_addr(node->lhs);
       return;
     case ND_ASSIGN:
-      gen_addr(node->lhs);
-      push();
-      gen_expr(node->rhs);
+      // Special case "int into a local". Normally this would compile to:
+      //   lea rax,[rbp+node->lhs->offset]
+      //   push rax
+      //   mov rax, node->rhs->val
+      //   pop rcx
+      //   mov [rcx], eax
+      if (node->lhs->kind == ND_VAR && node->lhs->var->is_local && node->rhs->kind == ND_NUM &&
+          node->rhs->ty->kind != TY_FLOAT && node->rhs->ty->kind != TY_DOUBLE &&
+          node->rhs->ty->kind != TY_LDOUBLE && node->rhs->val >= INT_MIN &&
+          node->rhs->val <= INT_MAX) {
+        //| mov rax, node->rhs->val
+        //| mov dword [rbp+node->lhs->var->offset], eax
+        dasm_put(Dst, 998, node->rhs->val, node->lhs->var->offset);
+#line 1223 "../../src/codegen.in.c"
+      } else {
+        gen_addr(node->lhs);
+        push();
+        gen_expr(node->rhs);
 
-      if (node->lhs->kind == ND_MEMBER && node->lhs->member->is_bitfield) {
-        //| mov r8, rax
-        dasm_put(Dst, 996);
-#line 1197 "../../src/codegen.in.c"
+        if (node->lhs->kind == ND_MEMBER && node->lhs->member->is_bitfield) {
+          //| mov r8, rax
+          dasm_put(Dst, 1006);
+#line 1230 "../../src/codegen.in.c"
 
-        // If the lhs is a bitfield, we need to read the current value
-        // from memory and merge it with a new value.
-        Member* mem = node->lhs->member;
-        //| mov RUTIL, rax
-        //| and RUTIL, (1L << mem->bit_width) - 1
-        //| shl RUTIL, mem->bit_offset
-        dasm_put(Dst, 1000, (1L << mem->bit_width) - 1, mem->bit_offset);
-#line 1204 "../../src/codegen.in.c"
+          // If the lhs is a bitfield, we need to read the current value
+          // from memory and merge it with a new value.
+          Member* mem = node->lhs->member;
+          //| mov RUTIL, rax
+          //| and RUTIL, (1L << mem->bit_width) - 1
+          //| shl RUTIL, mem->bit_offset
+          dasm_put(Dst, 1010, (1L << mem->bit_width) - 1, mem->bit_offset);
+#line 1237 "../../src/codegen.in.c"
 
-        //| mov rax, [rsp]
-        dasm_put(Dst, 1012);
-#line 1206 "../../src/codegen.in.c"
-        load(mem->ty);
+          //| mov rax, [rsp]
+          dasm_put(Dst, 1022);
+#line 1239 "../../src/codegen.in.c"
+          load(mem->ty);
 
-        long mask = ((1L << mem->bit_width) - 1) << mem->bit_offset;
-        //| mov r9, ~mask
-        //| and rax, r9
-        //| or rax, RUTIL
-        dasm_put(Dst, 1017, ~mask);
-#line 1212 "../../src/codegen.in.c"
+          long mask = ((1L << mem->bit_width) - 1) << mem->bit_offset;
+          //| mov r9, ~mask
+          //| and rax, r9
+          //| or rax, RUTIL
+          dasm_put(Dst, 1027, ~mask);
+#line 1245 "../../src/codegen.in.c"
+          store(node->ty);
+          //| mov rax, r8
+          dasm_put(Dst, 1039);
+#line 1247 "../../src/codegen.in.c"
+          return;
+        }
+
         store(node->ty);
-        //| mov rax, r8
-        dasm_put(Dst, 1029);
-#line 1214 "../../src/codegen.in.c"
-        return;
       }
-
-      store(node->ty);
       return;
     case ND_STMT_EXPR:
       for (Node* n = node->body; n; n = n->next)
@@ -15049,20 +22819,20 @@ static void gen_expr(Node* node) {
       // `rep stosb` is equivalent to `memset(rdi, al, rcx)`.
 #if X64WIN
       //| push rdi
-      dasm_put(Dst, 1033);
-#line 1235 "../../src/codegen.in.c"
+      dasm_put(Dst, 1043);
+#line 1269 "../../src/codegen.in.c"
 #endif
       //| mov rcx, node->var->ty->size
       //| lea rdi, [rbp+node->var->offset]
       //| mov al, 0
       //| rep
       //| stosb
-      dasm_put(Dst, 1035, node->var->ty->size, node->var->offset);
-#line 1241 "../../src/codegen.in.c"
+      dasm_put(Dst, 1045, node->var->ty->size, node->var->offset);
+#line 1275 "../../src/codegen.in.c"
 #if X64WIN
       //| pop rdi
-      dasm_put(Dst, 1049);
-#line 1243 "../../src/codegen.in.c"
+      dasm_put(Dst, 1059);
+#line 1277 "../../src/codegen.in.c"
 #endif
       return;
     case ND_COND: {
@@ -15071,17 +22841,17 @@ static void gen_expr(Node* node) {
       gen_expr(node->cond);
       cmp_zero(node->cond->ty);
       //| je =>lelse
-      dasm_put(Dst, 1051, lelse);
-#line 1251 "../../src/codegen.in.c"
+      dasm_put(Dst, 1061, lelse);
+#line 1285 "../../src/codegen.in.c"
       gen_expr(node->then);
       //| jmp =>lend
       //|=>lelse:
-      dasm_put(Dst, 1055, lend, lelse);
-#line 1254 "../../src/codegen.in.c"
+      dasm_put(Dst, 1065, lend, lelse);
+#line 1288 "../../src/codegen.in.c"
       gen_expr(node->els);
       //|=>lend:
-      dasm_put(Dst, 1058, lend);
-#line 1256 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, lend);
+#line 1290 "../../src/codegen.in.c"
       return;
     }
     case ND_NOT:
@@ -15089,14 +22859,14 @@ static void gen_expr(Node* node) {
       cmp_zero(node->lhs->ty);
       //| sete al
       //| movzx rax, al
-      dasm_put(Dst, 1060);
-#line 1263 "../../src/codegen.in.c"
+      dasm_put(Dst, 1070);
+#line 1297 "../../src/codegen.in.c"
       return;
     case ND_BITNOT:
       gen_expr(node->lhs);
       //| not rax
-      dasm_put(Dst, 1068);
-#line 1267 "../../src/codegen.in.c"
+      dasm_put(Dst, 1078);
+#line 1301 "../../src/codegen.in.c"
       return;
     case ND_LOGAND: {
       int lfalse = codegen_pclabel();
@@ -15104,8 +22874,8 @@ static void gen_expr(Node* node) {
       gen_expr(node->lhs);
       cmp_zero(node->lhs->ty);
       //| je =>lfalse
-      dasm_put(Dst, 1051, lfalse);
-#line 1274 "../../src/codegen.in.c"
+      dasm_put(Dst, 1061, lfalse);
+#line 1308 "../../src/codegen.in.c"
       gen_expr(node->rhs);
       cmp_zero(node->rhs->ty);
       //| je =>lfalse
@@ -15114,8 +22884,8 @@ static void gen_expr(Node* node) {
       //|=>lfalse:
       //| mov rax, 0
       //|=>lend:
-      dasm_put(Dst, 1073, lfalse, lend, lfalse, lend);
-#line 1282 "../../src/codegen.in.c"
+      dasm_put(Dst, 1083, lfalse, lend, lfalse, lend);
+#line 1316 "../../src/codegen.in.c"
       return;
     }
     case ND_LOGOR: {
@@ -15124,8 +22894,8 @@ static void gen_expr(Node* node) {
       gen_expr(node->lhs);
       cmp_zero(node->lhs->ty);
       //| jne =>ltrue
-      dasm_put(Dst, 1096, ltrue);
-#line 1290 "../../src/codegen.in.c"
+      dasm_put(Dst, 1106, ltrue);
+#line 1324 "../../src/codegen.in.c"
       gen_expr(node->rhs);
       cmp_zero(node->rhs->ty);
       //| jne =>ltrue
@@ -15134,16 +22904,16 @@ static void gen_expr(Node* node) {
       //|=>ltrue:
       //| mov rax, 1
       //|=>lend:
-      dasm_put(Dst, 1100, ltrue, lend, ltrue, lend);
-#line 1298 "../../src/codegen.in.c"
+      dasm_put(Dst, 1110, ltrue, lend, ltrue, lend);
+#line 1332 "../../src/codegen.in.c"
       return;
     }
     case ND_FUNCALL: {
       if (node->lhs->kind == ND_VAR && !strcmp(node->lhs->var->name, "alloca")) {
         gen_expr(node->args);
         //| mov CARG1, rax
-        dasm_put(Dst, 718);
-#line 1304 "../../src/codegen.in.c"
+        dasm_put(Dst, 720);
+#line 1338 "../../src/codegen.in.c"
         builtin_alloca();
         return;
       }
@@ -15159,14 +22929,14 @@ static void gen_expr(Node* node) {
         gen_addr(node->args->next);
         // RAX is now &x, move it to the next qword.
         //| add rax, 8
-        dasm_put(Dst, 1123);
-#line 1319 "../../src/codegen.in.c"
+        dasm_put(Dst, 1133);
+#line 1353 "../../src/codegen.in.c"
 
         // Store one-past the second argument into &ap.
         pop(REG_UTIL);
         //| mov [RUTIL], rax
-        dasm_put(Dst, 103);
-#line 1323 "../../src/codegen.in.c"
+        dasm_put(Dst, 105);
+#line 1357 "../../src/codegen.in.c"
         return;
       }
 #endif
@@ -15202,8 +22972,8 @@ static void gen_expr(Node* node) {
               popf(reg);
               // Varargs requires a copy of fp in gp.
               //| movd Rq(dasmargreg[reg]), xmm(reg)
-              dasm_put(Dst, 1128, (reg), (dasmargreg[reg]));
-#line 1358 "../../src/codegen.in.c"
+              dasm_put(Dst, 1138, (reg), (dasmargreg[reg]));
+#line 1392 "../../src/codegen.in.c"
               ++reg;
             }
             break;
@@ -15218,12 +22988,12 @@ static void gen_expr(Node* node) {
       //| mov r10, rax
       //| call r10
       //| add rsp, stack_args*8 + PARAMETER_SAVE_SIZE + by_ref_copies_size
-      dasm_put(Dst, 1138, PARAMETER_SAVE_SIZE, stack_args*8 + PARAMETER_SAVE_SIZE + by_ref_copies_size);
-#line 1372 "../../src/codegen.in.c"
+      dasm_put(Dst, 1148, PARAMETER_SAVE_SIZE, stack_args*8 + PARAMETER_SAVE_SIZE + by_ref_copies_size);
+#line 1406 "../../src/codegen.in.c"
       if (by_ref_copies_size > 0) {
         //| pop r11
-        dasm_put(Dst, 1155);
-#line 1374 "../../src/codegen.in.c"
+        dasm_put(Dst, 1165);
+#line 1408 "../../src/codegen.in.c"
       }
 
       C(depth) -= by_ref_copies_size / 8;
@@ -15235,29 +23005,29 @@ static void gen_expr(Node* node) {
       switch (node->ty->kind) {
         case TY_BOOL:
           //| movzx eax, al
-          dasm_put(Dst, 172);
-#line 1385 "../../src/codegen.in.c"
+          dasm_put(Dst, 174);
+#line 1419 "../../src/codegen.in.c"
           return;
         case TY_CHAR:
           if (node->ty->is_unsigned) {
             //| movzx eax, al
-            dasm_put(Dst, 172);
-#line 1389 "../../src/codegen.in.c"
+            dasm_put(Dst, 174);
+#line 1423 "../../src/codegen.in.c"
           } else {
             //| movsx eax, al
-            dasm_put(Dst, 168);
-#line 1391 "../../src/codegen.in.c"
+            dasm_put(Dst, 170);
+#line 1425 "../../src/codegen.in.c"
           }
           return;
         case TY_SHORT:
           if (node->ty->is_unsigned) {
             //| movzx eax, ax
-            dasm_put(Dst, 180);
-#line 1396 "../../src/codegen.in.c"
+            dasm_put(Dst, 182);
+#line 1430 "../../src/codegen.in.c"
           } else {
             //| movsx eax, ax
-            dasm_put(Dst, 176);
-#line 1398 "../../src/codegen.in.c"
+            dasm_put(Dst, 178);
+#line 1432 "../../src/codegen.in.c"
           }
           return;
       }
@@ -15268,8 +23038,8 @@ static void gen_expr(Node* node) {
       if (node->ret_buffer && type_passed_in_register(node->ty)) {
         //| mov [rbp+node->ret_buffer->offset], rax
         //| lea rax, [rbp+node->ret_buffer->offset]
-        dasm_put(Dst, 1158, node->ret_buffer->offset, node->ret_buffer->offset);
-#line 1408 "../../src/codegen.in.c"
+        dasm_put(Dst, 1168, node->ret_buffer->offset, node->ret_buffer->offset);
+#line 1442 "../../src/codegen.in.c"
       }
 
 #else  // SysV
@@ -15331,8 +23101,8 @@ static void gen_expr(Node* node) {
       //| mov rax, fp
       //| call r10
       //| add rsp, stack_args*8
-      dasm_put(Dst, 1167, fp, stack_args*8);
-#line 1469 "../../src/codegen.in.c"
+      dasm_put(Dst, 1177, fp, stack_args*8);
+#line 1503 "../../src/codegen.in.c"
 
       C(depth) -= stack_args;
 
@@ -15342,29 +23112,29 @@ static void gen_expr(Node* node) {
       switch (node->ty->kind) {
         case TY_BOOL:
           //| movzx eax, al
-          dasm_put(Dst, 172);
-#line 1478 "../../src/codegen.in.c"
+          dasm_put(Dst, 174);
+#line 1512 "../../src/codegen.in.c"
           return;
         case TY_CHAR:
           if (node->ty->is_unsigned) {
             //| movzx eax, al
-            dasm_put(Dst, 172);
-#line 1482 "../../src/codegen.in.c"
+            dasm_put(Dst, 174);
+#line 1516 "../../src/codegen.in.c"
           } else {
             //| movsx eax, al
-            dasm_put(Dst, 168);
-#line 1484 "../../src/codegen.in.c"
+            dasm_put(Dst, 170);
+#line 1518 "../../src/codegen.in.c"
           }
           return;
         case TY_SHORT:
           if (node->ty->is_unsigned) {
             //| movzx eax, ax
-            dasm_put(Dst, 180);
-#line 1489 "../../src/codegen.in.c"
+            dasm_put(Dst, 182);
+#line 1523 "../../src/codegen.in.c"
           } else {
             //| movsx eax, ax
-            dasm_put(Dst, 176);
-#line 1491 "../../src/codegen.in.c"
+            dasm_put(Dst, 178);
+#line 1525 "../../src/codegen.in.c"
           }
           return;
       }
@@ -15374,8 +23144,8 @@ static void gen_expr(Node* node) {
       if (node->ret_buffer && node->ty->size <= 16) {
         copy_ret_buffer(node->ret_buffer);
         //| lea rax, [rbp+node->ret_buffer->offset]
-        dasm_put(Dst, 112, node->ret_buffer->offset);
-#line 1500 "../../src/codegen.in.c"
+        dasm_put(Dst, 114, node->ret_buffer->offset);
+#line 1534 "../../src/codegen.in.c"
       }
 
 #endif  // SysV
@@ -15384,13 +23154,13 @@ static void gen_expr(Node* node) {
     }
     case ND_LABEL_VAL:
       //| lea rax, [=>node->pc_label]
-      dasm_put(Dst, 117, node->pc_label);
-#line 1508 "../../src/codegen.in.c"
+      dasm_put(Dst, 119, node->pc_label);
+#line 1542 "../../src/codegen.in.c"
       return;
     case ND_REFLECT_TYPE_PTR:
-      //| mov64 rax, node->rty;
-      dasm_put(Dst, 123, (unsigned int)(node->rty), (unsigned int)((node->rty)>>32));
-#line 1511 "../../src/codegen.in.c"
+      //| mov64 rax, node->reflect_ty;
+      dasm_put(Dst, 125, (unsigned int)(node->reflect_ty), (unsigned int)((node->reflect_ty)>>32));
+#line 1545 "../../src/codegen.in.c"
       return;
     case ND_CAS:
     case ND_LOCKCE: {
@@ -15403,8 +23173,8 @@ static void gen_expr(Node* node) {
       gen_expr(node->cas_old);
       if (!is_locked_ce) {
         //| mov r8, rax
-        dasm_put(Dst, 996);
-#line 1523 "../../src/codegen.in.c"
+        dasm_put(Dst, 1006);
+#line 1557 "../../src/codegen.in.c"
         load(node->cas_old->ty->base);
       }
       pop(REG_DX);    // new
@@ -15422,8 +23192,8 @@ static void gen_expr(Node* node) {
           //| .byte 0x0f
           //| .byte 0xb0
           //| .byte RUTILenc
-          dasm_put(Dst, 1183);
-#line 1540 "../../src/codegen.in.c"
+          dasm_put(Dst, 1193);
+#line 1574 "../../src/codegen.in.c"
           break;
         case 2:
           // lock cmpxchg WORD PTR [rdi/rcx],dx
@@ -15432,8 +23202,8 @@ static void gen_expr(Node* node) {
           //| .byte 0x0f
           //| .byte 0xb1
           //| .byte RUTILenc
-          dasm_put(Dst, 1189);
-#line 1548 "../../src/codegen.in.c"
+          dasm_put(Dst, 1199);
+#line 1582 "../../src/codegen.in.c"
           break;
         case 4:
           // lock cmpxchg DWORD PTR [rdi/rcx],edx
@@ -15441,8 +23211,8 @@ static void gen_expr(Node* node) {
           //| .byte 0x0f
           //| .byte 0xb1
           //| .byte RUTILenc
-          dasm_put(Dst, 1190);
-#line 1555 "../../src/codegen.in.c"
+          dasm_put(Dst, 1200);
+#line 1589 "../../src/codegen.in.c"
           break;
         case 8:
           // lock cmpxchg QWORD PTR [rdi/rcx],rdx
@@ -15451,8 +23221,8 @@ static void gen_expr(Node* node) {
           //| .byte 0x0f
           //| .byte 0xb1
           //| .byte RUTILenc
-          dasm_put(Dst, 1196);
-#line 1563 "../../src/codegen.in.c"
+          dasm_put(Dst, 1206);
+#line 1597 "../../src/codegen.in.c"
           break;
         default:
           unreachable();
@@ -15460,36 +23230,36 @@ static void gen_expr(Node* node) {
       if (!is_locked_ce) {
         //| sete cl
         //| je >1
-        dasm_put(Dst, 1203);
-#line 1570 "../../src/codegen.in.c"
+        dasm_put(Dst, 1213);
+#line 1604 "../../src/codegen.in.c"
         switch (sz) {
           case 1:
             //| mov [r8], al
-            dasm_put(Dst, 1211);
-#line 1573 "../../src/codegen.in.c"
+            dasm_put(Dst, 1221);
+#line 1607 "../../src/codegen.in.c"
             break;
           case 2:
             //| mov [r8], ax
-            dasm_put(Dst, 1215);
-#line 1576 "../../src/codegen.in.c"
+            dasm_put(Dst, 1225);
+#line 1610 "../../src/codegen.in.c"
             break;
           case 4:
             //| mov [r8], eax
-            dasm_put(Dst, 1216);
-#line 1579 "../../src/codegen.in.c"
+            dasm_put(Dst, 1226);
+#line 1613 "../../src/codegen.in.c"
             break;
           case 8:
             //| mov [r8], rax
-            dasm_put(Dst, 1220);
-#line 1582 "../../src/codegen.in.c"
+            dasm_put(Dst, 1230);
+#line 1616 "../../src/codegen.in.c"
             break;
           default:
             unreachable();
         }
         //|1:
         //| movzx eax, cl
-        dasm_put(Dst, 1224);
-#line 1588 "../../src/codegen.in.c"
+        dasm_put(Dst, 1234);
+#line 1622 "../../src/codegen.in.c"
       }
 
       return;
@@ -15504,23 +23274,23 @@ static void gen_expr(Node* node) {
       switch (sz) {
         case 1:
           //| xchg [RUTIL], al
-          dasm_put(Dst, 1230);
-#line 1602 "../../src/codegen.in.c"
+          dasm_put(Dst, 1240);
+#line 1636 "../../src/codegen.in.c"
           break;
         case 2:
           //| xchg [RUTIL], ax
-          dasm_put(Dst, 1233);
-#line 1605 "../../src/codegen.in.c"
+          dasm_put(Dst, 1243);
+#line 1639 "../../src/codegen.in.c"
           break;
         case 4:
           //| xchg [RUTIL], eax
-          dasm_put(Dst, 1234);
-#line 1608 "../../src/codegen.in.c"
+          dasm_put(Dst, 1244);
+#line 1642 "../../src/codegen.in.c"
           break;
         case 8:
           //| xchg [RUTIL], rax
-          dasm_put(Dst, 1237);
-#line 1611 "../../src/codegen.in.c"
+          dasm_put(Dst, 1247);
+#line 1645 "../../src/codegen.in.c"
           break;
         default:
           unreachable();
@@ -15543,45 +23313,45 @@ static void gen_expr(Node* node) {
         case ND_ADD:
           if (is_float) {
             //| addss xmm0, xmm1
-            dasm_put(Dst, 1241);
-#line 1633 "../../src/codegen.in.c"
+            dasm_put(Dst, 1251);
+#line 1667 "../../src/codegen.in.c"
           } else {
             //| addsd xmm0, xmm1
-            dasm_put(Dst, 1247);
-#line 1635 "../../src/codegen.in.c"
+            dasm_put(Dst, 1257);
+#line 1669 "../../src/codegen.in.c"
           }
           return;
         case ND_SUB:
           if (is_float) {
             //| subss xmm0, xmm1
-            dasm_put(Dst, 1253);
-#line 1640 "../../src/codegen.in.c"
+            dasm_put(Dst, 1263);
+#line 1674 "../../src/codegen.in.c"
           } else {
             //| subsd xmm0, xmm1
-            dasm_put(Dst, 1259);
-#line 1642 "../../src/codegen.in.c"
+            dasm_put(Dst, 1269);
+#line 1676 "../../src/codegen.in.c"
           }
           return;
         case ND_MUL:
           if (is_float) {
             //| mulss xmm0, xmm1
-            dasm_put(Dst, 1265);
-#line 1647 "../../src/codegen.in.c"
+            dasm_put(Dst, 1275);
+#line 1681 "../../src/codegen.in.c"
           } else {
             //| mulsd xmm0, xmm1
-            dasm_put(Dst, 1271);
-#line 1649 "../../src/codegen.in.c"
+            dasm_put(Dst, 1281);
+#line 1683 "../../src/codegen.in.c"
           }
           return;
         case ND_DIV:
           if (is_float) {
             //| divss xmm0, xmm1
-            dasm_put(Dst, 1277);
-#line 1654 "../../src/codegen.in.c"
+            dasm_put(Dst, 1287);
+#line 1688 "../../src/codegen.in.c"
           } else {
             //| divsd xmm0, xmm1
-            dasm_put(Dst, 1283);
-#line 1656 "../../src/codegen.in.c"
+            dasm_put(Dst, 1293);
+#line 1690 "../../src/codegen.in.c"
           }
           return;
         case ND_EQ:
@@ -15590,40 +23360,40 @@ static void gen_expr(Node* node) {
         case ND_LE:
           if (is_float) {
             //| ucomiss xmm1, xmm0
-            dasm_put(Dst, 1289);
-#line 1664 "../../src/codegen.in.c"
+            dasm_put(Dst, 1299);
+#line 1698 "../../src/codegen.in.c"
           } else {
             //| ucomisd xmm1, xmm0
-            dasm_put(Dst, 1293);
-#line 1666 "../../src/codegen.in.c"
+            dasm_put(Dst, 1303);
+#line 1700 "../../src/codegen.in.c"
           }
 
           if (node->kind == ND_EQ) {
             //| sete al
             //| setnp dl
             //| and al, dl
-            dasm_put(Dst, 1298);
-#line 1672 "../../src/codegen.in.c"
+            dasm_put(Dst, 1308);
+#line 1706 "../../src/codegen.in.c"
           } else if (node->kind == ND_NE) {
             //| setne al
             //| setp dl
             //| or al, dl
-            dasm_put(Dst, 1307);
-#line 1676 "../../src/codegen.in.c"
+            dasm_put(Dst, 1317);
+#line 1710 "../../src/codegen.in.c"
           } else if (node->kind == ND_LT) {
             //| seta al
-            dasm_put(Dst, 1316);
-#line 1678 "../../src/codegen.in.c"
+            dasm_put(Dst, 1326);
+#line 1712 "../../src/codegen.in.c"
           } else {
             //| setae al
-            dasm_put(Dst, 1320);
-#line 1680 "../../src/codegen.in.c"
+            dasm_put(Dst, 1330);
+#line 1714 "../../src/codegen.in.c"
           }
 
           //| and al, 1
           //| movzx rax, al
-          dasm_put(Dst, 1324);
-#line 1684 "../../src/codegen.in.c"
+          dasm_put(Dst, 1334);
+#line 1718 "../../src/codegen.in.c"
           return;
       }
 
@@ -15637,23 +23407,23 @@ static void gen_expr(Node* node) {
       switch (node->kind) {
         case ND_ADD:
           //| faddp st1, st0
-          dasm_put(Dst, 1331);
-#line 1697 "../../src/codegen.in.c"
+          dasm_put(Dst, 1341);
+#line 1731 "../../src/codegen.in.c"
           return;
         case ND_SUB:
           //| fsubrp st1, st0
-          dasm_put(Dst, 1334);
-#line 1700 "../../src/codegen.in.c"
+          dasm_put(Dst, 1344);
+#line 1734 "../../src/codegen.in.c"
           return;
         case ND_MUL:
           //| fmulp st1, st0
-          dasm_put(Dst, 1337);
-#line 1703 "../../src/codegen.in.c"
+          dasm_put(Dst, 1347);
+#line 1737 "../../src/codegen.in.c"
           return;
         case ND_DIV:
           //| fdivrp st1, st0
-          dasm_put(Dst, 1340);
-#line 1706 "../../src/codegen.in.c"
+          dasm_put(Dst, 1350);
+#line 1740 "../../src/codegen.in.c"
           return;
         case ND_EQ:
         case ND_NE:
@@ -15661,30 +23431,30 @@ static void gen_expr(Node* node) {
         case ND_LE:
           //| fcomip st1
           //| fstp st0
-          dasm_put(Dst, 1344);
-#line 1713 "../../src/codegen.in.c"
+          dasm_put(Dst, 1354);
+#line 1747 "../../src/codegen.in.c"
 
           if (node->kind == ND_EQ) {
             //| sete al
-            dasm_put(Dst, 1350);
-#line 1716 "../../src/codegen.in.c"
+            dasm_put(Dst, 1360);
+#line 1750 "../../src/codegen.in.c"
           } else if (node->kind == ND_NE) {
             //| setne al
-            dasm_put(Dst, 1354);
-#line 1718 "../../src/codegen.in.c"
+            dasm_put(Dst, 1364);
+#line 1752 "../../src/codegen.in.c"
           } else if (node->kind == ND_LT) {
             //| seta al
-            dasm_put(Dst, 1316);
-#line 1720 "../../src/codegen.in.c"
+            dasm_put(Dst, 1326);
+#line 1754 "../../src/codegen.in.c"
           } else {
             //| setae al
-            dasm_put(Dst, 1320);
-#line 1722 "../../src/codegen.in.c"
+            dasm_put(Dst, 1330);
+#line 1756 "../../src/codegen.in.c"
           }
 
           //| movzx rax, al
-          dasm_put(Dst, 1063);
-#line 1725 "../../src/codegen.in.c"
+          dasm_put(Dst, 1073);
+#line 1759 "../../src/codegen.in.c"
           return;
       }
 
@@ -15704,34 +23474,34 @@ static void gen_expr(Node* node) {
     case ND_ADD:
       if (is_long) {
         //| add rax, RUTIL
-        dasm_put(Dst, 1358);
-#line 1744 "../../src/codegen.in.c"
+        dasm_put(Dst, 1368);
+#line 1778 "../../src/codegen.in.c"
       } else {
         //| add eax, RUTILd
-        dasm_put(Dst, 1359);
-#line 1746 "../../src/codegen.in.c"
+        dasm_put(Dst, 1369);
+#line 1780 "../../src/codegen.in.c"
       }
       return;
     case ND_SUB:
       if (is_long) {
         //| sub rax, RUTIL
-        dasm_put(Dst, 1363);
-#line 1751 "../../src/codegen.in.c"
+        dasm_put(Dst, 1373);
+#line 1785 "../../src/codegen.in.c"
       } else {
         //| sub eax, RUTILd
-        dasm_put(Dst, 1364);
-#line 1753 "../../src/codegen.in.c"
+        dasm_put(Dst, 1374);
+#line 1787 "../../src/codegen.in.c"
       }
       return;
     case ND_MUL:
       if (is_long) {
         //| imul rax, RUTIL
-        dasm_put(Dst, 1368);
-#line 1758 "../../src/codegen.in.c"
+        dasm_put(Dst, 1378);
+#line 1792 "../../src/codegen.in.c"
       } else {
         //| imul eax, RUTILd
-        dasm_put(Dst, 1369);
-#line 1760 "../../src/codegen.in.c"
+        dasm_put(Dst, 1379);
+#line 1794 "../../src/codegen.in.c"
       }
       return;
     case ND_DIV:
@@ -15740,72 +23510,72 @@ static void gen_expr(Node* node) {
         if (is_long) {
           //| mov rdx, 0
           //| div RUTIL
-          dasm_put(Dst, 1373);
-#line 1768 "../../src/codegen.in.c"
+          dasm_put(Dst, 1383);
+#line 1802 "../../src/codegen.in.c"
         } else {
           //| mov edx, 0
           //| div RUTILd
-          dasm_put(Dst, 1386);
-#line 1771 "../../src/codegen.in.c"
+          dasm_put(Dst, 1396);
+#line 1805 "../../src/codegen.in.c"
         }
       } else {
         if (node->lhs->ty->size == 8) {
           //| cqo
-          dasm_put(Dst, 1396);
-#line 1775 "../../src/codegen.in.c"
+          dasm_put(Dst, 1406);
+#line 1809 "../../src/codegen.in.c"
         } else {
           //| cdq
-          dasm_put(Dst, 1397);
-#line 1777 "../../src/codegen.in.c"
+          dasm_put(Dst, 1407);
+#line 1811 "../../src/codegen.in.c"
         }
         if (is_long) {
           //| idiv RUTIL
-          dasm_put(Dst, 1399);
-#line 1780 "../../src/codegen.in.c"
+          dasm_put(Dst, 1409);
+#line 1814 "../../src/codegen.in.c"
         } else {
           //| idiv RUTILd
-          dasm_put(Dst, 1400);
-#line 1782 "../../src/codegen.in.c"
+          dasm_put(Dst, 1410);
+#line 1816 "../../src/codegen.in.c"
         }
       }
 
       if (node->kind == ND_MOD) {
         //| mov rax, rdx
-        dasm_put(Dst, 1405);
-#line 1787 "../../src/codegen.in.c"
+        dasm_put(Dst, 1415);
+#line 1821 "../../src/codegen.in.c"
       }
       return;
     case ND_BITAND:
       if (is_long) {
         //| and rax, RUTIL
-        dasm_put(Dst, 1409);
-#line 1792 "../../src/codegen.in.c"
+        dasm_put(Dst, 1419);
+#line 1826 "../../src/codegen.in.c"
       } else {
         //| and eax, RUTILd
-        dasm_put(Dst, 1410);
-#line 1794 "../../src/codegen.in.c"
+        dasm_put(Dst, 1420);
+#line 1828 "../../src/codegen.in.c"
       }
       return;
     case ND_BITOR:
       if (is_long) {
         //| or rax, RUTIL
-        dasm_put(Dst, 1024);
-#line 1799 "../../src/codegen.in.c"
+        dasm_put(Dst, 1034);
+#line 1833 "../../src/codegen.in.c"
       } else {
         //| or eax, RUTILd
-        dasm_put(Dst, 1025);
-#line 1801 "../../src/codegen.in.c"
+        dasm_put(Dst, 1035);
+#line 1835 "../../src/codegen.in.c"
       }
       return;
     case ND_BITXOR:
       if (is_long) {
         //| xor rax, RUTIL
-        dasm_put(Dst, 1414);
-#line 1806 "../../src/codegen.in.c"
+        dasm_put(Dst, 1424);
+#line 1840 "../../src/codegen.in.c"
       } else {
         //| xor eax, RUTILd
-        dasm_put(Dst, 1415);
-#line 1808 "../../src/codegen.in.c"
+        dasm_put(Dst, 1425);
+#line 1842 "../../src/codegen.in.c"
       }
       return;
     case ND_EQ:
@@ -15814,85 +23584,85 @@ static void gen_expr(Node* node) {
     case ND_LE:
       if (is_long) {
         //| cmp rax, RUTIL
-        dasm_put(Dst, 1419);
-#line 1816 "../../src/codegen.in.c"
+        dasm_put(Dst, 1429);
+#line 1850 "../../src/codegen.in.c"
       } else {
         //| cmp eax, RUTILd
-        dasm_put(Dst, 1420);
-#line 1818 "../../src/codegen.in.c"
+        dasm_put(Dst, 1430);
+#line 1852 "../../src/codegen.in.c"
       }
 
       if (node->kind == ND_EQ) {
         //| sete al
-        dasm_put(Dst, 1350);
-#line 1822 "../../src/codegen.in.c"
+        dasm_put(Dst, 1360);
+#line 1856 "../../src/codegen.in.c"
       } else if (node->kind == ND_NE) {
         //| setne al
-        dasm_put(Dst, 1354);
-#line 1824 "../../src/codegen.in.c"
+        dasm_put(Dst, 1364);
+#line 1858 "../../src/codegen.in.c"
       } else if (node->kind == ND_LT) {
         if (node->lhs->ty->is_unsigned) {
           //| setb al
-          dasm_put(Dst, 1424);
-#line 1827 "../../src/codegen.in.c"
+          dasm_put(Dst, 1434);
+#line 1861 "../../src/codegen.in.c"
         } else {
           //| setl al
-          dasm_put(Dst, 1428);
-#line 1829 "../../src/codegen.in.c"
+          dasm_put(Dst, 1438);
+#line 1863 "../../src/codegen.in.c"
         }
       } else if (node->kind == ND_LE) {
         if (node->lhs->ty->is_unsigned) {
           //| setbe al
-          dasm_put(Dst, 1432);
-#line 1833 "../../src/codegen.in.c"
+          dasm_put(Dst, 1442);
+#line 1867 "../../src/codegen.in.c"
         } else {
           //| setle al
-          dasm_put(Dst, 1436);
-#line 1835 "../../src/codegen.in.c"
+          dasm_put(Dst, 1446);
+#line 1869 "../../src/codegen.in.c"
         }
       }
 
       //| movzx rax, al
-      dasm_put(Dst, 1063);
-#line 1839 "../../src/codegen.in.c"
+      dasm_put(Dst, 1073);
+#line 1873 "../../src/codegen.in.c"
       return;
     case ND_SHL:
       //| mov rcx, RUTIL
-      dasm_put(Dst, 1440);
-#line 1842 "../../src/codegen.in.c"
+      dasm_put(Dst, 1450);
+#line 1876 "../../src/codegen.in.c"
       if (is_long) {
         //| shl rax, cl
-        dasm_put(Dst, 1445);
-#line 1844 "../../src/codegen.in.c"
+        dasm_put(Dst, 1455);
+#line 1878 "../../src/codegen.in.c"
       } else {
         //| shl eax, cl
-        dasm_put(Dst, 1446);
-#line 1846 "../../src/codegen.in.c"
+        dasm_put(Dst, 1456);
+#line 1880 "../../src/codegen.in.c"
       }
       return;
     case ND_SHR:
       //| mov rcx, RUTIL
-      dasm_put(Dst, 1440);
-#line 1850 "../../src/codegen.in.c"
+      dasm_put(Dst, 1450);
+#line 1884 "../../src/codegen.in.c"
       if (node->lhs->ty->is_unsigned) {
         if (is_long) {
           //| shr rax, cl
-          dasm_put(Dst, 1449);
-#line 1853 "../../src/codegen.in.c"
+          dasm_put(Dst, 1459);
+#line 1887 "../../src/codegen.in.c"
         } else {
           //| shr eax, cl
-          dasm_put(Dst, 1450);
-#line 1855 "../../src/codegen.in.c"
+          dasm_put(Dst, 1460);
+#line 1889 "../../src/codegen.in.c"
         }
       } else {
         if (is_long) {
           //| sar rax, cl
-          dasm_put(Dst, 1453);
-#line 1859 "../../src/codegen.in.c"
+          dasm_put(Dst, 1463);
+#line 1893 "../../src/codegen.in.c"
         } else {
           //| sar eax, cl
-          dasm_put(Dst, 1454);
-#line 1861 "../../src/codegen.in.c"
+          dasm_put(Dst, 1464);
+#line 1895 "../../src/codegen.in.c"
         }
       }
       return;
@@ -15902,6 +23672,12 @@ static void gen_expr(Node* node) {
 }
 
 static void gen_stmt(Node* node) {
+#if X64WIN
+  if (user_context->generate_debug_symbols) {
+    record_line_syminfo(node->tok->file->file_no, node->tok->line_no, codegen_pclabel());
+  }
+#endif
+
   switch (node->kind) {
     case ND_IF: {
       int lelse = codegen_pclabel();
@@ -15909,18 +23685,18 @@ static void gen_stmt(Node* node) {
       gen_expr(node->cond);
       cmp_zero(node->cond->ty);
       //| je =>lelse
-      dasm_put(Dst, 1051, lelse);
-#line 1877 "../../src/codegen.in.c"
+      dasm_put(Dst, 1061, lelse);
+#line 1917 "../../src/codegen.in.c"
       gen_stmt(node->then);
       //| jmp =>lend
       //|=>lelse:
-      dasm_put(Dst, 1055, lend, lelse);
-#line 1880 "../../src/codegen.in.c"
+      dasm_put(Dst, 1065, lend, lelse);
+#line 1920 "../../src/codegen.in.c"
       if (node->els)
         gen_stmt(node->els);
       //|=>lend:
-      dasm_put(Dst, 1058, lend);
-#line 1883 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, lend);
+#line 1923 "../../src/codegen.in.c"
       return;
     }
     case ND_FOR: {
@@ -15928,42 +23704,42 @@ static void gen_stmt(Node* node) {
         gen_stmt(node->init);
       int lbegin = codegen_pclabel();
       //|=>lbegin:
-      dasm_put(Dst, 1058, lbegin);
-#line 1890 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, lbegin);
+#line 1930 "../../src/codegen.in.c"
       if (node->cond) {
         gen_expr(node->cond);
         cmp_zero(node->cond->ty);
         //| je =>node->brk_pc_label
-        dasm_put(Dst, 1051, node->brk_pc_label);
-#line 1894 "../../src/codegen.in.c"
+        dasm_put(Dst, 1061, node->brk_pc_label);
+#line 1934 "../../src/codegen.in.c"
       }
       gen_stmt(node->then);
       //|=>node->cont_pc_label:
-      dasm_put(Dst, 1058, node->cont_pc_label);
-#line 1897 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->cont_pc_label);
+#line 1937 "../../src/codegen.in.c"
       if (node->inc)
         gen_expr(node->inc);
       //| jmp =>lbegin
       //|=>node->brk_pc_label:
-      dasm_put(Dst, 1055, lbegin, node->brk_pc_label);
-#line 1901 "../../src/codegen.in.c"
+      dasm_put(Dst, 1065, lbegin, node->brk_pc_label);
+#line 1941 "../../src/codegen.in.c"
       return;
     }
     case ND_DO: {
       int lbegin = codegen_pclabel();
       //|=>lbegin:
-      dasm_put(Dst, 1058, lbegin);
-#line 1906 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, lbegin);
+#line 1946 "../../src/codegen.in.c"
       gen_stmt(node->then);
       //|=>node->cont_pc_label:
-      dasm_put(Dst, 1058, node->cont_pc_label);
-#line 1908 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->cont_pc_label);
+#line 1948 "../../src/codegen.in.c"
       gen_expr(node->cond);
       cmp_zero(node->cond->ty);
       //| jne =>lbegin
       //|=>node->brk_pc_label:
-      dasm_put(Dst, 1458, lbegin, node->brk_pc_label);
-#line 1912 "../../src/codegen.in.c"
+      dasm_put(Dst, 1468, lbegin, node->brk_pc_label);
+#line 1952 "../../src/codegen.in.c"
       return;
     }
     case ND_SWITCH:
@@ -15975,16 +23751,16 @@ static void gen_stmt(Node* node) {
         if (n->begin == n->end) {
           if (is_long) {
             //| cmp rax, n->begin
-            dasm_put(Dst, 1463, n->begin);
-#line 1923 "../../src/codegen.in.c"
+            dasm_put(Dst, 1473, n->begin);
+#line 1963 "../../src/codegen.in.c"
           } else {
             //| cmp eax, n->begin
-            dasm_put(Dst, 1464, n->begin);
-#line 1925 "../../src/codegen.in.c"
+            dasm_put(Dst, 1474, n->begin);
+#line 1965 "../../src/codegen.in.c"
           }
           //| je =>n->pc_label
-          dasm_put(Dst, 1051, n->pc_label);
-#line 1927 "../../src/codegen.in.c"
+          dasm_put(Dst, 1061, n->pc_label);
+#line 1967 "../../src/codegen.in.c"
           continue;
         }
 
@@ -15993,38 +23769,38 @@ static void gen_stmt(Node* node) {
           //| mov RUTIL, rax
           //| sub RUTIL, n->begin
           //| cmp RUTIL, n->end - n->begin
-          dasm_put(Dst, 1469, n->begin, n->end - n->begin);
-#line 1935 "../../src/codegen.in.c"
+          dasm_put(Dst, 1479, n->begin, n->end - n->begin);
+#line 1975 "../../src/codegen.in.c"
         } else {
           //| mov RUTILd, eax
           //| sub RUTILd, n->begin
           //| cmp RUTILd, n->end - n->begin
-          dasm_put(Dst, 1483, n->begin, n->end - n->begin);
-#line 1939 "../../src/codegen.in.c"
+          dasm_put(Dst, 1493, n->begin, n->end - n->begin);
+#line 1979 "../../src/codegen.in.c"
         }
         //| jbe =>n->pc_label
-        dasm_put(Dst, 1494, n->pc_label);
-#line 1941 "../../src/codegen.in.c"
+        dasm_put(Dst, 1504, n->pc_label);
+#line 1981 "../../src/codegen.in.c"
       }
 
       if (node->default_case) {
         //| jmp =>node->default_case->pc_label
-        dasm_put(Dst, 1498, node->default_case->pc_label);
-#line 1945 "../../src/codegen.in.c"
+        dasm_put(Dst, 1508, node->default_case->pc_label);
+#line 1985 "../../src/codegen.in.c"
       }
 
       //| jmp =>node->brk_pc_label
-      dasm_put(Dst, 1498, node->brk_pc_label);
-#line 1948 "../../src/codegen.in.c"
+      dasm_put(Dst, 1508, node->brk_pc_label);
+#line 1988 "../../src/codegen.in.c"
       gen_stmt(node->then);
       //|=>node->brk_pc_label:
-      dasm_put(Dst, 1058, node->brk_pc_label);
-#line 1950 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->brk_pc_label);
+#line 1990 "../../src/codegen.in.c"
       return;
     case ND_CASE:
       //|=>node->pc_label:
-      dasm_put(Dst, 1058, node->pc_label);
-#line 1953 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->pc_label);
+#line 1993 "../../src/codegen.in.c"
       gen_stmt(node->lhs);
       return;
     case ND_BLOCK:
@@ -16033,19 +23809,19 @@ static void gen_stmt(Node* node) {
       return;
     case ND_GOTO:
       //| jmp =>node->pc_label
-      dasm_put(Dst, 1498, node->pc_label);
-#line 1961 "../../src/codegen.in.c"
+      dasm_put(Dst, 1508, node->pc_label);
+#line 2001 "../../src/codegen.in.c"
       return;
     case ND_GOTO_EXPR:
       gen_expr(node->lhs);
       //| jmp rax
-      dasm_put(Dst, 1502);
-#line 1965 "../../src/codegen.in.c"
+      dasm_put(Dst, 1512);
+#line 2005 "../../src/codegen.in.c"
       return;
     case ND_LABEL:
       //|=>node->pc_label:
-      dasm_put(Dst, 1058, node->pc_label);
-#line 1968 "../../src/codegen.in.c"
+      dasm_put(Dst, 0, node->pc_label);
+#line 2008 "../../src/codegen.in.c"
       gen_stmt(node->lhs);
       return;
     case ND_RETURN:
@@ -16072,8 +23848,8 @@ static void gen_stmt(Node* node) {
       }
 
       //| jmp =>C(current_fn)->dasm_return_label
-      dasm_put(Dst, 1498, C(current_fn)->dasm_return_label);
-#line 1994 "../../src/codegen.in.c"
+      dasm_put(Dst, 1508, C(current_fn)->dasm_return_label);
+#line 2034 "../../src/codegen.in.c"
       return;
     case ND_EXPR_STMT:
       gen_expr(node->lhs);
@@ -16387,13 +24163,13 @@ static void store_fp(int r, int offset, int sz) {
   switch (sz) {
     case 4:
       //| movss dword [rbp+offset], xmm(r)
-      dasm_put(Dst, 682, (r), offset);
-#line 2307 "../../src/codegen.in.c"
+      dasm_put(Dst, 684, (r), offset);
+#line 2347 "../../src/codegen.in.c"
       return;
     case 8:
       //| movsd qword [rbp+offset], xmm(r)
-      dasm_put(Dst, 693, (r), offset);
-#line 2310 "../../src/codegen.in.c"
+      dasm_put(Dst, 695, (r), offset);
+#line 2350 "../../src/codegen.in.c"
       return;
   }
   unreachable();
@@ -16403,31 +24179,31 @@ static void store_gp(int r, int offset, int sz) {
   switch (sz) {
     case 1:
       //| mov [rbp+offset], Rb(dasmargreg[r])
-      dasm_put(Dst, 1506, (dasmargreg[r]), offset);
-#line 2319 "../../src/codegen.in.c"
+      dasm_put(Dst, 1516, (dasmargreg[r]), offset);
+#line 2359 "../../src/codegen.in.c"
       return;
     case 2:
       //| mov [rbp+offset], Rw(dasmargreg[r])
-      dasm_put(Dst, 1514, (dasmargreg[r]), offset);
-#line 2322 "../../src/codegen.in.c"
+      dasm_put(Dst, 1524, (dasmargreg[r]), offset);
+#line 2362 "../../src/codegen.in.c"
       return;
       return;
     case 4:
       //| mov [rbp+offset], Rd(dasmargreg[r])
-      dasm_put(Dst, 1515, (dasmargreg[r]), offset);
-#line 2326 "../../src/codegen.in.c"
+      dasm_put(Dst, 1525, (dasmargreg[r]), offset);
+#line 2366 "../../src/codegen.in.c"
       return;
     case 8:
       //| mov [rbp+offset], Rq(dasmargreg[r])
-      dasm_put(Dst, 1523, (dasmargreg[r]), offset);
-#line 2329 "../../src/codegen.in.c"
+      dasm_put(Dst, 1533, (dasmargreg[r]), offset);
+#line 2369 "../../src/codegen.in.c"
       return;
     default:
       for (int i = 0; i < sz; i++) {
         //| mov [rbp+offset+i], Rb(dasmargreg[r])
         //| shr Rq(dasmargreg[r]), 8
-        dasm_put(Dst, 704, (dasmargreg[r]), offset+i, (dasmargreg[r]));
-#line 2334 "../../src/codegen.in.c"
+        dasm_put(Dst, 706, (dasmargreg[r]), offset+i, (dasmargreg[r]));
+#line 2374 "../../src/codegen.in.c"
       }
       return;
   }
@@ -16450,34 +24226,38 @@ static void emit_text(Obj* prog) {
   }
 
   //| .code
-  dasm_put(Dst, 1531);
-#line 2356 "../../src/codegen.in.c"
+  dasm_put(Dst, 1541);
+#line 2396 "../../src/codegen.in.c"
 
   for (Obj* fn = prog; fn; fn = fn->next) {
     if (!fn->is_function || !fn->is_definition || !fn->is_live)
       continue;
 
     //|=>fn->dasm_entry_label:
-    dasm_put(Dst, 1058, fn->dasm_entry_label);
-#line 2362 "../../src/codegen.in.c"
+    dasm_put(Dst, 0, fn->dasm_entry_label);
+#line 2402 "../../src/codegen.in.c"
 
     C(current_fn) = fn;
+
+#if X64WIN
+    record_line_syminfo(fn->ty->name->file->file_no, fn->ty->name->line_no, codegen_pclabel());
+#endif
 
     // outaf("---- %s\n", fn->name);
 
     // Prologue
     //| push rbp
     //| mov rbp, rsp
-    dasm_put(Dst, 1533);
-#line 2370 "../../src/codegen.in.c"
+    dasm_put(Dst, 1543);
+#line 2414 "../../src/codegen.in.c"
 
 #if X64WIN
     // Stack probe on Windows if necessary. The MSDN reference for __chkstk says
     // it's only necessary beyond 8k for x64, but cl does it at 4k.
     if (fn->stack_size >= 4096) {
       //| mov rax, fn->stack_size
-      dasm_put(Dst, 926, fn->stack_size);
-#line 2376 "../../src/codegen.in.c"
+      dasm_put(Dst, 928, fn->stack_size);
+#line 2420 "../../src/codegen.in.c"
       int fixup_location = codegen_pclabel();
       strintarray_push(&C(fixups), (StringInt){"__chkstk", fixup_location}, AL_Compile);
 #ifdef _MSC_VER
@@ -16486,15 +24266,15 @@ static void emit_text(Obj* prog) {
 #endif
       //|=>fixup_location:
       //| mov64 r10, 0xc0dec0dec0dec0de
-      dasm_put(Dst, 1538, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
-#line 2384 "../../src/codegen.in.c"
+      dasm_put(Dst, 1548, fixup_location, (unsigned int)(0xc0dec0dec0dec0de), (unsigned int)((0xc0dec0dec0dec0de)>>32));
+#line 2428 "../../src/codegen.in.c"
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
       //| call r10
       //| sub rsp, rax
-      dasm_put(Dst, 1544);
-#line 2389 "../../src/codegen.in.c"
+      dasm_put(Dst, 1554);
+#line 2433 "../../src/codegen.in.c"
 
       // TODO: pdata emission
     } else
@@ -16502,8 +24282,8 @@ static void emit_text(Obj* prog) {
 
     {
       //| sub rsp, fn->stack_size
-      dasm_put(Dst, 617, fn->stack_size);
-#line 2396 "../../src/codegen.in.c"
+      dasm_put(Dst, 619, fn->stack_size);
+#line 2440 "../../src/codegen.in.c"
 
       // TODO: add a label here to assert that the prolog size is as expected
 
@@ -16533,14 +24313,14 @@ static void emit_text(Obj* prog) {
       // These are the UNWIND_INFO structure that is referenced by the third
       // element of RUNTIME_FUNCTION.
       //| .pdata
-      dasm_put(Dst, 1552);
-#line 2425 "../../src/codegen.in.c"
+      dasm_put(Dst, 1562);
+#line 2469 "../../src/codegen.in.c"
       // This takes care of cases where CountOfCodes is odd.
       //| .align 4
       //|=>fn->dasm_unwind_info_label:
       //| .byte 1  /* Version:3 (1) and Flags:5 (0) */
-      dasm_put(Dst, 1554, fn->dasm_unwind_info_label, 1  /* Version:3 (1) and Flags:5 (0) */);
-#line 2429 "../../src/codegen.in.c"
+      dasm_put(Dst, 1564, fn->dasm_unwind_info_label, 1  /* Version:3 (1) and Flags:5 (0) */);
+#line 2473 "../../src/codegen.in.c"
       bool small_stack = fn->stack_size / 8 - 1 <= 15;
       if (small_stack) {
         // We just happen to "know" this is the form used for small stack sizes.
@@ -16550,8 +24330,8 @@ static void emit_text(Obj* prog) {
         // xxxxxxxxxxxx0009 ...
         //| .byte 8  /* SizeOfProlog */
         //| .byte 3  /* CountOfCodes */
-        dasm_put(Dst, 1559, 8  /* SizeOfProlog */, 3  /* CountOfCodes */);
-#line 2438 "../../src/codegen.in.c"
+        dasm_put(Dst, 1569, 8  /* SizeOfProlog */, 3  /* CountOfCodes */);
+#line 2482 "../../src/codegen.in.c"
       } else {
         // And this one for larger reservations.
         // xxxxxxxxxxxx0000 55                   push        rbp
@@ -16560,44 +24340,44 @@ static void emit_text(Obj* prog) {
         // xxxxxxxxxxxx000b ...
         //| .byte 11  /* SizeOfProlog */
         //| .byte 4  /* CountOfCodes */
-        dasm_put(Dst, 1559, 11  /* SizeOfProlog */, 4  /* CountOfCodes */);
-#line 2446 "../../src/codegen.in.c"
+        dasm_put(Dst, 1569, 11  /* SizeOfProlog */, 4  /* CountOfCodes */);
+#line 2490 "../../src/codegen.in.c"
       }
       //| .byte 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */
-      dasm_put(Dst, 983, 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */);
-#line 2448 "../../src/codegen.in.c"
+      dasm_put(Dst, 985, 5  /* FrameRegister:4 (RBP) | FrameOffset:4: 0 offset */);
+#line 2492 "../../src/codegen.in.c"
 
       if (small_stack) {
         //| .byte 8  /* CodeOffset */
         //| .byte UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4)
-        dasm_put(Dst, 1559, 8  /* CodeOffset */, UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4));
-#line 2452 "../../src/codegen.in.c"
+        dasm_put(Dst, 1569, 8  /* CodeOffset */, UWOP_ALLOC_SMALL | (((unsigned char)((fn->stack_size / 8) - 1)) << 4));
+#line 2496 "../../src/codegen.in.c"
       } else {
         //| .byte 11  /* CodeOffset */
-        dasm_put(Dst, 983, 11  /* CodeOffset */);
-#line 2454 "../../src/codegen.in.c"
+        dasm_put(Dst, 985, 11  /* CodeOffset */);
+#line 2498 "../../src/codegen.in.c"
         assert(fn->stack_size / 8 <= 65535 && "todo; not UWOP_ALLOC_LARGE 0-style");
         //| .byte UWOP_ALLOC_LARGE
         //| .word fn->stack_size / 8
-        dasm_put(Dst, 1562, UWOP_ALLOC_LARGE, fn->stack_size / 8);
-#line 2457 "../../src/codegen.in.c"
+        dasm_put(Dst, 1572, UWOP_ALLOC_LARGE, fn->stack_size / 8);
+#line 2501 "../../src/codegen.in.c"
       }
       //| .byte 4  /* CodeOffset */
       //| .byte UWOP_SET_FPREG
       //| .byte 1  /* CodeOffset */
       //| .byte UWOP_PUSH_NONVOL | (5 /* RBP */ << 4)
-      dasm_put(Dst, 1565, 4  /* CodeOffset */, UWOP_SET_FPREG, 1  /* CodeOffset */, UWOP_PUSH_NONVOL | (5 /* RBP */ << 4));
-#line 2462 "../../src/codegen.in.c"
+      dasm_put(Dst, 1575, 4  /* CodeOffset */, UWOP_SET_FPREG, 1  /* CodeOffset */, UWOP_PUSH_NONVOL | (5 /* RBP */ << 4));
+#line 2506 "../../src/codegen.in.c"
 
       //| .code
-      dasm_put(Dst, 1531);
-#line 2464 "../../src/codegen.in.c"
+      dasm_put(Dst, 1541);
+#line 2508 "../../src/codegen.in.c"
 #endif
     }
 
     //| mov [rbp+fn->alloca_bottom->offset], rsp
-    dasm_put(Dst, 1570, fn->alloca_bottom->offset);
-#line 2468 "../../src/codegen.in.c"
+    dasm_put(Dst, 1580, fn->alloca_bottom->offset);
+#line 2512 "../../src/codegen.in.c"
 
 #if !X64WIN
     // Save arg registers if function is variadic
@@ -16619,8 +24399,8 @@ static void emit_text(Obj* prog) {
       //| add qword [rbp+off+8], 16
       //| mov [rbp+off+16], rbp                // reg_save_area
       //| add qword [rbp+off+16], off+24
-      dasm_put(Dst, 1575, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
-#line 2489 "../../src/codegen.in.c"
+      dasm_put(Dst, 1585, off, gp*8, off+4, fp * 8 + 48, off+8, off+8, off+16, off+16, off+24);
+#line 2533 "../../src/codegen.in.c"
 
       // __reg_save_area__
       //| mov [rbp + off + 24], rdi
@@ -16637,8 +24417,8 @@ static void emit_text(Obj* prog) {
       //| movsd qword [rbp + off + 112], xmm5
       //| movsd qword [rbp + off + 120], xmm6
       //| movsd qword [rbp + off + 128], xmm7
-      dasm_put(Dst, 1602, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
-#line 2505 "../../src/codegen.in.c"
+      dasm_put(Dst, 1612, off + 24, off + 32, off + 40, off + 48, off + 56, off + 64, off + 72, off + 80, off + 88, off + 96, off + 104, off + 112, off + 120, off + 128);
+#line 2549 "../../src/codegen.in.c"
     }
 #endif
 
@@ -16650,8 +24430,8 @@ static void emit_text(Obj* prog) {
       //| mov [rbp + 24], CARG2
       //| mov [rbp + 32], CARG3
       //| mov [rbp + 40], CARG4
-      dasm_put(Dst, 1675, 16, 24, 32, 40);
-#line 2516 "../../src/codegen.in.c"
+      dasm_put(Dst, 1685, 16, 24, 32, 40);
+#line 2560 "../../src/codegen.in.c"
     } else {
       // Save passed-by-register arguments to the stack
       int reg = 0;
@@ -16727,33 +24507,33 @@ static void emit_text(Obj* prog) {
     // behavior is undefined for the other functions.
     if (strcmp(fn->name, "main") == 0) {
       //| mov rax, 0
-      dasm_put(Dst, 734);
-#line 2591 "../../src/codegen.in.c"
+      dasm_put(Dst, 736);
+#line 2635 "../../src/codegen.in.c"
     }
 
     // Epilogue
     //|=>fn->dasm_return_label:
-    dasm_put(Dst, 1058, fn->dasm_return_label);
-#line 2595 "../../src/codegen.in.c"
+    dasm_put(Dst, 0, fn->dasm_return_label);
+#line 2639 "../../src/codegen.in.c"
 #if X64WIN
     // https://learn.microsoft.com/en-us/cpp/build/prolog-and-epilog?view=msvc-170#epilog-code
     // says this the required form to recognize an epilog.
     //| lea rsp, [rbp]
-    dasm_put(Dst, 1692);
-#line 2599 "../../src/codegen.in.c"
+    dasm_put(Dst, 1702);
+#line 2643 "../../src/codegen.in.c"
 #else
     //| mov rsp, rbp
-    dasm_put(Dst, 1697);
-#line 2601 "../../src/codegen.in.c"
+    dasm_put(Dst, 1707);
+#line 2645 "../../src/codegen.in.c"
 #endif
     //| pop rbp
     //| ret
-    dasm_put(Dst, 1702);
-#line 2604 "../../src/codegen.in.c"
+    dasm_put(Dst, 1712);
+#line 2648 "../../src/codegen.in.c"
 
     //|=>fn->dasm_end_of_function_label:
-    dasm_put(Dst, 1058, fn->dasm_end_of_function_label);
-#line 2606 "../../src/codegen.in.c"
+    dasm_put(Dst, 0, fn->dasm_end_of_function_label);
+#line 2650 "../../src/codegen.in.c"
   }
 }
 
@@ -16804,7 +24584,10 @@ typedef struct RuntimeFunction {
   unsigned long UnwindData;
 } RuntimeFunction;
 
-static void create_and_register_exception_function_table(Obj* prog, char* base_addr) {
+static void emit_symbols_and_exception_function_table(Obj* prog,
+                                                      char* base_addr,
+                                                      int pdata_start_offset,
+                                                      int pdata_end_offset) {
   int func_count = 0;
   for (Obj* fn = prog; fn; fn = fn->next) {
     if (!fn->is_function || !fn->is_definition || !fn->is_live)
@@ -16818,7 +24601,6 @@ static void create_and_register_exception_function_table(Obj* prog, char* base_a
   unregister_and_free_function_table_data(user_context);
   char* function_table_data = malloc(alloc_size);
   user_context->function_table_data = function_table_data;
-
   char* pfuncs = function_table_data;
 
   for (Obj* fn = prog; fn; fn = fn->next) {
@@ -16831,6 +24613,33 @@ static void create_and_register_exception_function_table(Obj* prog, char* base_a
     rf->EndAddress = dasm_getpclabel(&C(dynasm), fn->dasm_end_of_function_label);
     rf->UnwindData = dasm_getpclabel(&C(dynasm), fn->dasm_unwind_info_label);
     pfuncs += sizeof(RuntimeFunction);
+
+    if (user_context->generate_debug_symbols) {
+      DbpFunctionSymbol* dbp_func_sym =
+          dbp_add_function_symbol(user_context->dbp_ctx, fn->name, fn->ty->name->filename,
+                                  dasm_getpclabel(&C(dynasm), fn->dasm_entry_label),
+                                  dasm_getpclabel(&C(dynasm), fn->dasm_end_of_function_label));
+      for (int i = 0; i < fn->file_line_label_data.len; ++i) {
+        // TODO: ignoring file index, might not be needed unless something got
+        // inlined (which doesn't happen). Maybe there's a macro case that could
+        // cause it already though?
+        int offset = dasm_getpclabel(&C(dynasm), fn->file_line_label_data.data[i].c);
+        dbp_add_line_mapping(user_context->dbp_ctx, dbp_func_sym, offset,
+                             fn->file_line_label_data.data[i].b);
+      }
+    }
+  }
+
+  if (user_context->generate_debug_symbols) {
+    char* unwind_base = base_addr + pdata_start_offset;
+    size_t unwind_len = pdata_end_offset - pdata_start_offset;
+    DbpExceptionTables exception_tables = {
+        .pdata = (DbpRUNTIME_FUNCTION*)user_context->function_table_data,
+        .num_pdata_entries = func_count,
+        .unwind_info = (unsigned char*)unwind_base,
+        .unwind_info_byte_length = unwind_len,
+    };
+    dbp_ready_to_execute(user_context->dbp_ctx, &exception_tables);
   }
 
   register_function_table_data(user_context, func_count, base_addr);
@@ -16838,9 +24647,14 @@ static void create_and_register_exception_function_table(Obj* prog, char* base_a
 
 #else  // !X64WIN
 
-static void create_and_register_exception_function_table(Obj* prog, char* base_addr) {
+static void emit_symbols_and_exception_function_table(Obj* prog,
+                                                      char* base_addr,
+                                                      int pdata_start_offset,
+                                                      int pdata_end_offset) {
   (void)prog;
   (void)base_addr;
+  (void)pdata_start_offset;
+  (void)pdata_end_offset;
 }
 
 #endif
@@ -16860,8 +24674,27 @@ static void codegen(Obj* prog, size_t file_index) {
 
   dasm_setup(&C(dynasm), dynasm_actions);
 
+  //| .pdata
+  dasm_put(Dst, 1562);
+#line 2791 "../../src/codegen.in.c"
+  int start_of_pdata = codegen_pclabel();
+  //|.align 4
+  //|=>start_of_pdata:
+  //| .code
+  dasm_put(Dst, 1715, start_of_pdata);
+#line 2795 "../../src/codegen.in.c"
+
   assign_lvar_offsets(prog);
   emit_text(prog);
+
+  //| .pdata
+  dasm_put(Dst, 1562);
+#line 2800 "../../src/codegen.in.c"
+  int end_of_pdata = codegen_pclabel();
+  //|=>end_of_pdata:
+  //| .code
+  dasm_put(Dst, 1717, end_of_pdata);
+#line 2803 "../../src/codegen.in.c"
 
   size_t code_size;
   dasm_link(&C(dynasm), &code_size);
@@ -16876,7 +24709,16 @@ static void codegen(Obj* prog, size_t file_index) {
   unsigned int page_sized = (unsigned int)align_to_u(code_size, get_page_size());
 
   fld->codeseg_size = page_sized;
+#if X64WIN
+  if (user_context->generate_debug_symbols) {
+    user_context->dbp_ctx = dbp_create(fld->codeseg_size, get_temp_pdb_filename(AL_Compile));
+    fld->codeseg_base_address = dbp_get_image_base(user_context->dbp_ctx);
+  } else {
+    fld->codeseg_base_address = allocate_writable_memory(page_sized);
+  }
+#else
   fld->codeseg_base_address = allocate_writable_memory(page_sized);
+#endif
   // outaf("code_size: %zu, page_sized: %zu\n", code_size, page_sized);
 
   fill_out_text_exports(prog, fld->codeseg_base_address);
@@ -16887,13 +24729,22 @@ static void codegen(Obj* prog, size_t file_index) {
 
   dasm_encode(&C(dynasm), fld->codeseg_base_address);
 
+#if 0
+  FILE* f = fopen("code.raw", "wb");
+  fwrite(fld->codeseg_base_address, code_size, 1, f);
+  fclose(f);
+  system("ndisasm -b64 code.raw");
+#endif
+
   int check_result = dasm_checkstep(&C(dynasm), 0);
   if (check_result != DASM_S_OK) {
     outaf("check_result: 0x%08x\n", check_result);
     ABORT("dasm_checkstep failed");
   }
 
-  create_and_register_exception_function_table(prog, fld->codeseg_base_address);
+  emit_symbols_and_exception_function_table(prog, fld->codeseg_base_address,
+                                            dasm_getpclabel(&C(dynasm), start_of_pdata),
+                                            dasm_getpclabel(&C(dynasm), end_of_pdata));
 
   codegen_free();
 }

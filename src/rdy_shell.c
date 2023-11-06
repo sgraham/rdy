@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <reflect.h>
+//#include <reflect.h>
 #include <math.h>
 
 #include "libdyibicc.h"
@@ -51,6 +51,7 @@ static void Log(const char* fmt, ...) {
   console_main_vprintf(fmt, ap);
 }
 
+/*
 static void qq_fmt(char* into, void* data, _ReflectType* type) {
   char tmp[256];
   if (type->kind == _REFLECT_KIND_INT) {
@@ -111,6 +112,7 @@ static void qq_eval(char* file, int line, _ReflectType* type, ...) {
 
   nvim_connection_send_extmark_update(connection_handle, file, line - 1, buf);
 }
+*/
 
 void custom_raylib_log(int log_type, const char *fmt, va_list ap) {
   if (log_type < LOG_WARNING) {
@@ -129,7 +131,7 @@ static void* provide_function(const char* name) {
   if (strcmp(#n, name) == 0) \
     return (void*)n;
   X(Log);
-  X(qq_eval);
+  //X(qq_eval);
   X(fmaxf);
   X(fminf);
 
@@ -167,8 +169,8 @@ static void* provide_function(const char* name) {
 
   // raylib
   X(InitWindow);
-  X(WindowShouldClose);
   X(CloseWindow);
+  X(WindowShouldClose);
   X(IsWindowReady);
   X(IsWindowFullscreen);
   X(IsWindowHidden);
@@ -180,6 +182,7 @@ static void* provide_function(const char* name) {
   X(SetWindowState);
   X(ClearWindowState);
   X(ToggleFullscreen);
+  X(ToggleBorderlessWindowed);
   X(MaximizeWindow);
   X(MinimizeWindow);
   X(RestoreWindow);
@@ -189,9 +192,11 @@ static void* provide_function(const char* name) {
   X(SetWindowPosition);
   X(SetWindowMonitor);
   X(SetWindowMinSize);
+  X(SetWindowMaxSize);
   X(SetWindowSize);
   X(SetWindowOpacity);
-  X(GetWindowHandle);
+  X(SetWindowFocused);
+  X(*GetWindowHandle);
   X(GetScreenWidth);
   X(GetScreenHeight);
   X(GetRenderWidth);
@@ -211,9 +216,6 @@ static void* provide_function(const char* name) {
   X(GetClipboardText);
   X(EnableEventWaiting);
   X(DisableEventWaiting);
-  X(SwapScreenBuffer);
-  X(PollInputEvents);
-  X(WaitTime);
   X(ShowCursor);
   X(HideCursor);
   X(IsCursorHidden);
@@ -257,19 +259,24 @@ static void* provide_function(const char* name) {
   X(GetWorldToScreenEx);
   X(GetWorldToScreen2D);
   X(SetTargetFPS);
-  X(GetFPS);
   X(GetFrameTime);
   X(GetTime);
-  X(GetRandomValue);
+  X(GetFPS);
+  X(SwapScreenBuffer);
+  X(PollInputEvents);
+  X(WaitTime);
   X(SetRandomSeed);
+  X(GetRandomValue);
+  X(*LoadRandomSequence);
+  X(UnloadRandomSequence);
   X(TakeScreenshot);
   X(SetConfigFlags);
+  X(OpenURL);
   X(TraceLog);
   X(SetTraceLogLevel);
-  X(MemAlloc);
-  X(MemRealloc);
+  X(*MemAlloc);
+  X(*MemRealloc);
   X(MemFree);
-  X(OpenURL);
   X(SetTraceLogCallback);
   X(SetLoadFileDataCallback);
   X(SetSaveFileDataCallback);
@@ -279,7 +286,7 @@ static void* provide_function(const char* name) {
   X(UnloadFileData);
   X(SaveFileData);
   X(ExportDataAsCode);
-  X(LoadFileText);
+  X(*LoadFileText);
   X(UnloadFileText);
   X(SaveFileText);
   X(FileExists);
@@ -306,13 +313,22 @@ static void* provide_function(const char* name) {
   X(DecompressData);
   X(EncodeDataBase64);
   X(DecodeDataBase64);
+  X(LoadAutomationEventList);
+  X(UnloadAutomationEventList);
+  X(ExportAutomationEventList);
+  X(SetAutomationEventList);
+  X(SetAutomationEventBaseFrame);
+  X(StartAutomationEventRecording);
+  X(StopAutomationEventRecording);
+  X(PlayAutomationEvent);
   X(IsKeyPressed);
+  X(IsKeyPressedRepeat);
   X(IsKeyDown);
   X(IsKeyReleased);
   X(IsKeyUp);
-  X(SetExitKey);
   X(GetKeyPressed);
   X(GetCharPressed);
+  X(SetExitKey);
   X(IsGamepadAvailable);
   X(GetGamepadName);
   X(IsGamepadButtonPressed);
@@ -361,6 +377,8 @@ static void* provide_function(const char* name) {
   X(DrawLineBezier);
   X(DrawLineBezierQuad);
   X(DrawLineBezierCubic);
+  X(DrawLineBSpline);
+  X(DrawLineCatmullRom);
   X(DrawLineStrip);
   X(DrawCircle);
   X(DrawCircleSector);
@@ -368,6 +386,7 @@ static void* provide_function(const char* name) {
   X(DrawCircleGradient);
   X(DrawCircleV);
   X(DrawCircleLines);
+  X(DrawCircleLinesV);
   X(DrawEllipse);
   X(DrawEllipseLines);
   X(DrawRing);
@@ -402,6 +421,7 @@ static void* provide_function(const char* name) {
   X(GetCollisionRec);
   X(LoadImage);
   X(LoadImageRaw);
+  X(LoadImageSvg);
   X(LoadImageAnim);
   X(LoadImageFromMemory);
   X(LoadImageFromTexture);
@@ -409,11 +429,12 @@ static void* provide_function(const char* name) {
   X(IsImageReady);
   X(UnloadImage);
   X(ExportImage);
+  X(ExportImageToMemory);
   X(ExportImageAsCode);
   X(GenImageColor);
-  X(GenImageGradientV);
-  X(GenImageGradientH);
+  X(GenImageGradientLinear);
   X(GenImageGradientRadial);
+  X(GenImageGradientSquare);
   X(GenImageChecked);
   X(GenImageWhiteNoise);
   X(GenImagePerlinNoise);
@@ -438,6 +459,7 @@ static void* provide_function(const char* name) {
   X(ImageDither);
   X(ImageFlipVertical);
   X(ImageFlipHorizontal);
+  X(ImageRotate);
   X(ImageRotateCW);
   X(ImageRotateCCW);
   X(ImageColorTint);
@@ -508,7 +530,7 @@ static void* provide_function(const char* name) {
   X(LoadFontFromImage);
   X(LoadFontFromMemory);
   X(IsFontReady);
-  X(LoadFontData);
+  X(*LoadFontData);
   X(GenImageFontAtlas);
   X(UnloadFontData);
   X(UnloadFont);
@@ -519,6 +541,7 @@ static void* provide_function(const char* name) {
   X(DrawTextPro);
   X(DrawTextCodepoint);
   X(DrawTextCodepoints);
+  X(SetTextLineSpacing);
   X(MeasureText);
   X(MeasureTextEx);
   X(GetGlyphIndex);
@@ -607,7 +630,7 @@ static void* provide_function(const char* name) {
   X(UnloadMaterial);
   X(SetMaterialTexture);
   X(SetModelMeshMaterial);
-  X(LoadModelAnimations);
+  X(*LoadModelAnimations);
   X(UpdateModelAnimation);
   X(UnloadModelAnimation);
   X(UnloadModelAnimations);
@@ -624,15 +647,18 @@ static void* provide_function(const char* name) {
   X(CloseAudioDevice);
   X(IsAudioDeviceReady);
   X(SetMasterVolume);
+  X(GetMasterVolume);
   X(LoadWave);
   X(LoadWaveFromMemory);
   X(IsWaveReady);
   X(LoadSound);
   X(LoadSoundFromWave);
+  X(LoadSoundAlias);
   X(IsSoundReady);
   X(UpdateSound);
   X(UnloadWave);
   X(UnloadSound);
+  X(UnloadSoundAlias);
   X(ExportWave);
   X(ExportWaveAsCode);
   X(PlaySound);
@@ -800,12 +826,14 @@ int main(void) {
   nvim_connection_setup(files, nvim_config_fullpath, &connection_handle);
   free(nvim_config_fullpath);
 
-  DyibiccEnviromentData cc_env_data = {.include_paths = include_paths,
-                                       .files = files,
-                                       .dyibicc_include_dir = "libdyibicc\\include",
-                                       .get_function_address = provide_function,
-                                       .output_function = output_function,
-                                       .use_ansi_codes = true};
+  DyibiccEnviromentData cc_env_data = {
+      .include_paths = include_paths,
+      .files = files,
+      .get_function_address = provide_function,
+      .output_function = output_function,
+      .use_ansi_codes = true,
+      .generate_debug_symbols = false,
+  };
   cc_ctx = dyibicc_set_environment(&cc_env_data);
 
   for (char** p = include_paths; *p; ++p)

@@ -328,7 +328,7 @@ static void update_interps(void) {
     *interp->into =
         Lerp(interp->start, interp->end,
              interp->func((float)++interp->cur_tick / interp->total_ticks));
-    QQ(*interp->into);
+    //QQ(*interp->into);
     if (interp->cur_tick == interp->total_ticks) {
       interp->on_complete(interp->into);
       interp->into = NULL;

@@ -23,9 +23,6 @@ typedef struct DyibiccEnviromentData {
   // NULL-terminated list of .c files to include in the project.
   const char** files;
 
-  // Path to the compiler's include directory.
-  const char* dyibicc_include_dir;
-
   // Load the contents of a file by name (typically from disk).
   //
   // NOTE/TODO: There is currently a gotcha with this callback. It is used in
@@ -51,7 +48,11 @@ typedef struct DyibiccEnviromentData {
 
   // Are simple ANSI colours supported by |output_function|.
   bool use_ansi_codes;
-  bool padding[7];  // Avoid C4820 padding warning on MSVC /Wall.
+
+  // Should debug symbols (pdb) be generated. Only implemented on Windows.
+  bool generate_debug_symbols;
+
+  bool padding[6];  // Avoid C4820 padding warning on MSVC /Wall.
 } DyibiccEnviromentData;
 
 typedef struct DyibiccContext DyibiccContext;

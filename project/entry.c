@@ -1,13 +1,3 @@
-#ifdef __dyibicc__
-#include <reflect.h>
-
-#define QQ(expr) qq_eval(__FILE__, __LINE__, _ReflectTypeOf(expr), expr)
-
-void qq_eval(const char* file, int line, int num_args, ...);
-#else
-#define QQ(expr) ((void)expr)
-#endif
-
 #include <math.h>
 #include <stdio.h>
 #include "raylib.h"
